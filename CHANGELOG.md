@@ -5,6 +5,8 @@ All notable changes will be documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-04
+
 ### Added
 
 - Four distinct event-sourced domains: kudos, one-recipient memos, owner-private notes, and todos.
@@ -29,4 +31,5 @@ All notable changes will be documented here. The format follows
 - Skill installation is explicit, constrained to supported runtime directories, and dry-run by
   default.
 
-[Unreleased]: https://github.com/Coaden/synomem/commits/main
+[Unreleased]: https://github.com/Coaden/synomem/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Coaden/synomem/releases/tag/v0.1.0

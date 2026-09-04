@@ -13,11 +13,22 @@ function run(command, args, cwd, env = process.env) {
 
 const project = process.cwd();
 const temporary = mkdtempSync(join(tmpdir(), 'synomem-pack-'));
-const npmEnv = { ...process.env, NPM_CONFIG_CACHE: join(temporary, 'npm-cache') };
+const npmEnv = {
+  ...process.env,
+  NPM_CONFIG_CACHE: join(temporary, 'npm-cache'),
+  npm_config_dry_run: 'false',
+};
 
 try {
   const packJson = JSON.parse(
-    run('npm', ['pack', '--json', '--pack-destination', temporary], project, npmEnv),
+    // npm publish --dry-run exports npm_config_dry_run=true to lifecycle scripts. Override it here
+    // because this smoke test must create and install the isolated tarball it is validating.
+    run(
+      'npm',
+      ['pack', '--json', '--dry-run=false', '--pack-destination', temporary],
+      project,
+      npmEnv,
+    ),
   );
   const packRecords = Array.isArray(packJson) ? packJson : Object.values(packJson);
   if (packRecords.length !== 1) throw new Error('npm pack returned an unexpected result.');
