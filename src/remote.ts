@@ -1,0 +1,516 @@
+import { actorSchema } from './schemas.js';
+import { asSynomemError, errorCodes, SynomemError, type SynomemErrorCode } from './errors.js';
+import type { SynomemService, SynomemServiceCapabilities, SynomemServiceInfo } from './service.js';
+import type {
+  ActorIdentity,
+  ChangesInput,
+  CreateAgentInput,
+  CreateNoteInput,
+  CreateTodoInput,
+  GiveKudosInput,
+  ItemListInput,
+  KudosListInput,
+  ReviseNoteInput,
+  SendMemoInput,
+  UpdateAgentInput,
+  UpdateTodoInput,
+} from './types.js';
+
+const defaultMaximumResponseBytes = 1024 * 1024;
+const defaultTimeoutMs = 15_000;
+
+export interface SynomemCredentialProvider {
+  getAccessToken(signal?: AbortSignal): Promise<string | undefined>;
+}
+
+export interface RemoteSynomemOptions {
+  baseUrl: string;
+  workspaceId: string;
+  expectedActor: ActorIdentity;
+  credentialProvider: SynomemCredentialProvider;
+  fetch?: typeof fetch;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  maximumResponseBytes?: number;
+}
+
+interface ApiErrorEnvelope {
+  ok: false;
+  error: { code: string; message: string; details?: Record<string, unknown>; requestId?: string };
+}
+
+interface ApiSuccessEnvelope<T> {
+  ok: true;
+  data: T;
+  requestId?: string;
+}
+
+function remoteBaseUrl(value: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new SynomemError('CONFIG_INVALID', 'Remote Synomem baseUrl must be an absolute URL.');
+  }
+  const loopback =
+    parsed.hostname === 'localhost' ||
+    parsed.hostname === '127.0.0.1' ||
+    parsed.hostname === '[::1]';
+  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && loopback)) {
+    throw new SynomemError(
+      'CONFIG_INVALID',
+      'Remote Synomem requires HTTPS except for explicit loopback development URLs.',
+    );
+  }
+  if (
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash ||
+    parsed.pathname !== '/'
+  ) {
+    throw new SynomemError(
+      'CONFIG_INVALID',
+      'Remote Synomem baseUrl cannot contain credentials, paths, query parameters, or fragments.',
+    );
+  }
+  return new URL(parsed.href.endsWith('/') ? parsed.href : `${parsed.href}/`);
+}
+
+function queryString(input: object): string {
+  const parameters = new URLSearchParams();
+  for (const [key, value] of Object.entries(input)) {
+    if (value === undefined) continue;
+    if (Array.isArray(value)) {
+      for (const item of value) parameters.append(key, String(item));
+    } else {
+      parameters.set(key, String(value));
+    }
+  }
+  const encoded = parameters.toString();
+  return encoded ? `?${encoded}` : '';
+}
+
+function knownErrorCode(value: string): SynomemErrorCode {
+  return errorCodes.some((code) => code === value)
+    ? (value as SynomemErrorCode)
+    : 'REMOTE_PROTOCOL';
+}
+
+async function boundedResponseBytes(response: Response, maximumBytes: number): Promise<Uint8Array> {
+  if (!response.body) return new Uint8Array();
+  const reader = response.body.getReader() as unknown as {
+    read(): Promise<{ done: boolean; value?: Uint8Array }>;
+    cancel(): Promise<void>;
+  };
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) {
+      throw new SynomemError('REMOTE_PROTOCOL', 'Remote response stream was malformed.');
+    }
+    length += value.byteLength;
+    if (length > maximumBytes) {
+      await reader.cancel();
+      throw new SynomemError('REMOTE_PROTOCOL', 'Remote response exceeded the configured limit.');
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+export function environmentCredentialProvider(
+  env: NodeJS.ProcessEnv = process.env,
+): SynomemCredentialProvider {
+  return {
+    async getAccessToken() {
+      return env.SYNOMEM_ACCESS_TOKEN;
+    },
+  };
+}
+
+export class RemoteSynomemService implements SynomemService {
+  readonly actor: ActorIdentity;
+  private readonly baseUrl: URL;
+  private readonly workspaceId: string;
+  private readonly credentialProvider: SynomemCredentialProvider;
+  private readonly fetchImplementation: typeof fetch;
+  private readonly signal?: AbortSignal;
+  private readonly timeoutMs: number;
+  private readonly maximumResponseBytes: number;
+  private initialized = false;
+  private cachedCapabilities?: SynomemServiceCapabilities;
+
+  readonly agents = {
+    create: (input: CreateAgentInput) =>
+      this.request<Awaited<ReturnType<SynomemService['agents']['create']>>>(
+        'POST',
+        'agents',
+        input,
+      ),
+    update: (id: string, changes: UpdateAgentInput) =>
+      this.request<Awaited<ReturnType<SynomemService['agents']['update']>>>(
+        'PATCH',
+        `agents/${encodeURIComponent(id)}`,
+        changes,
+      ),
+    get: (idOrAlias: string) =>
+      this.request<Awaited<ReturnType<SynomemService['agents']['get']>>>(
+        'GET',
+        `agents/${encodeURIComponent(idOrAlias)}`,
+      ),
+    list: () =>
+      this.request<Awaited<ReturnType<SynomemService['agents']['list']>>>('GET', 'agents'),
+  };
+
+  readonly kudos = {
+    give: (input: GiveKudosInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['kudos']['give']>>>('POST', 'kudos', input),
+    list: (input: KudosListInput = {}) =>
+      this.request<Awaited<ReturnType<SynomemService['kudos']['list']>>>(
+        'GET',
+        `kudos${queryString(input)}`,
+      ),
+    changes: (input: ChangesInput = {}) =>
+      this.request<Awaited<ReturnType<SynomemService['kudos']['changes']>>>(
+        'GET',
+        `kudos/changes${queryString(input)}`,
+      ),
+    get: (id: string) =>
+      this.request<Awaited<ReturnType<SynomemService['kudos']['get']>>>(
+        'GET',
+        `kudos/${encodeURIComponent(id)}`,
+      ),
+    acknowledge: (input: { kudosId: string; note?: string }) =>
+      this.request<Awaited<ReturnType<SynomemService['kudos']['acknowledge']>>>(
+        'POST',
+        `kudos/${encodeURIComponent(input.kudosId)}/acknowledgment`,
+        input.note === undefined ? {} : { note: input.note },
+      ),
+    revoke: (input: { kudosId: string; reason: string; administrative?: boolean }) =>
+      this.request<Awaited<ReturnType<SynomemService['kudos']['revoke']>>>(
+        'POST',
+        `kudos/${encodeURIComponent(input.kudosId)}/revocation`,
+        { reason: input.reason },
+      ),
+  };
+
+  readonly memos = {
+    send: (input: SendMemoInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['memos']['send']>>>('POST', 'memos', input),
+    list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
+      this.request<Awaited<ReturnType<SynomemService['memos']['list']>>>(
+        'GET',
+        `memos${queryString(input)}`,
+      ),
+    get: (id: string) =>
+      this.request<Awaited<ReturnType<SynomemService['memos']['get']>>>(
+        'GET',
+        `memos/${encodeURIComponent(id)}`,
+      ),
+    read: (input: { memoId: string; idempotencyKey?: string }) =>
+      this.mutation<Awaited<ReturnType<SynomemService['memos']['read']>>>(
+        'POST',
+        `memos/${encodeURIComponent(input.memoId)}/read`,
+        input,
+        ['memoId'],
+      ),
+    archive: (input: { memoId: string; idempotencyKey?: string }) =>
+      this.mutation<Awaited<ReturnType<SynomemService['memos']['archive']>>>(
+        'POST',
+        `memos/${encodeURIComponent(input.memoId)}/archive`,
+        input,
+        ['memoId'],
+      ),
+  };
+
+  readonly notes = {
+    create: (input: CreateNoteInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['notes']['create']>>>('POST', 'notes', input),
+    list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
+      this.request<Awaited<ReturnType<SynomemService['notes']['list']>>>(
+        'GET',
+        `notes${queryString(input)}`,
+      ),
+    get: (id: string) =>
+      this.request<Awaited<ReturnType<SynomemService['notes']['get']>>>(
+        'GET',
+        `notes/${encodeURIComponent(id)}`,
+      ),
+    revise: (input: ReviseNoteInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['notes']['revise']>>>(
+        'POST',
+        `notes/${encodeURIComponent(input.noteId)}/revisions`,
+        input,
+        ['noteId'],
+      ),
+    archive: (input: { noteId: string; idempotencyKey?: string }) =>
+      this.mutation<Awaited<ReturnType<SynomemService['notes']['archive']>>>(
+        'POST',
+        `notes/${encodeURIComponent(input.noteId)}/archive`,
+        input,
+        ['noteId'],
+      ),
+  };
+
+  readonly todos = {
+    create: (input: CreateTodoInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['todos']['create']>>>('POST', 'todos', input),
+    list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
+      this.request<Awaited<ReturnType<SynomemService['todos']['list']>>>(
+        'GET',
+        `todos${queryString(input)}`,
+      ),
+    get: (id: string) =>
+      this.request<Awaited<ReturnType<SynomemService['todos']['get']>>>(
+        'GET',
+        `todos/${encodeURIComponent(id)}`,
+      ),
+    update: (input: UpdateTodoInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['todos']['update']>>>(
+        'POST',
+        `todos/${encodeURIComponent(input.todoId)}/revisions`,
+        input,
+        ['todoId'],
+      ),
+    accept: (input: { todoId: string; idempotencyKey?: string }) =>
+      this.todoTransition('accept', input),
+    reject: (input: { todoId: string; reason?: string; idempotencyKey?: string }) =>
+      this.todoTransition('reject', input),
+    complete: (input: { todoId: string; note?: string; idempotencyKey?: string }) =>
+      this.todoTransition('complete', input),
+    reopen: (input: { todoId: string; idempotencyKey?: string }) =>
+      this.todoTransition('reopen', input),
+    cancel: (input: { todoId: string; reason?: string; idempotencyKey?: string }) =>
+      this.todoTransition('cancel', input),
+  };
+
+  readonly items = {
+    list: (input: ItemListInput = {}) =>
+      this.request<Awaited<ReturnType<SynomemService['items']['list']>>>(
+        'GET',
+        `items${queryString(input)}`,
+      ),
+    get: (id: string) =>
+      this.request<Awaited<ReturnType<SynomemService['items']['get']>>>(
+        'GET',
+        `items/${encodeURIComponent(id)}`,
+      ),
+    changes: (input: ChangesInput = {}) =>
+      this.request<Awaited<ReturnType<SynomemService['items']['changes']>>>(
+        'GET',
+        `changes${queryString(input)}`,
+      ),
+  };
+
+  constructor(options: RemoteSynomemOptions) {
+    this.baseUrl = remoteBaseUrl(options.baseUrl);
+    if (!options.workspaceId.trim() || options.workspaceId.length > 100) {
+      throw new SynomemError('CONFIG_INVALID', 'Remote Synomem workspaceId is required.');
+    }
+    this.workspaceId = options.workspaceId;
+    try {
+      this.actor = actorSchema.parse(options.expectedActor);
+    } catch (error) {
+      throw asSynomemError(error);
+    }
+    this.credentialProvider = options.credentialProvider;
+    this.fetchImplementation = options.fetch ?? fetch;
+    this.signal = options.signal;
+    this.timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
+    this.maximumResponseBytes = options.maximumResponseBytes ?? defaultMaximumResponseBytes;
+    if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1) {
+      throw new SynomemError('CONFIG_INVALID', 'Remote timeoutMs must be a positive integer.');
+    }
+    if (!Number.isSafeInteger(this.maximumResponseBytes) || this.maximumResponseBytes < 1024) {
+      throw new SynomemError(
+        'CONFIG_INVALID',
+        'Remote maximumResponseBytes must be an integer of at least 1024.',
+      );
+    }
+  }
+
+  async init(): Promise<void> {
+    if (this.initialized) return;
+    this.cachedCapabilities = await this.request<SynomemServiceCapabilities>(
+      'GET',
+      '../../capabilities',
+    );
+    if (this.cachedCapabilities.backend !== 'remote') {
+      throw new SynomemError('REMOTE_PROTOCOL', 'The configured server is not a remote backend.');
+    }
+    const binding = this.cachedCapabilities.binding;
+    if (
+      binding.workspaceId !== this.workspaceId ||
+      binding.actor.kind !== this.actor.kind ||
+      binding.actor.id !== this.actor.id
+    ) {
+      throw new SynomemError(
+        'AUTH_FORBIDDEN',
+        'The authenticated Synomem actor does not match the configured actor.',
+      );
+    }
+    this.initialized = true;
+  }
+
+  async close(): Promise<void> {
+    this.initialized = false;
+  }
+
+  stats(input: KudosListInput = {}) {
+    return this.request<Awaited<ReturnType<SynomemService['stats']>>>(
+      'GET',
+      `kudos/stats${queryString(input)}`,
+    );
+  }
+
+  doctor() {
+    return this.request<Awaited<ReturnType<SynomemService['doctor']>>>('GET', 'diagnostics');
+  }
+
+  async export(format: 'json' | 'jsonl' | 'markdown'): Promise<string> {
+    const result = await this.request<{ content: string }>(
+      'GET',
+      `export${queryString({ format })}`,
+    );
+    return result.content;
+  }
+
+  rebuild() {
+    return this.request<Awaited<ReturnType<SynomemService['rebuild']>>>(
+      'POST',
+      'administration/rebuild',
+      {},
+    );
+  }
+
+  async capabilities(): Promise<SynomemServiceCapabilities> {
+    return (
+      this.cachedCapabilities ??
+      (await this.request<SynomemServiceCapabilities>('GET', '../../capabilities'))
+    );
+  }
+
+  async info(): Promise<SynomemServiceInfo> {
+    return { backend: 'remote', baseUrl: this.baseUrl.href, workspaceId: this.workspaceId };
+  }
+
+  getCanonicalEvent(id: string) {
+    return this.request<Awaited<ReturnType<SynomemService['getCanonicalEvent']>>>(
+      'GET',
+      `events/${encodeURIComponent(id)}`,
+    );
+  }
+
+  private todoTransition(
+    transition: 'accept' | 'reject' | 'complete' | 'reopen' | 'cancel',
+    input: { todoId: string; idempotencyKey?: string; reason?: string; note?: string },
+  ) {
+    return this.mutation<Awaited<ReturnType<SynomemService['todos']['accept']>>>(
+      'POST',
+      `todos/${encodeURIComponent(input.todoId)}/${transition}`,
+      input,
+      ['todoId'],
+    );
+  }
+
+  private mutation<T>(
+    method: 'POST' | 'PATCH',
+    path: string,
+    input: object,
+    omittedKeys: string[] = [],
+  ): Promise<T> {
+    const body = { ...input } as Record<string, unknown>;
+    const idempotencyKey =
+      typeof body.idempotencyKey === 'string' ? body.idempotencyKey : undefined;
+    delete body.idempotencyKey;
+    for (const key of omittedKeys) delete body[key];
+    return this.request<T>(method, path, body, idempotencyKey);
+  }
+
+  private async request<T>(
+    method: 'GET' | 'POST' | 'PATCH',
+    path: string,
+    body?: object,
+    idempotencyKey?: string,
+  ): Promise<T> {
+    const accessToken = await this.credentialProvider.getAccessToken(this.signal);
+    if (!accessToken) {
+      throw new SynomemError('AUTH_REQUIRED', 'Remote Synomem authentication is required.');
+    }
+    const workspaceBase = new URL(
+      `v1/workspaces/${encodeURIComponent(this.workspaceId)}/`,
+      this.baseUrl,
+    );
+    const url = new URL(path, workspaceBase);
+    if (url.origin !== this.baseUrl.origin) {
+      throw new SynomemError('CONFIG_INVALID', 'Remote request escaped the configured origin.');
+    }
+    const timeoutSignal = AbortSignal.timeout(this.timeoutMs);
+    const signal = this.signal ? AbortSignal.any([this.signal, timeoutSignal]) : timeoutSignal;
+    let response: Response;
+    try {
+      response = await this.fetchImplementation(url, {
+        method,
+        redirect: 'manual',
+        signal,
+        headers: {
+          accept: 'application/json',
+          authorization: `Bearer ${accessToken}`,
+          ...(body ? { 'content-type': 'application/json' } : {}),
+          ...(idempotencyKey ? { 'idempotency-key': idempotencyKey } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+    } catch (error) {
+      if (this.signal?.aborted) throw error;
+      throw new SynomemError('REMOTE_UNAVAILABLE', 'The remote Synomem service is unavailable.', {
+        cause: error instanceof Error ? error.name : 'network_error',
+      });
+    }
+    if (response.status >= 300 && response.status < 400) {
+      throw new SynomemError('REMOTE_PROTOCOL', 'Remote redirects are not followed.');
+    }
+    const declaredLength = Number(response.headers.get('content-length') ?? 0);
+    if (declaredLength > this.maximumResponseBytes) {
+      throw new SynomemError('REMOTE_PROTOCOL', 'Remote response exceeded the configured limit.');
+    }
+    const bytes = await boundedResponseBytes(response, this.maximumResponseBytes);
+    let envelope: ApiSuccessEnvelope<T> | ApiErrorEnvelope;
+    try {
+      envelope = JSON.parse(new TextDecoder().decode(bytes)) as
+        ApiSuccessEnvelope<T> | ApiErrorEnvelope;
+    } catch {
+      throw new SynomemError('REMOTE_PROTOCOL', 'Remote Synomem returned invalid JSON.');
+    }
+    if (!response.ok || envelope.ok !== true) {
+      if (envelope.ok !== false || !envelope.error || typeof envelope.error.message !== 'string') {
+        throw new SynomemError('REMOTE_PROTOCOL', 'Remote Synomem returned an invalid error.');
+      }
+      const code =
+        response.status === 401
+          ? 'AUTH_REQUIRED'
+          : response.status === 403
+            ? 'AUTH_FORBIDDEN'
+            : response.status === 429
+              ? 'RATE_LIMITED'
+              : knownErrorCode(envelope.error.code);
+      throw new SynomemError(code, envelope.error.message, {
+        ...(envelope.error.details ?? {}),
+        ...(envelope.error.requestId ? { requestId: envelope.error.requestId } : {}),
+      });
+    }
+    if (!('data' in envelope)) {
+      throw new SynomemError('REMOTE_PROTOCOL', 'Remote Synomem response omitted data.');
+    }
+    return envelope.data;
+  }
+}

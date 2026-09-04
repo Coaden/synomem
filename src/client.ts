@@ -1,0 +1,1261 @@
+import { accessSync, constants as fsConstants, existsSync, lstatSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
+import { ulid } from 'ulid';
+import { resolveHome } from './config.js';
+import { asSynomemError, SynomemError } from './errors.js';
+import { assertNoSymlinkEscape } from './fs-utils.js';
+import {
+  escapeMarkdown,
+  memoRecordsFromEvents,
+  noteRecordsFromEvents,
+  ProjectionManager,
+  recordsFromEvents,
+  todoRecordsFromEvents,
+} from './projections.js';
+import {
+  actorSchema,
+  agentIdSchema,
+  createAgentSchema,
+  createNoteSchema,
+  createTodoSchema,
+  changesInputSchema,
+  giveKudosSchema,
+  itemListInputSchema,
+  listInputSchema,
+  reviseNoteSchema,
+  sendMemoSchema,
+  updateTodoSchema,
+  updateAgentSchema,
+} from './schemas.js';
+import { SynomemStorage } from './storage.js';
+import type {
+  SynomemService,
+  SynomemDomainService,
+  SynomemServiceCapabilities,
+  SynomemServiceInfo,
+  ProjectionRebuildResult,
+} from './service.js';
+import type { SynomemRepository } from './ports/repository.js';
+import type { ProjectionWriter } from './ports/projections.js';
+import type {
+  ActorIdentity,
+  AgentProfile,
+  CreateAgentInput,
+  Diagnostic,
+  DoctorResult,
+  GiveKudosInput,
+  GiveKudosResult,
+  SendMemoInput,
+  SendMemoResult,
+  MemoRecord,
+  CreateNoteInput,
+  CreateNoteResult,
+  ReviseNoteInput,
+  NoteRecord,
+  CreateTodoInput,
+  CreateTodoResult,
+  UpdateTodoInput,
+  TodoRecord,
+  ItemListInput,
+  ItemRecord,
+  ItemSummary,
+  ChangesInput,
+  KudosChangesInput,
+  KudosAcknowledgedEvent,
+  SynomemClientOptions,
+  SynomemEvent,
+  KudosGivenEvent,
+  KudosListInput,
+  KudosRecord,
+  KudosRevokedEvent,
+  KudosStats,
+  KudosSummary,
+  ChangePage,
+  Page,
+  UpdateAgentInput,
+} from './types.js';
+
+export interface SynomemCoreOptions {
+  repository: SynomemRepository;
+  projectionWriter: ProjectionWriter;
+  actor?: ActorIdentity;
+  clock?: () => Date;
+  idGenerator?: () => string;
+  signal?: AbortSignal;
+  /** Explicit administrator authority. Defaults to true only for local-style human actors. */
+  administrative?: boolean;
+}
+
+export class SynomemCore implements SynomemDomainService {
+  readonly actor: ActorIdentity;
+  private readonly repository: SynomemRepository;
+  private readonly projectionWriter: ProjectionWriter;
+  private readonly clock: () => Date;
+  private readonly idGenerator: () => string;
+  private readonly signal?: AbortSignal;
+  private readonly administrative: boolean;
+  private initialized = false;
+
+  readonly agents = {
+    create: (input: CreateAgentInput) => this.createAgent(input),
+    update: (id: string, changes: UpdateAgentInput) => this.updateAgent(id, changes),
+    get: (idOrAlias: string) => this.getAgent(idOrAlias),
+    list: () => this.listAgents(),
+  };
+
+  readonly kudos = {
+    give: (input: GiveKudosInput) => this.giveKudos(input),
+    list: (input: KudosListInput = {}) => this.listKudos(input),
+    changes: (input: KudosChangesInput = {}) => this.listKudosChanges(input),
+    get: (id: string) => this.getKudos(id),
+    acknowledge: (input: { kudosId: string; note?: string }) => this.acknowledgeKudos(input),
+    revoke: (input: { kudosId: string; reason: string; administrative?: boolean }) =>
+      this.revokeKudos(input),
+  };
+
+  readonly memos = {
+    send: (input: SendMemoInput) => this.sendMemo(input),
+    list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
+      this.listItems({ ...input, kinds: ['memo'] }),
+    get: (id: string) => this.getMemo(id),
+    read: (input: { memoId: string; idempotencyKey?: string }) => this.readMemo(input),
+    archive: (input: { memoId: string; idempotencyKey?: string }) => this.archiveMemo(input),
+  };
+
+  readonly notes = {
+    create: (input: CreateNoteInput) => this.createNote(input),
+    list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
+      this.listItems({ ...input, kinds: ['note'] }),
+    get: (id: string) => this.getNote(id),
+    revise: (input: ReviseNoteInput) => this.reviseNote(input),
+    archive: (input: { noteId: string; idempotencyKey?: string }) => this.archiveNote(input),
+  };
+
+  readonly todos = {
+    create: (input: CreateTodoInput) => this.createTodo(input),
+    list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
+      this.listItems({ ...input, kinds: ['todo'] }),
+    get: (id: string) => this.getTodo(id),
+    update: (input: UpdateTodoInput) => this.updateTodo(input),
+    accept: (input: { todoId: string; idempotencyKey?: string }) => this.acceptTodo(input),
+    reject: (input: { todoId: string; reason?: string; idempotencyKey?: string }) =>
+      this.rejectTodo(input),
+    complete: (input: { todoId: string; note?: string; idempotencyKey?: string }) =>
+      this.completeTodo(input),
+    reopen: (input: { todoId: string; idempotencyKey?: string }) => this.reopenTodo(input),
+    cancel: (input: { todoId: string; reason?: string; idempotencyKey?: string }) =>
+      this.cancelTodo(input),
+  };
+
+  readonly items = {
+    list: (input: ItemListInput = {}) => this.listItems(input),
+    get: (id: string) => this.getItem(id),
+    changes: (input: ChangesInput = {}) => this.listItemChanges(input),
+  };
+
+  constructor(options: SynomemCoreOptions) {
+    try {
+      this.actor = actorSchema.parse(options.actor ?? { kind: 'system', id: 'workspace' });
+    } catch (error) {
+      throw asSynomemError(error);
+    }
+    this.clock = options.clock ?? (() => new Date());
+    this.idGenerator = options.idGenerator ?? (() => ulid(this.clock().getTime()));
+    this.signal = options.signal;
+    this.administrative = options.administrative ?? this.actor.kind === 'human';
+    this.repository = options.repository;
+    this.projectionWriter = options.projectionWriter;
+  }
+
+  async init(): Promise<void> {
+    this.checkAbort();
+    if (this.initialized) return;
+    await this.repository.init();
+    this.initialized = true;
+  }
+
+  async close(): Promise<void> {
+    await this.repository.close();
+    this.initialized = false;
+  }
+
+  private now(): string {
+    return this.clock().toISOString();
+  }
+
+  private nextId(): string {
+    return this.idGenerator();
+  }
+
+  private eventBase(aggregateId: string, aggregateVersion: number, id = this.nextId()) {
+    return {
+      schemaVersion: 1 as const,
+      id,
+      workspaceId: this.repository.config.workspaceId,
+      aggregateId,
+      aggregateVersion,
+      createdAt: this.now(),
+      actor: this.actor,
+    };
+  }
+
+  protected checkAbort(): void {
+    this.signal?.throwIfAborted();
+  }
+
+  private validate<T>(operation: () => T): T {
+    try {
+      return operation();
+    } catch (error) {
+      throw asSynomemError(error);
+    }
+  }
+
+  private async createAgent(input: CreateAgentInput): Promise<AgentProfile> {
+    this.checkAbort();
+    await this.repository.assertEventCompatibility();
+    const parsed = this.validate(() => createAgentSchema.parse(input));
+    if (await this.repository.getAgent(parsed.id)) {
+      throw new SynomemError('AGENT_EXISTS', `Agent or alias already exists: ${parsed.id}`);
+    }
+    const aliases = [...new Set(parsed.aliases ?? [])].sort();
+    if (aliases.includes(parsed.id)) {
+      throw new SynomemError('ALIAS_CONFLICT', 'An agent cannot use its own ID as an alias.');
+    }
+    for (const alias of aliases) {
+      if (await this.repository.getAgent(alias)) {
+        throw new SynomemError('ALIAS_CONFLICT', `Alias already belongs to an agent: ${alias}`);
+      }
+    }
+    const profile: AgentProfile = {
+      id: parsed.id,
+      displayName: parsed.displayName,
+      ...(aliases.length ? { aliases } : {}),
+      ...(parsed.description !== undefined ? { description: parsed.description } : {}),
+      createdAt: this.now(),
+      ...(parsed.metadata !== undefined ? { metadata: parsed.metadata } : {}),
+    };
+    const event: SynomemEvent = {
+      ...this.eventBase(profile.id, 1),
+      type: 'agent.created',
+      agent: profile,
+    };
+    await this.repository.transaction(async () => {
+      await this.repository.insertAgent(profile);
+      await this.repository.insertEvent(event);
+    });
+    await this.projectionWriter.syncAgent(profile.id);
+    return profile;
+  }
+
+  private async updateAgent(idOrAlias: string, changes: UpdateAgentInput): Promise<AgentProfile> {
+    this.checkAbort();
+    await this.repository.assertEventCompatibility();
+    this.validate(() => agentIdSchema.parse(idOrAlias));
+    const parsed = this.validate(() => updateAgentSchema.parse(changes));
+    const existing = await this.repository.getAgent(idOrAlias);
+    if (!existing) throw new SynomemError('AGENT_NOT_FOUND', `Unknown agent: ${idOrAlias}`);
+    const aliases = parsed.aliases ? [...new Set(parsed.aliases)].sort() : existing.aliases;
+    if (aliases?.includes(existing.id)) {
+      throw new SynomemError('ALIAS_CONFLICT', 'An agent cannot use its own ID as an alias.');
+    }
+    for (const alias of aliases ?? []) {
+      const owner = await this.repository.getAgent(alias);
+      if (owner && owner.id !== existing.id) {
+        throw new SynomemError('ALIAS_CONFLICT', `Alias already belongs to ${owner.id}: ${alias}`);
+      }
+    }
+    const updated: AgentProfile = {
+      ...existing,
+      ...parsed,
+      ...(aliases?.length ? { aliases } : { aliases: undefined }),
+    };
+    const changesForEvent = { ...parsed, ...(parsed.aliases ? { aliases } : {}) };
+    await this.repository.transaction(async () => {
+      const event: SynomemEvent = {
+        ...this.eventBase(existing.id, await this.repository.nextAggregateVersion(existing.id)),
+        type: 'agent.updated',
+        agentId: existing.id,
+        changes: changesForEvent,
+      };
+      await this.repository.updateAgent(updated, event.createdAt);
+      await this.repository.insertEvent(event);
+    });
+    await this.projectionWriter.syncAgent(updated.id);
+    return updated;
+  }
+
+  private async getAgent(idOrAlias: string): Promise<AgentProfile> {
+    this.checkAbort();
+    this.validate(() => agentIdSchema.parse(idOrAlias));
+    const profile = await this.repository.getAgent(idOrAlias);
+    if (!profile) throw new SynomemError('AGENT_NOT_FOUND', `Unknown agent: ${idOrAlias}`);
+    return profile;
+  }
+
+  private async listAgents(): Promise<AgentProfile[]> {
+    this.checkAbort();
+    return await this.repository.listAgents();
+  }
+
+  private async giveKudos(input: GiveKudosInput): Promise<GiveKudosResult> {
+    this.checkAbort();
+    await this.repository.assertEventCompatibility();
+    const parsed = this.validate(() =>
+      giveKudosSchema.parse({
+        ...input,
+        visibility: input.visibility ?? this.repository.config.defaultVisibility,
+      }),
+    );
+    const recipient = await this.repository.getAgent(parsed.recipientAgentId);
+    if (!recipient) {
+      throw new SynomemError('AGENT_NOT_FOUND', `Unknown recipient: ${parsed.recipientAgentId}`);
+    }
+    if (
+      !this.repository.config.allowSelfAwards &&
+      this.actor.kind !== 'human' &&
+      this.actor.id === recipient.id
+    ) {
+      throw new SynomemError(
+        'SELF_AWARD_FORBIDDEN',
+        'Non-human actors cannot award kudos to a matching agent identity.',
+      );
+    }
+
+    const outcome = await this.repository.transaction(async () => {
+      const prior = await this.priorMutation(parsed.idempotencyKey, 'kudos.given');
+      if (prior?.type === 'kudos.given') return { event: prior, created: false };
+      const id = this.nextId();
+      const event: KudosGivenEvent = {
+        ...this.eventBase(id, 1, id),
+        type: 'kudos.given',
+        recipientAgentId: recipient.id,
+        recipientDisplayName: recipient.displayName,
+        title: parsed.title,
+        reason: parsed.reason,
+        visibility: parsed.visibility,
+        ...(parsed.evidence ? { evidence: parsed.evidence } : {}),
+        ...(parsed.tags ? { tags: [...new Set(parsed.tags)].sort() } : {}),
+        ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
+        ...(parsed.source ? { source: parsed.source } : {}),
+        ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
+      };
+      await this.repository.insertEvent(event);
+      return { event, created: true };
+    });
+    if (outcome.created) await this.projectionWriter.syncAgent(recipient.id);
+    const record = await this.getKudosRecord(outcome.event.id);
+    return { record, created: outcome.created, deduplicated: !outcome.created };
+  }
+
+  private async getKudosRecord(id: string): Promise<KudosRecord> {
+    await this.requireVisibleItem(id, 'kudos');
+    const record = recordsFromEvents(await this.repository.getReadableSynomemEvents(id))[0];
+    if (!record) throw new SynomemError('KUDOS_NOT_FOUND', `Unknown kudos: ${id}`);
+    return record;
+  }
+
+  private async getKudos(id: string): Promise<KudosRecord> {
+    this.checkAbort();
+    return await this.getKudosRecord(id);
+  }
+
+  private async listKudos(input: KudosListInput): Promise<Page<KudosSummary>> {
+    this.checkAbort();
+    const filters = this.validate(() => listInputSchema.parse(input));
+    const recipient = filters.recipientAgentId
+      ? await this.repository.getAgent(filters.recipientAgentId)
+      : undefined;
+    if (filters.recipientAgentId && !recipient) {
+      throw new SynomemError('AGENT_NOT_FOUND', `Unknown agent: ${filters.recipientAgentId}`);
+    }
+    return await this.repository.listKudosSummaries(
+      {
+        ...filters,
+        ...(recipient ? { recipientAgentId: recipient.id } : {}),
+      },
+      this.actor,
+    );
+  }
+
+  private async listKudosChanges(input: KudosChangesInput): Promise<ChangePage> {
+    this.checkAbort();
+    const parsed = this.validate(() => changesInputSchema.parse(input));
+    return await this.repository.listKudosChanges(parsed.after, parsed.limit, this.actor);
+  }
+
+  private async acknowledgeKudos(input: { kudosId: string; note?: string }): Promise<KudosRecord> {
+    this.checkAbort();
+    await this.repository.assertEventCompatibility();
+    if (input.note !== undefined && (input.note.trim().length < 1 || input.note.length > 2000)) {
+      throw new SynomemError('INVALID_INPUT', 'Acknowledgment notes must be 1–2000 characters.');
+    }
+    const record = await this.getKudosRecord(input.kudosId);
+    if (record.acknowledgment) return record;
+    if (record.revocation)
+      throw new SynomemError('INVALID_INPUT', 'Revoked kudos cannot be acknowledged.');
+    const isRecipient =
+      this.actor.kind === 'agent' && this.actor.id === record.event.recipientAgentId;
+    if (!this.administrative && !isRecipient) {
+      throw new SynomemError(
+        'ACKNOWLEDGMENT_FORBIDDEN',
+        'Only the recipient agent or a human administrator may acknowledge kudos.',
+      );
+    }
+    const event: KudosAcknowledgedEvent = {
+      ...this.eventBase(record.event.id, 2),
+      type: 'kudos.acknowledged',
+      kudosId: record.event.id,
+      recipientAgentId: record.event.recipientAgentId,
+      ...(input.note ? { note: input.note.trim() } : {}),
+    };
+    await this.repository.transaction(() => this.repository.insertEvent(event));
+    await this.projectionWriter.syncAgent(record.event.recipientAgentId);
+    return await this.getKudosRecord(input.kudosId);
+  }
+
+  private async revokeKudos(input: {
+    kudosId: string;
+    reason: string;
+    administrative?: boolean;
+  }): Promise<KudosRecord> {
+    this.checkAbort();
+    await this.repository.assertEventCompatibility();
+    const reason = input.reason.trim();
+    if (!reason || reason.length > 2000) {
+      throw new SynomemError('INVALID_INPUT', 'Revocation reasons must be 1–2000 characters.');
+    }
+    const record = await this.getKudosRecord(input.kudosId);
+    if (record.revocation) return record;
+    const isOriginalActor =
+      record.event.actor.kind === this.actor.kind && record.event.actor.id === this.actor.id;
+    if (input.administrative === true && !this.administrative) {
+      throw new SynomemError(
+        'REVOCATION_FORBIDDEN',
+        'Only an administrator may request an administrative revocation.',
+      );
+    }
+    const administrative = this.administrative && !isOriginalActor;
+    if (!isOriginalActor && !this.administrative) {
+      throw new SynomemError(
+        'REVOCATION_FORBIDDEN',
+        'Only the original actor or an administrator may revoke kudos.',
+      );
+    }
+    const event: KudosRevokedEvent = {
+      ...this.eventBase(record.event.id, record.acknowledgment ? 3 : 2),
+      type: 'kudos.revoked',
+      kudosId: record.event.id,
+      reason,
+      mode: administrative && !isOriginalActor ? 'administrative' : 'actor-requested',
+    };
+    await this.repository.transaction(() => this.repository.insertEvent(event));
+    await this.projectionWriter.syncAgent(record.event.recipientAgentId);
+    return await this.getKudosRecord(input.kudosId);
+  }
+
+  private async priorMutation(
+    idempotencyKey: string | undefined,
+    expectedType: SynomemEvent['type'],
+  ) {
+    if (!idempotencyKey) return undefined;
+    const prior = await this.repository.getEventByIdempotency(
+      this.actor.kind,
+      this.actor.id,
+      idempotencyKey,
+    );
+    if (prior && prior.type !== expectedType) {
+      throw new SynomemError(
+        'IDEMPOTENCY_CONFLICT',
+        `Idempotency key was already used for ${prior.type}.`,
+      );
+    }
+    return prior;
+  }
+
+  private canViewItem(summary: ItemSummary): boolean {
+    return (
+      this.administrative ||
+      summary.visibility !== 'private' ||
+      (summary.actor.kind === this.actor.kind && summary.actor.id === this.actor.id) ||
+      (this.actor.kind === 'agent' &&
+        (summary.recipientAgentId === this.actor.id ||
+          summary.ownerAgentId === this.actor.id ||
+          summary.assigneeAgentId === this.actor.id))
+    );
+  }
+
+  private async requireVisibleItem(id: string, kind: ItemSummary['kind']): Promise<ItemSummary> {
+    const summary = await this.repository.getItemSummary(id);
+    if (!summary || summary.kind !== kind) {
+      const code =
+        kind === 'memo'
+          ? 'MEMO_NOT_FOUND'
+          : kind === 'note'
+            ? 'NOTE_NOT_FOUND'
+            : kind === 'todo'
+              ? 'TODO_NOT_FOUND'
+              : 'KUDOS_NOT_FOUND';
+      throw new SynomemError(code, `Unknown ${kind}: ${id}`);
+    }
+    if (!this.canViewItem(summary)) {
+      throw new SynomemError(
+        'POLICY_FORBIDDEN',
+        `This ${kind} is not visible to the configured actor.`,
+      );
+    }
+    return summary;
+  }
+
+  private async getMemoRecord(id: string): Promise<MemoRecord> {
+    await this.requireVisibleItem(id, 'memo');
+    const record = memoRecordsFromEvents(await this.repository.getReadableItemEvents(id))[0];
+    if (!record) throw new SynomemError('MEMO_NOT_FOUND', `Unknown memo: ${id}`);
+    return record;
+  }
+
+  private async getMemo(id: string): Promise<MemoRecord> {
+    this.checkAbort();
+    return await this.getMemoRecord(id);
+  }
+
+  private async sendMemo(input: SendMemoInput): Promise<SendMemoResult> {
+    this.checkAbort();
+    await this.repository.assertEventCompatibility();
+    const parsed = this.validate(() => sendMemoSchema.parse(input));
+    const recipient = await this.repository.getAgent(parsed.recipientAgentId);
+    if (!recipient)
+      throw new SynomemError('AGENT_NOT_FOUND', `Unknown recipient: ${parsed.recipientAgentId}`);
+    const outcome = await this.repository.transaction(async () => {
+      const prior = await this.priorMutation(parsed.idempotencyKey, 'memo.sent');
+      if (prior?.type === 'memo.sent') return { id: prior.id, created: false };
+      const id = this.nextId();
+      const event: SynomemEvent = {
+        ...this.eventBase(id, 1, id),
+        type: 'memo.sent',
+        recipientAgentId: recipient.id,
+        recipientDisplayName: recipient.displayName,
+        subject: parsed.subject,
+        body: parsed.body,
+        tags: [...new Set(parsed.tags ?? [])].sort(),
+        visibility: parsed.visibility ?? this.repository.config.defaultVisibility,
+        ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
+        ...(parsed.source ? { source: parsed.source } : {}),
+        ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
+      };
+      await this.repository.insertEvent(event);
+      return { id, created: true };
+    });
+    if (outcome.created) await this.projectionWriter.syncAgent(recipient.id);
+    return {
+      record: await this.getMemoRecord(outcome.id),
+      created: outcome.created,
+      deduplicated: !outcome.created,
+    };
+  }
+
+  private assertRecipient(recipientAgentId: string, operation: string): void {
+    if (
+      !this.administrative &&
+      !(this.actor.kind === 'agent' && this.actor.id === recipientAgentId)
+    ) {
+      throw new SynomemError(
+        'MUTATION_FORBIDDEN',
+        `Only the recipient agent or a human administrator may ${operation}.`,
+      );
+    }
+  }
+
+  private async readMemo(input: { memoId: string; idempotencyKey?: string }): Promise<MemoRecord> {
+    const record = await this.getMemoRecord(input.memoId);
+    this.assertRecipient(record.event.recipientAgentId, 'mark this memo read');
+    if (record.read) return record;
+    await this.repository.transaction(async () => {
+      const prior = await this.priorMutation(input.idempotencyKey, 'memo.read');
+      if (prior) return;
+      const event: SynomemEvent = {
+        ...this.eventBase(
+          record.event.id,
+          await this.repository.nextAggregateVersion(record.event.id),
+        ),
+        type: 'memo.read',
+        memoId: record.event.id,
+        recipientAgentId: record.event.recipientAgentId,
+        ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+      };
+      await this.repository.insertEvent(event);
+    });
+    await this.projectionWriter.syncAgent(record.event.recipientAgentId);
+    return await this.getMemoRecord(input.memoId);
+  }
+
+  private async archiveMemo(input: {
+    memoId: string;
+    idempotencyKey?: string;
+  }): Promise<MemoRecord> {
+    const record = await this.getMemoRecord(input.memoId);
+    this.assertRecipient(record.event.recipientAgentId, 'archive this memo');
+    if (record.archived) return record;
+    await this.repository.transaction(async () => {
+      const prior = await this.priorMutation(input.idempotencyKey, 'memo.archived');
+      if (prior) return;
+      const event: SynomemEvent = {
+        ...this.eventBase(
+          record.event.id,
+          await this.repository.nextAggregateVersion(record.event.id),
+        ),
+        type: 'memo.archived',
+        memoId: record.event.id,
+        recipientAgentId: record.event.recipientAgentId,
+        ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+      };
+      await this.repository.insertEvent(event);
+    });
+    await this.projectionWriter.syncAgent(record.event.recipientAgentId);
+    return await this.getMemoRecord(input.memoId);
+  }
+
+  private async getNoteRecord(id: string): Promise<NoteRecord> {
+    await this.requireVisibleItem(id, 'note');
+    const record = noteRecordsFromEvents(await this.repository.getReadableItemEvents(id))[0];
+    if (!record) throw new SynomemError('NOTE_NOT_FOUND', `Unknown note: ${id}`);
+    return record;
+  }
+  private async getNote(id: string): Promise<NoteRecord> {
+    this.checkAbort();
+    return await this.getNoteRecord(id);
+  }
+
+  private async createNote(input: CreateNoteInput): Promise<CreateNoteResult> {
+    this.checkAbort();
+    await this.repository.assertEventCompatibility();
+    const parsed = this.validate(() => createNoteSchema.parse(input));
+    const ownerId =
+      parsed.ownerAgentId ?? (this.actor.kind === 'agent' ? this.actor.id : undefined);
+    if (!ownerId)
+      throw new SynomemError('INVALID_INPUT', 'A human or system actor must specify ownerAgentId.');
+    const owner = await this.repository.getAgent(ownerId);
+    if (!owner) throw new SynomemError('AGENT_NOT_FOUND', `Unknown note owner: ${ownerId}`);
+    if (!this.administrative && (this.actor.kind !== 'agent' || this.actor.id !== owner.id)) {
+      throw new SynomemError('MUTATION_FORBIDDEN', 'Agents may create notes only for themselves.');
+    }
+    const outcome = await this.repository.transaction(async () => {
+      const prior = await this.priorMutation(parsed.idempotencyKey, 'note.created');
+      if (prior?.type === 'note.created') return { id: prior.id, created: false };
+      const id = this.nextId();
+      const event: SynomemEvent = {
+        ...this.eventBase(id, 1, id),
+        type: 'note.created',
+        ownerAgentId: owner.id,
+        ownerDisplayName: owner.displayName,
+        title: parsed.title,
+        body: parsed.body,
+        tags: [...new Set(parsed.tags ?? [])].sort(),
+        visibility: 'private',
+        ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
+        ...(parsed.source ? { source: parsed.source } : {}),
+        ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
+      };
+      await this.repository.insertEvent(event);
+      return { id, created: true };
+    });
+    if (outcome.created) await this.projectionWriter.syncAgent(owner.id);
+    return {
+      record: await this.getNoteRecord(outcome.id),
+      created: outcome.created,
+      deduplicated: !outcome.created,
+    };
+  }
+
+  private assertNoteOwner(record: NoteRecord): void {
+    if (
+      !this.administrative &&
+      !(this.actor.kind === 'agent' && this.actor.id === record.event.ownerAgentId)
+    ) {
+      throw new SynomemError(
+        'MUTATION_FORBIDDEN',
+        'Only the note owner or a human administrator may change it.',
+      );
+    }
+  }
+
+  private async reviseNote(input: ReviseNoteInput): Promise<NoteRecord> {
+    const parsed = this.validate(() => reviseNoteSchema.parse(input));
+    const record = await this.getNoteRecord(parsed.noteId);
+    this.assertNoteOwner(record);
+    if (record.status === 'archived')
+      throw new SynomemError('INVALID_INPUT', 'Archived notes cannot be revised.');
+    if (parsed.expectedVersion !== record.current.version)
+      throw new SynomemError(
+        'REVISION_CONFLICT',
+        `Expected note version ${parsed.expectedVersion}; current version is ${record.current.version}.`,
+      );
+    await this.repository.transaction(async () => {
+      const prior = await this.priorMutation(parsed.idempotencyKey, 'note.revised');
+      if (prior) return;
+      if (
+        (await this.repository.nextAggregateVersion(record.event.id)) !==
+        parsed.expectedVersion + 1
+      )
+        throw new SynomemError(
+          'REVISION_CONFLICT',
+          'The note changed before this revision was stored.',
+        );
+      const event: SynomemEvent = {
+        ...this.eventBase(record.event.id, parsed.expectedVersion + 1),
+        type: 'note.revised',
+        noteId: record.event.id,
+        title: parsed.title ?? record.current.title,
+        body: parsed.body ?? record.current.body,
+        tags: parsed.tags ?? record.current.tags,
+        visibility: 'private',
+        ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
+        ...(parsed.source ? { source: parsed.source } : {}),
+        ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
+      };
+      await this.repository.insertEvent(event);
+    });
+    await this.projectionWriter.syncAgent(record.event.ownerAgentId);
+    return await this.getNoteRecord(parsed.noteId);
+  }
+
+  private async archiveNote(input: {
+    noteId: string;
+    idempotencyKey?: string;
+  }): Promise<NoteRecord> {
+    const record = await this.getNoteRecord(input.noteId);
+    this.assertNoteOwner(record);
+    if (record.archived) return record;
+    await this.repository.transaction(async () => {
+      const prior = await this.priorMutation(input.idempotencyKey, 'note.archived');
+      if (prior) return;
+      const event: SynomemEvent = {
+        ...this.eventBase(
+          record.event.id,
+          await this.repository.nextAggregateVersion(record.event.id),
+        ),
+        type: 'note.archived',
+        noteId: record.event.id,
+        ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+      };
+      await this.repository.insertEvent(event);
+    });
+    await this.projectionWriter.syncAgent(record.event.ownerAgentId);
+    return await this.getNoteRecord(input.noteId);
+  }
+
+  private async getTodoRecord(id: string): Promise<TodoRecord> {
+    await this.requireVisibleItem(id, 'todo');
+    const record = todoRecordsFromEvents(await this.repository.getReadableItemEvents(id))[0];
+    if (!record) throw new SynomemError('TODO_NOT_FOUND', `Unknown todo: ${id}`);
+    return record;
+  }
+  private async getTodo(id: string): Promise<TodoRecord> {
+    this.checkAbort();
+    return await this.getTodoRecord(id);
+  }
+
+  private async createTodo(input: CreateTodoInput): Promise<CreateTodoResult> {
+    this.checkAbort();
+    await this.repository.assertEventCompatibility();
+    const parsed = this.validate(() => createTodoSchema.parse(input));
+    const assigneeId =
+      parsed.assigneeAgentId ?? (this.actor.kind === 'agent' ? this.actor.id : undefined);
+    if (!assigneeId)
+      throw new SynomemError(
+        'INVALID_INPUT',
+        'A human or system actor must specify assigneeAgentId.',
+      );
+    const assignee = await this.repository.getAgent(assigneeId);
+    if (!assignee)
+      throw new SynomemError('AGENT_NOT_FOUND', `Unknown todo assignee: ${assigneeId}`);
+    if (
+      this.actor.kind === 'agent' &&
+      this.actor.id !== assignee.id &&
+      !this.repository.config.allowCrossAgentTodos
+    )
+      throw new SynomemError('POLICY_FORBIDDEN', 'Cross-agent todo assignment is disabled.');
+    const outcome = await this.repository.transaction(async () => {
+      const prior = await this.priorMutation(parsed.idempotencyKey, 'todo.created');
+      if (prior?.type === 'todo.created') return { id: prior.id, created: false };
+      const id = this.nextId();
+      const requiresAcceptance = this.actor.kind !== 'agent' || this.actor.id !== assignee.id;
+      const event: SynomemEvent = {
+        ...this.eventBase(id, 1, id),
+        type: 'todo.created',
+        assigneeAgentId: assignee.id,
+        assigneeDisplayName: assignee.displayName,
+        title: parsed.title,
+        ...(parsed.description !== undefined ? { description: parsed.description } : {}),
+        priority: parsed.priority ?? 3,
+        ...(parsed.due ? { due: parsed.due } : {}),
+        tags: [...new Set(parsed.tags ?? [])].sort(),
+        visibility: parsed.visibility ?? this.repository.config.defaultVisibility,
+        requiresAcceptance,
+        ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
+        ...(parsed.source ? { source: parsed.source } : {}),
+        ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
+      };
+      await this.repository.insertEvent(event);
+      return { id, created: true };
+    });
+    if (outcome.created) await this.projectionWriter.syncAgent(assignee.id);
+    return {
+      record: await this.getTodoRecord(outcome.id),
+      created: outcome.created,
+      deduplicated: !outcome.created,
+    };
+  }
+
+  private assertTodoParticipant(record: TodoRecord): void {
+    const isCreator =
+      record.event.actor.kind === this.actor.kind && record.event.actor.id === this.actor.id;
+    const isAssignee =
+      this.actor.kind === 'agent' && this.actor.id === record.event.assigneeAgentId;
+    if (!this.administrative && !isCreator && !isAssignee)
+      throw new SynomemError(
+        'MUTATION_FORBIDDEN',
+        'Only the todo creator, assignee, or a human administrator may change it.',
+      );
+  }
+
+  private assertTodoAssignee(record: TodoRecord): void {
+    if (
+      !this.administrative &&
+      !(this.actor.kind === 'agent' && this.actor.id === record.event.assigneeAgentId)
+    ) {
+      throw new SynomemError(
+        'MUTATION_FORBIDDEN',
+        'Only the assigned agent or a human administrator may accept or reject this todo.',
+      );
+    }
+  }
+
+  private async updateTodo(input: UpdateTodoInput): Promise<TodoRecord> {
+    const parsed = this.validate(() => updateTodoSchema.parse(input));
+    const record = await this.getTodoRecord(parsed.todoId);
+    this.assertTodoParticipant(record);
+    if (record.status !== 'open')
+      throw new SynomemError('INVALID_INPUT', 'Only open todos can be updated.');
+    if (parsed.expectedVersion !== record.current.version)
+      throw new SynomemError(
+        'REVISION_CONFLICT',
+        `Expected todo version ${parsed.expectedVersion}; current version is ${record.current.version}.`,
+      );
+    await this.repository.transaction(async () => {
+      const prior = await this.priorMutation(parsed.idempotencyKey, 'todo.updated');
+      if (prior) return;
+      if (
+        (await this.repository.nextAggregateVersion(record.event.id)) !==
+        parsed.expectedVersion + 1
+      )
+        throw new SynomemError(
+          'REVISION_CONFLICT',
+          'The todo changed before this update was stored.',
+        );
+      const due = parsed.due === null ? undefined : (parsed.due ?? record.current.due);
+      const event: SynomemEvent = {
+        ...this.eventBase(record.event.id, parsed.expectedVersion + 1),
+        type: 'todo.updated',
+        todoId: record.event.id,
+        title: parsed.title ?? record.current.title,
+        ...(parsed.description !== undefined
+          ? { description: parsed.description }
+          : record.current.description !== undefined
+            ? { description: record.current.description }
+            : {}),
+        priority: parsed.priority ?? record.current.priority,
+        ...(due ? { due } : {}),
+        tags: parsed.tags ?? record.current.tags,
+        visibility: parsed.visibility ?? record.current.visibility,
+        ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
+        ...(parsed.source ? { source: parsed.source } : {}),
+        ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
+      };
+      await this.repository.insertEvent(event);
+    });
+    await this.projectionWriter.syncAgent(record.event.assigneeAgentId);
+    return await this.getTodoRecord(parsed.todoId);
+  }
+
+  private async todoTransition(
+    input: { todoId: string; idempotencyKey?: string; note?: string; reason?: string },
+    type: 'todo.accepted' | 'todo.rejected' | 'todo.completed' | 'todo.reopened' | 'todo.canceled',
+  ): Promise<TodoRecord> {
+    const record = await this.getTodoRecord(input.todoId);
+    if (type === 'todo.accepted' || type === 'todo.rejected') this.assertTodoAssignee(record);
+    else this.assertTodoParticipant(record);
+    if ((type === 'todo.accepted' || type === 'todo.rejected') && record.status !== 'assigned') {
+      if (type === 'todo.accepted' && record.status === 'open') return record;
+      if (type === 'todo.rejected' && record.status === 'rejected') return record;
+      throw new SynomemError('INVALID_INPUT', 'Only assigned todos may be accepted or rejected.');
+    }
+    if (type === 'todo.completed' && record.status !== 'open') {
+      if (record.status === 'completed') return record;
+      throw new SynomemError(
+        'INVALID_INPUT',
+        'Only accepted or self-created open todos may be completed.',
+      );
+    }
+    if (type === 'todo.reopened' && record.status !== 'completed' && record.status !== 'canceled') {
+      if (record.status === 'open') return record;
+      throw new SynomemError('INVALID_INPUT', 'Only completed or canceled todos may be reopened.');
+    }
+    if (type === 'todo.canceled' && record.status !== 'assigned' && record.status !== 'open') {
+      if (record.status === 'canceled') return record;
+      throw new SynomemError('INVALID_INPUT', 'Only assigned or open todos may be canceled.');
+    }
+    await this.repository.transaction(async () => {
+      const prior = await this.priorMutation(input.idempotencyKey, type);
+      if (prior) return;
+      const base = {
+        ...this.eventBase(
+          record.event.id,
+          await this.repository.nextAggregateVersion(record.event.id),
+        ),
+        todoId: record.event.id,
+        ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+      };
+      const event: SynomemEvent =
+        type === 'todo.completed'
+          ? { ...base, type, ...(input.note ? { note: input.note.trim() } : {}) }
+          : type === 'todo.canceled' || type === 'todo.rejected'
+            ? { ...base, type, ...(input.reason ? { reason: input.reason.trim() } : {}) }
+            : { ...base, type };
+      await this.repository.insertEvent(event);
+    });
+    await this.projectionWriter.syncAgent(record.event.assigneeAgentId);
+    return await this.getTodoRecord(input.todoId);
+  }
+  private completeTodo(input: { todoId: string; note?: string; idempotencyKey?: string }) {
+    return this.todoTransition(input, 'todo.completed');
+  }
+  private acceptTodo(input: { todoId: string; idempotencyKey?: string }) {
+    return this.todoTransition(input, 'todo.accepted');
+  }
+  private rejectTodo(input: { todoId: string; reason?: string; idempotencyKey?: string }) {
+    return this.todoTransition(input, 'todo.rejected');
+  }
+  private reopenTodo(input: { todoId: string; idempotencyKey?: string }) {
+    return this.todoTransition(input, 'todo.reopened');
+  }
+  private cancelTodo(input: { todoId: string; reason?: string; idempotencyKey?: string }) {
+    return this.todoTransition(input, 'todo.canceled');
+  }
+
+  private async listItems(input: ItemListInput): Promise<Page<ItemSummary>> {
+    this.checkAbort();
+    const parsed = this.validate(() => itemListInputSchema.parse(input));
+    return await this.repository.listItemSummaries(parsed, this.actor);
+  }
+  private async listItemChanges(input: ChangesInput): Promise<ChangePage> {
+    this.checkAbort();
+    const parsed = this.validate(() =>
+      changesInputSchema
+        .extend({
+          kinds: itemListInputSchema.shape.kinds,
+        })
+        .parse(input),
+    );
+    return await this.repository.listItemChanges(
+      parsed.after,
+      parsed.limit,
+      this.actor,
+      parsed.kinds,
+    );
+  }
+  private async getItem(id: string): Promise<ItemRecord> {
+    const summary = await this.repository.getItemSummary(id);
+    if (!summary) throw new SynomemError('ITEM_NOT_FOUND', `Unknown item: ${id}`);
+    if (!this.canViewItem(summary)) {
+      throw new SynomemError(
+        'POLICY_FORBIDDEN',
+        'This item is not visible to the configured actor.',
+      );
+    }
+    if (summary.kind === 'kudos') return this.getKudos(id);
+    if (summary.kind === 'memo') return this.getMemo(id);
+    if (summary.kind === 'note') return this.getNote(id);
+    return this.getTodo(id);
+  }
+
+  async stats(input: KudosListInput = {}): Promise<KudosStats> {
+    this.checkAbort();
+    const parsed = this.validate(() => listInputSchema.parse(input));
+    const { cursor: _cursor, limit: _limit, offset: _offset, ...filters } = parsed;
+    void _cursor;
+    void _limit;
+    void _offset;
+    const recipient = filters.recipientAgentId
+      ? await this.repository.getAgent(filters.recipientAgentId)
+      : undefined;
+    if (filters.recipientAgentId && !recipient) {
+      throw new SynomemError('AGENT_NOT_FOUND', `Unknown agent: ${filters.recipientAgentId}`);
+    }
+    const records: KudosSummary[] = [];
+    let cursor: string | undefined;
+    const viewer = this.actor;
+    let hasMore = true;
+    while (hasMore) {
+      const page = await this.repository.listKudosSummaries(
+        {
+          ...filters,
+          ...(recipient ? { recipientAgentId: recipient.id } : {}),
+          limit: 50,
+          offset: 0,
+          ...(cursor ? { cursor } : {}),
+        },
+        viewer,
+      );
+      records.push(...page.items);
+      cursor = page.nextCursor;
+      hasMore = page.hasMore && Boolean(cursor) && page.items.length > 0;
+    }
+    const includedRecords = this.repository.config.includePrivateInStats
+      ? records
+      : records.filter((record) => record.visibility !== 'private');
+    const stats: KudosStats = {
+      total: includedRecords.length,
+      active: includedRecords.filter((record) => record.revocationStatus === 'active').length,
+      acknowledged: includedRecords.filter(
+        (record) => record.status === 'acknowledged' && record.revocationStatus === 'active',
+      ).length,
+      revoked: includedRecords.filter((record) => record.revocationStatus === 'revoked').length,
+      byAgent: {},
+      byActor: {},
+      byTag: {},
+    };
+    for (const record of includedRecords) {
+      stats.byAgent[record.recipientAgentId] = (stats.byAgent[record.recipientAgentId] ?? 0) + 1;
+      const actor = `${record.actor.kind}:${record.actor.id}`;
+      stats.byActor[actor] = (stats.byActor[actor] ?? 0) + 1;
+      for (const tag of record.tags) stats.byTag[tag] = (stats.byTag[tag] ?? 0) + 1;
+    }
+    return stats;
+  }
+}
+
+export class SynomemClient extends SynomemCore implements SynomemService {
+  readonly home: string;
+  readonly storage: SynomemStorage;
+  readonly projections: ProjectionManager;
+
+  constructor(options: SynomemClientOptions = {}) {
+    const home = resolveHome(options.home);
+    const storage = new SynomemStorage({
+      home,
+      readOnly: options.readOnly ?? false,
+      ...(options.config ? { config: options.config } : {}),
+    });
+    const projections = new ProjectionManager(storage);
+    super({
+      repository: storage,
+      projectionWriter: projections,
+      ...(options.actor ? { actor: options.actor } : {}),
+      ...(options.clock ? { clock: options.clock } : {}),
+      ...(options.idGenerator ? { idGenerator: options.idGenerator } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+    this.home = home;
+    this.storage = storage;
+    this.projections = projections;
+  }
+
+  async doctor(): Promise<DoctorResult> {
+    this.checkAbort();
+    const diagnostics: Diagnostic[] = [];
+    try {
+      try {
+        accessSync(this.home, fsConstants.R_OK | (this.storage.readOnly ? 0 : fsConstants.W_OK));
+        diagnostics.push({
+          level: 'ok',
+          code: 'HOME_PERMISSIONS_OK',
+          message: `Storage home is ${this.storage.readOnly ? 'readable' : 'readable and writable'}.`,
+        });
+      } catch {
+        diagnostics.push({
+          level: 'error',
+          code: 'HOME_PERMISSIONS_FAILED',
+          message: 'Storage home permissions do not permit the configured access mode.',
+          path: this.home,
+        });
+      }
+      const integrity = this.storage.integrityCheck();
+      if (integrity.length === 1 && integrity[0] === 'ok') {
+        diagnostics.push({
+          level: 'ok',
+          code: 'SQLITE_INTEGRITY_OK',
+          message: 'SQLite integrity check passed.',
+        });
+      } else {
+        diagnostics.push({
+          level: 'error',
+          code: 'SQLITE_INTEGRITY_FAILED',
+          message: integrity.join('; '),
+        });
+      }
+      const journal = this.storage.journalMode();
+      diagnostics.push({
+        level: journal === 'wal' || this.storage.readOnly ? 'ok' : 'warning',
+        code: 'SQLITE_JOURNAL_MODE',
+        message: `SQLite journal mode is ${journal}.`,
+      });
+      const eventScan = this.storage.scanEvents();
+      if (eventScan.invalid.length) {
+        for (const invalid of eventScan.invalid) {
+          diagnostics.push({
+            level: 'error',
+            code: invalid.error.code,
+            message: invalid.error.message,
+          });
+        }
+      } else {
+        diagnostics.push({
+          level: 'ok',
+          code: 'EVENTS_VALID',
+          message: `${eventScan.events.length} canonical event${eventScan.events.length === 1 ? '' : 's'} validated.`,
+        });
+      }
+      const indexHealth = this.storage.currentIndexHealth();
+      const indexValid =
+        indexHealth.given === indexHealth.indexed && indexHealth.stateMismatches === 0;
+      diagnostics.push({
+        level: indexValid ? 'ok' : 'error',
+        code: indexValid ? 'CURRENT_INDEX_VALID' : 'CURRENT_INDEX_INCONSISTENT',
+        message: `${indexHealth.indexed} of ${indexHealth.given} kudos are present in the current-state index; ${indexHealth.stateMismatches} state mismatch${indexHealth.stateMismatches === 1 ? '' : 'es'} detected.`,
+      });
+      const itemHealth = this.storage.itemIndexHealth();
+      const itemsValid = itemHealth.created === itemHealth.indexed;
+      diagnostics.push({
+        level: itemsValid ? 'ok' : 'error',
+        code: itemsValid ? 'ITEM_INDEX_VALID' : 'ITEM_INDEX_INCONSISTENT',
+        message: `${itemHealth.indexed} of ${itemHealth.created} item aggregates are present in the shared current-state index.`,
+      });
+      const migrationState = this.storage.migrationState();
+      const migrationsValid =
+        migrationState.schemaVersion === 3 &&
+        JSON.stringify(migrationState.appliedVersions) === JSON.stringify([1, 2, 3]);
+      diagnostics.push({
+        level: migrationsValid ? 'ok' : 'error',
+        code: migrationsValid ? 'MIGRATIONS_VALID' : 'MIGRATIONS_INCONSISTENT',
+        message: `Database schema version is ${migrationState.schemaVersion}; recorded migrations: ${migrationState.appliedVersions.join(', ') || 'none'}.`,
+      });
+      const aliasConflicts = this.storage.aliasIdentityConflicts();
+      diagnostics.push({
+        level: aliasConflicts.length ? 'error' : 'ok',
+        code: aliasConflicts.length ? 'ALIAS_CONFLICTS_FOUND' : 'ALIASES_VALID',
+        message: aliasConflicts.length
+          ? `Aliases collide with direct agent identities: ${aliasConflicts.map((item) => `${item.alias}→${item.agentId}`).join(', ')}.`
+          : 'No aliases collide with direct agent identities.',
+      });
+      const expected = this.projections.expectedPaths();
+      const manifest = this.storage.projectionManifest().sort();
+      const stale = JSON.stringify(expected) === JSON.stringify(manifest) ? [] : expected;
+      diagnostics.push({
+        level: stale.length ? 'warning' : 'ok',
+        code: stale.length ? 'PROJECTIONS_STALE' : 'PROJECTIONS_CURRENT',
+        message: stale.length
+          ? 'Generated projections need rebuilding.'
+          : 'Projection manifest is current.',
+      });
+      for (const profile of this.storage.listAgents()) {
+        const directory = join(this.home, profile.id);
+        try {
+          assertNoSymlinkEscape(this.home, directory);
+          if (existsSync(directory) && lstatSync(directory).isSymbolicLink()) {
+            throw new SynomemError('UNSAFE_PATH', 'Agent directory is a symbolic link.');
+          }
+        } catch (error) {
+          diagnostics.push({
+            level: 'error',
+            code: 'UNSAFE_SYMLINK',
+            message: error instanceof Error ? error.message : String(error),
+            path: relative(this.home, directory),
+          });
+        }
+      }
+    } catch (error) {
+      diagnostics.push({
+        level: 'error',
+        code: error instanceof SynomemError ? error.code : 'DOCTOR_FAILED',
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return { healthy: !diagnostics.some((item) => item.level === 'error'), diagnostics };
+  }
+
+  async export(format: 'json' | 'jsonl' | 'markdown'): Promise<string> {
+    this.checkAbort();
+    const rows = this.storage.rawEventRows();
+    if (format === 'jsonl') return `${rows.map((row) => row.payload).join('\n')}\n`;
+    const exported = rows.map((row) => {
+      try {
+        return JSON.parse(row.payload) as unknown;
+      } catch {
+        return { _synomemUnreadableEvent: { id: row.id, rawPayload: row.payload } };
+      }
+    });
+    if (format === 'json') return `${JSON.stringify(exported, null, 2)}\n`;
+    const scan = this.storage.scanEvents();
+    const events = scan.events;
+    const records = recordsFromEvents(events);
+    const memos = memoRecordsFromEvents(events);
+    const notes = noteRecordsFromEvents(events);
+    const todos = todoRecordsFromEvents(events);
+    const warning = scan.invalid.length
+      ? `> Warning: ${scan.invalid.length} unsupported or malformed event(s) omitted from this Markdown view: ${scan.invalid.map((item) => item.id).join(', ')}\n\n`
+      : '';
+    const sections = [
+      ...records.map(
+        (record) =>
+          `## Kudos: ${escapeMarkdown(record.event.title)}\n\n${escapeMarkdown(record.event.reason)}\n\nStatus: ${record.revocationStatus === 'revoked' ? 'Revoked' : record.status}\n\nID: \`${record.event.id}\``,
+      ),
+      ...memos.map(
+        (record) =>
+          `## Memo: ${escapeMarkdown(record.event.subject)}\n\n${escapeMarkdown(record.event.body)}\n\nStatus: ${record.status}\n\nID: \`${record.event.id}\``,
+      ),
+      ...notes.map(
+        (record) =>
+          `## Note: ${escapeMarkdown(record.current.title)}\n\n${escapeMarkdown(record.current.body)}\n\nStatus: ${record.status}; version ${record.current.version}\n\nID: \`${record.event.id}\``,
+      ),
+      ...todos.map(
+        (record) =>
+          `## Todo: ${escapeMarkdown(record.current.title)}\n\n${record.current.description ? `${escapeMarkdown(record.current.description)}\n\n` : ''}Status: ${record.status}; priority ${record.current.priority}\n\nID: \`${record.event.id}\``,
+      ),
+    ];
+    return `${warning}${sections.join('\n\n')}\n`;
+  }
+
+  async backup(destination: string): Promise<string> {
+    this.checkAbort();
+    return this.storage.backup(resolve(destination));
+  }
+
+  async rebuild(): Promise<ProjectionRebuildResult> {
+    this.checkAbort();
+    return this.projections.rebuild();
+  }
+
+  async capabilities(): Promise<SynomemServiceCapabilities> {
+    this.checkAbort();
+    return {
+      backend: 'local',
+      binding: { workspaceId: this.storage.config.workspaceId, actor: this.actor },
+      administration: {
+        agentCreationViaMcp: this.storage.config.allowAgentCreationViaMcp,
+        rebuildViaMcp: this.storage.config.allowRebuildViaMcp,
+      },
+      projections: { ...this.storage.config.projection },
+    };
+  }
+
+  async info(): Promise<SynomemServiceInfo> {
+    this.checkAbort();
+    return { backend: 'local', home: this.home, databasePath: this.storage.databasePath };
+  }
+
+  async getCanonicalEvent(id: string): Promise<SynomemEvent | undefined> {
+    this.checkAbort();
+    return this.storage.getEvent(id);
+  }
+}

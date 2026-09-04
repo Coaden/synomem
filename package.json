@@ -1,0 +1,100 @@
+{
+  "name": "synomem",
+  "version": "0.1.0",
+  "description": "Shared memory, durable communication, recognition, and task coordination for AI agents",
+  "type": "module",
+  "license": "MIT",
+  "author": "Troy Locke",
+  "homepage": "https://coaden.github.io/synomem/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Coaden/synomem.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Coaden/synomem/issues"
+  },
+  "keywords": [
+    "ai-agents",
+    "mcp",
+    "model-context-protocol",
+    "recognition",
+    "agent-memory",
+    "multi-agent",
+    "local-first",
+    "sqlite"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "files": [
+    "dist",
+    "src",
+    "skills/synomem",
+    "docs/cli.md",
+    "docs/examples.md",
+    "docs/mcp.md",
+    "docs/recovery.md",
+    "docs/releasing.md",
+    "docs/skill.md",
+    "docs/storage-format.md",
+    "openapi/synomem-v1.yaml",
+    "AGENTS.md",
+    "ARCHITECTURE.md",
+    "CHANGELOG.md",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp/index.d.ts",
+      "import": "./dist/mcp/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "synomem": "dist/cli.js",
+    "synomem-mcp": "dist/mcp-server.js"
+  },
+  "scripts": {
+    "prebuild": "npm run clean",
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "node scripts/clean.mjs",
+    "demo": "npm run build && node scripts/demo.mjs",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "pack:check": "npm run build && node scripts/pack-check.mjs",
+    "test": "npm run build && vitest run",
+    "test:coverage": "npm run build && vitest run --coverage",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run lint && npm run format:check && npm run typecheck && npm test && npm run pack:check"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "commander": "^14.0.0",
+    "ulid": "^3.0.1",
+    "zod": "^4.5.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.35.0",
+    "@types/node": "^22.18.0",
+    "@vitest/coverage-v8": "^4.1.11",
+    "eslint": "^9.35.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^16.3.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.42.0",
+    "vitest": "^4.1.11"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
+  }
+}

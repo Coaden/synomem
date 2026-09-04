@@ -1,0 +1,674 @@
+openapi: 3.1.0
+info:
+  title: Synomem Domain API
+  version: 1.0.0
+  description: >-
+    Authenticated domain operations for Synomem. The server derives workspace access and actor
+    authority from the bearer credential; mutation bodies never select an actor.
+servers:
+  - url: https://api.synomem.ai
+security:
+  - bearerAuth: []
+tags:
+  - name: capabilities
+  - name: agents
+  - name: kudos
+  - name: memos
+  - name: notes
+  - name: todos
+  - name: items
+  - name: administration
+paths:
+  /v1/capabilities:
+    get:
+      tags: [capabilities]
+      operationId: getCapabilities
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/agents:
+    parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
+    get:
+      tags: [agents]
+      operationId: listAgents
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [agents]
+      operationId: createAgent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAgent' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/agents/{agentId}:
+    parameters:
+      - { $ref: '#/components/parameters/WorkspaceId' }
+      - { $ref: '#/components/parameters/AgentId' }
+    get:
+      tags: [agents]
+      operationId: getAgent
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+    patch:
+      tags: [agents]
+      operationId: updateAgent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateAgent' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/kudos:
+    parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
+    get:
+      tags: [kudos]
+      operationId: listKudos
+      parameters:
+        [{ $ref: '#/components/parameters/ListLimit' }, { $ref: '#/components/parameters/Cursor' }]
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [kudos]
+      operationId: giveKudos
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GiveKudos' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/kudos/changes:
+    get:
+      tags: [kudos]
+      operationId: getKudosChanges
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { $ref: '#/components/parameters/After' }
+        - { $ref: '#/components/parameters/ChangeLimit' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/kudos/stats:
+    get:
+      tags: [kudos]
+      operationId: getKudosStats
+      parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/kudos/{itemId}:
+    get:
+      tags: [kudos]
+      operationId: getKudos
+      parameters:
+        [
+          { $ref: '#/components/parameters/WorkspaceId' },
+          { $ref: '#/components/parameters/ItemId' },
+        ]
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/kudos/{itemId}/acknowledgment:
+    post:
+      tags: [kudos]
+      operationId: acknowledgeKudos
+      parameters:
+        [
+          { $ref: '#/components/parameters/WorkspaceId' },
+          { $ref: '#/components/parameters/ItemId' },
+        ]
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/OptionalNote' } } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/kudos/{itemId}/revocation:
+    post:
+      tags: [kudos]
+      operationId: revokeKudos
+      parameters:
+        [
+          { $ref: '#/components/parameters/WorkspaceId' },
+          { $ref: '#/components/parameters/ItemId' },
+        ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/RevokeKudos' } } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/memos:
+    parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
+    get:
+      tags: [memos]
+      operationId: listMemos
+      parameters:
+        [{ $ref: '#/components/parameters/ListLimit' }, { $ref: '#/components/parameters/Cursor' }]
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [memos]
+      operationId: sendMemo
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SendMemo' } } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/memos/{itemId}:
+    get:
+      tags: [memos]
+      operationId: getMemo
+      parameters:
+        [
+          { $ref: '#/components/parameters/WorkspaceId' },
+          { $ref: '#/components/parameters/ItemId' },
+        ]
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/memos/{itemId}/read:
+    post:
+      tags: [memos]
+      operationId: readMemo
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { $ref: '#/components/parameters/ItemId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/memos/{itemId}/archive:
+    post:
+      tags: [memos]
+      operationId: archiveMemo
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { $ref: '#/components/parameters/ItemId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/notes:
+    parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
+    get:
+      tags: [notes]
+      operationId: listNotes
+      parameters:
+        [{ $ref: '#/components/parameters/ListLimit' }, { $ref: '#/components/parameters/Cursor' }]
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [notes]
+      operationId: createNote
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CreateNote' } } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/notes/{itemId}:
+    get:
+      tags: [notes]
+      operationId: getNote
+      parameters:
+        [
+          { $ref: '#/components/parameters/WorkspaceId' },
+          { $ref: '#/components/parameters/ItemId' },
+        ]
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/notes/{itemId}/revisions:
+    post:
+      tags: [notes]
+      operationId: reviseNote
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { $ref: '#/components/parameters/ItemId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ReviseNote' } } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/notes/{itemId}/archive:
+    post:
+      tags: [notes]
+      operationId: archiveNote
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { $ref: '#/components/parameters/ItemId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/todos:
+    parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
+    get:
+      tags: [todos]
+      operationId: listTodos
+      parameters:
+        [{ $ref: '#/components/parameters/ListLimit' }, { $ref: '#/components/parameters/Cursor' }]
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      tags: [todos]
+      operationId: createTodo
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CreateTodo' } } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/todos/{itemId}:
+    get:
+      tags: [todos]
+      operationId: getTodo
+      parameters:
+        [
+          { $ref: '#/components/parameters/WorkspaceId' },
+          { $ref: '#/components/parameters/ItemId' },
+        ]
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/todos/{itemId}/revisions:
+    post:
+      tags: [todos]
+      operationId: updateTodo
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { $ref: '#/components/parameters/ItemId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/UpdateTodo' } } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/todos/{itemId}/{transition}:
+    post:
+      tags: [todos]
+      operationId: transitionTodo
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { $ref: '#/components/parameters/ItemId' }
+        - name: transition
+          in: path
+          required: true
+          schema: { type: string, enum: [accept, reject, complete, reopen, cancel] }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/TodoTransition' } } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/items:
+    get:
+      tags: [items]
+      operationId: listItems
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { $ref: '#/components/parameters/ListLimit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/items/{itemId}:
+    get:
+      tags: [items]
+      operationId: getItem
+      parameters:
+        [
+          { $ref: '#/components/parameters/WorkspaceId' },
+          { $ref: '#/components/parameters/ItemId' },
+        ]
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/changes:
+    get:
+      tags: [items]
+      operationId: getChanges
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { $ref: '#/components/parameters/After' }
+        - { $ref: '#/components/parameters/ChangeLimit' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/diagnostics:
+    get:
+      tags: [administration]
+      operationId: getDiagnostics
+      parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/audit:
+    get:
+      tags: [administration]
+      operationId: listWorkspaceAudit
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/imports/preview:
+    post:
+      tags: [administration]
+      operationId: previewWorkspaceImport
+      parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImportPreviewRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/imports/confirm:
+    post:
+      tags: [administration]
+      operationId: confirmWorkspaceImport
+      parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImportConfirmRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/export:
+    get:
+      tags: [administration]
+      operationId: exportWorkspace
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - name: format
+          in: query
+          required: true
+          schema: { type: string, enum: [json, jsonl, markdown] }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/administration/rebuild:
+    post:
+      tags: [administration]
+      operationId: rebuildWorkspaceIndexes
+      parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/events/{eventId}:
+    get:
+      tags: [administration]
+      operationId: getCanonicalEvent
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - name: eventId
+          in: path
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 100 }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    WorkspaceId:
+      name: workspaceId
+      in: path
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 100 }
+    AgentId:
+      name: agentId
+      in: path
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 100 }
+    ItemId:
+      name: itemId
+      in: path
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 100 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, minLength: 1, maxLength: 200 }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string, minLength: 1, maxLength: 2048 }
+    After:
+      name: after
+      in: query
+      schema: { type: string, minLength: 1, maxLength: 2048 }
+    ListLimit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+    ChangeLimit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+  responses:
+    Success:
+      description: Successful Synomem operation
+      headers:
+        X-Request-Id: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+    Error:
+      description: Stable safe Synomem error
+      headers:
+        X-Request-Id: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  schemas:
+    ImportBundle:
+      type: object
+      additionalProperties: false
+      required: [version, sourceWorkspaceId, checksum, events, profiles]
+      properties:
+        version: { const: 1 }
+        sourceWorkspaceId: { type: string, minLength: 1, maxLength: 100 }
+        checksum: { type: string, pattern: '^[a-f0-9]{64}$' }
+        events: { type: array, maxItems: 100000, items: { type: object } }
+        profiles: { type: array, maxItems: 10000, items: { type: object } }
+    ImportPreviewRequest:
+      type: object
+      additionalProperties: false
+      required: [bundle]
+      properties:
+        bundle: { $ref: '#/components/schemas/ImportBundle' }
+    ImportConfirmRequest:
+      type: object
+      additionalProperties: false
+      required: [bundle, planId]
+      properties:
+        bundle: { $ref: '#/components/schemas/ImportBundle' }
+        planId: { type: string, minLength: 1, maxLength: 4096 }
+    SuccessEnvelope:
+      type: object
+      additionalProperties: false
+      required: [ok, data]
+      properties:
+        ok: { const: true }
+        data: {}
+        requestId: { type: string }
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [ok, error]
+      properties:
+        ok: { const: false }
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: { type: object }
+            requestId: { type: string }
+    Visibility: { type: string, enum: [private, workspace, public] }
+    Tags:
+      type: array
+      maxItems: 50
+      items: { type: string }
+    CreateAgent:
+      type: object
+      additionalProperties: false
+      required: [id, displayName]
+      properties:
+        id: { type: string }
+        displayName: { type: string }
+        aliases: { type: array, items: { type: string } }
+        description: { type: string }
+        metadata: { type: object }
+    UpdateAgent:
+      type: object
+      additionalProperties: false
+      properties:
+        displayName: { type: string }
+        aliases: { type: array, items: { type: string } }
+        description: { type: string }
+        metadata: { type: object }
+    GiveKudos:
+      type: object
+      additionalProperties: false
+      required: [recipientAgentId, title, reason]
+      properties:
+        recipientAgentId: { type: string }
+        title: { type: string }
+        reason: { type: string }
+        evidence: { type: array, items: { type: object } }
+        tags: { $ref: '#/components/schemas/Tags' }
+        visibility: { $ref: '#/components/schemas/Visibility' }
+        source: { type: object }
+        metadata: { type: object }
+    OptionalNote:
+      type: object
+      additionalProperties: false
+      properties: { note: { type: string } }
+    RevokeKudos:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason: { type: string }
+        administrative: { type: boolean }
+    SendMemo:
+      type: object
+      additionalProperties: false
+      required: [recipientAgentId, subject, body]
+      properties:
+        recipientAgentId: { type: string }
+        subject: { type: string }
+        body: { type: string }
+        tags: { $ref: '#/components/schemas/Tags' }
+        visibility: { $ref: '#/components/schemas/Visibility' }
+        source: { type: object }
+        metadata: { type: object }
+    CreateNote:
+      type: object
+      additionalProperties: false
+      required: [title, body]
+      properties:
+        ownerAgentId: { type: string }
+        title: { type: string }
+        body: { type: string }
+        tags: { $ref: '#/components/schemas/Tags' }
+        source: { type: object }
+        metadata: { type: object }
+    ReviseNote:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion]
+      properties:
+        expectedVersion: { type: integer, minimum: 1 }
+        title: { type: string }
+        body: { type: string }
+        tags: { $ref: '#/components/schemas/Tags' }
+        source: { type: object }
+        metadata: { type: object }
+    TodoDue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [kind, date]
+          properties:
+            kind: { const: date }
+            date: { type: string, format: date }
+        - type: object
+          additionalProperties: false
+          required: [kind, datetime, timeZone]
+          properties:
+            kind: { const: datetime }
+            datetime: { type: string, format: date-time }
+            timeZone: { type: string }
+    CreateTodo:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        assigneeAgentId: { type: string }
+        title: { type: string }
+        description: { type: string }
+        priority: { type: integer, minimum: 1, maximum: 4 }
+        due: { $ref: '#/components/schemas/TodoDue' }
+        tags: { $ref: '#/components/schemas/Tags' }
+        visibility: { $ref: '#/components/schemas/Visibility' }
+        source: { type: object }
+        metadata: { type: object }
+    UpdateTodo:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion]
+      properties:
+        expectedVersion: { type: integer, minimum: 1 }
+        title: { type: string }
+        description: { type: string }
+        priority: { type: integer, minimum: 1, maximum: 4 }
+        due:
+          oneOf: [{ $ref: '#/components/schemas/TodoDue' }, { type: 'null' }]
+        tags: { $ref: '#/components/schemas/Tags' }
+        visibility: { $ref: '#/components/schemas/Visibility' }
+        source: { type: object }
+        metadata: { type: object }
+    TodoTransition:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: { type: string }
+        note: { type: string }

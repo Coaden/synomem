@@ -1,0 +1,52 @@
+name: Release npm package
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - name: Use an npm CLI with trusted-publishing support
+        run: npm install --global npm@latest
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run pack:check
+      - name: Verify release tag matches package version
+        run: node scripts/verify-release-tag.mjs "${{ github.event.release.tag_name }}"
+      - name: Check whether this version is already published
+        id: registry
+        shell: bash
+        run: |
+          PACKAGE_SPEC="$(node -p "const p=require('./package.json'); p.name+'@'+p.version")"
+          if npm view "$PACKAGE_SPEC" version --json >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish stable release
+        if: ${{ !github.event.release.prerelease && steps.registry.outputs.published != 'true' }}
+        run: npm publish --access public
+      - name: Publish prerelease
+        if: ${{ github.event.release.prerelease && steps.registry.outputs.published != 'true' }}
+        run: npm publish --access public --tag next
+      - name: Confirm existing registry version
+        if: ${{ steps.registry.outputs.published == 'true' }}
+        run: echo "${{ github.event.release.tag_name }} is already present in the npm registry; publish is idempotently skipped."

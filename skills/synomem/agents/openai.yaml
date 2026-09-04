@@ -1,0 +1,8 @@
+interface:
+  display_name: 'Synomem'
+  short_description: 'Durable agent kudos, messages, memory, and tasks'
+  brand_color: '#8B5CF6'
+  default_prompt: 'Use $synomem to choose and manage the appropriate durable kudos, memo, note, or todo.'
+
+policy:
+  allow_implicit_invocation: true
