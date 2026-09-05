@@ -109,6 +109,22 @@ function actor(kind: string, id: string, displayName?: string): ActorIdentity {
   };
 }
 
+/**
+ * The acting identity for commands that do not take an explicit actor.
+ * Local storage accepts any actor, so these fall back to the historical CLI defaults; a remote
+ * backend binds the credential to one actor, so SYNOMEM_ACTOR_ID/KIND/NAME must be able to
+ * override them or those commands cannot authenticate.
+ */
+function defaultActor(
+  env: NodeJS.ProcessEnv,
+  fallbackKind: string,
+  fallbackId: string,
+): ActorIdentity {
+  const id = env.SYNOMEM_ACTOR_ID?.trim();
+  if (!id) return actor(fallbackKind, fallbackId);
+  return actor(env.SYNOMEM_ACTOR_KIND?.trim() || fallbackKind, id, env.SYNOMEM_ACTOR_NAME?.trim());
+}
+
 function todoDue(options: {
   dueDate?: string;
   dueAt?: string;
@@ -386,7 +402,7 @@ export function createCli(
       if (persisted?.backend.kind === 'remote') {
         throw new SynomemError('INVALID_INPUT', 'The init command requires a local backend.');
       }
-      await withClient(options.home, actor('system', 'cli'), async (client) => {
+      await withClient(options.home, defaultActor(env, 'system', 'cli'), async (client) => {
         const info = await client.info();
         if (info.backend !== 'local') {
           throw new SynomemError('INVALID_INPUT', 'The init command requires a local backend.');
@@ -595,7 +611,7 @@ export function createCli(
         command: Command,
       ) => {
         const global = globals(command);
-        const profile = await withClient(global.home, actor('system', 'cli'), (client) =>
+        const profile = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
           client.agents.create({
             id,
             displayName: options.name,
@@ -684,7 +700,7 @@ export function createCli(
     .description('List known agent identities')
     .action(async (_options, command: Command) => {
       const global = globals(command);
-      const agents = await withClient(global.home, actor('system', 'cli'), (client) =>
+      const agents = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
         client.agents.list(),
       );
       const human = agents.length
@@ -703,7 +719,7 @@ export function createCli(
     .description('Show one agent profile, resolving aliases')
     .action(async (id: string, _options, command: Command) => {
       const global = globals(command);
-      const profile = await withClient(global.home, actor('system', 'cli'), (client) =>
+      const profile = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
         client.agents.get(id),
       );
       output(
@@ -729,7 +745,7 @@ export function createCli(
       ) => {
         const global = globals(command);
         const hasAliases = options.clearAliases || options.alias.length > 0;
-        const profile = await withClient(global.home, actor('system', 'cli'), (client) =>
+        const profile = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
           client.agents.update(id, {
             ...(options.name ? { displayName: options.name } : {}),
             ...(hasAliases ? { aliases: options.clearAliases ? [] : options.alias } : {}),
@@ -835,7 +851,7 @@ export function createCli(
   addListOptions(kudosCommand.command('list').description('List and filter kudos')).action(
     async (options: Record<string, string>, command: Command) => {
       const global = globals(command);
-      const page = await withClient(global.home, actor('human', 'local-cli'), (client) =>
+      const page = await withClient(global.home, defaultActor(env, 'human', 'local-cli'), (client) =>
         client.kudos.list(listInput(options)),
       );
       output(
@@ -863,7 +879,7 @@ export function createCli(
     .option('--offset <number>', 'deprecated offset', '0')
     .action(async (options: Record<string, string | string[]>, command: Command) => {
       const global = globals(command);
-      const page = await withClient(global.home, actor('human', 'local-cli'), (client) =>
+      const page = await withClient(global.home, defaultActor(env, 'human', 'local-cli'), (client) =>
         client.items.list(itemListInput(options)),
       );
       output(
@@ -885,7 +901,7 @@ export function createCli(
     .action(
       async (options: { after?: string; limit: string; kind: string[] }, command: Command) => {
         const global = globals(command);
-        const page = await withClient(global.home, actor('human', 'local-cli'), (client) =>
+        const page = await withClient(global.home, defaultActor(env, 'human', 'local-cli'), (client) =>
           client.items.changes({
             limit: Number(options.limit),
             ...(options.kind.length ? { kinds: options.kind as ItemListInput['kinds'] } : {}),
@@ -964,7 +980,7 @@ export function createCli(
         command: Command,
       ) => {
         const global = globals(command);
-        const page = await withClient(global.home, actor('human', 'local-cli'), (client) =>
+        const page = await withClient(global.home, defaultActor(env, 'human', 'local-cli'), (client) =>
           client.memos.list({
             ...(options.participant ? { participantAgentId: options.participant } : {}),
             ...(options.status ? { status: options.status } : {}),
@@ -977,7 +993,7 @@ export function createCli(
     );
   memoCommand.command('show <memo-id>').action(async (id: string, _options, command: Command) => {
     const global = globals(command);
-    const record = await withClient(global.home, actor('human', 'local-cli'), (client) =>
+    const record = await withClient(global.home, defaultActor(env, 'human', 'local-cli'), (client) =>
       client.memos.get(id),
     );
     output(
@@ -1068,7 +1084,7 @@ export function createCli(
     .action(
       async (options: { owner?: string; status?: string; limit: string }, command: Command) => {
         const global = globals(command);
-        const page = await withClient(global.home, actor('human', 'local-cli'), (client) =>
+        const page = await withClient(global.home, defaultActor(env, 'human', 'local-cli'), (client) =>
           client.notes.list({
             ...(options.owner ? { participantAgentId: options.owner } : {}),
             ...(options.status ? { status: options.status } : {}),
@@ -1080,7 +1096,7 @@ export function createCli(
     );
   noteCommand.command('show <note-id>').action(async (id: string, _options, command: Command) => {
     const global = globals(command);
-    const record = await withClient(global.home, actor('human', 'local-cli'), (client) =>
+    const record = await withClient(global.home, defaultActor(env, 'human', 'local-cli'), (client) =>
       client.notes.get(id),
     );
     output(
@@ -1219,7 +1235,7 @@ export function createCli(
     .action(
       async (options: { assignee?: string; status?: string; limit: string }, command: Command) => {
         const global = globals(command);
-        const page = await withClient(global.home, actor('human', 'local-cli'), (client) =>
+        const page = await withClient(global.home, defaultActor(env, 'human', 'local-cli'), (client) =>
           client.todos.list({
             ...(options.assignee ? { participantAgentId: options.assignee } : {}),
             ...(options.status ? { status: options.status } : {}),
@@ -1231,7 +1247,7 @@ export function createCli(
     );
   todoCommand.command('show <todo-id>').action(async (id: string, _options, command: Command) => {
     const global = globals(command);
-    const record = await withClient(global.home, actor('human', 'local-cli'), (client) =>
+    const record = await withClient(global.home, defaultActor(env, 'human', 'local-cli'), (client) =>
       client.todos.get(id),
     );
     output(
@@ -1363,7 +1379,7 @@ export function createCli(
     .description('Show one kudos item and its current state')
     .action(async (id: string, _options, command: Command) => {
       const global = globals(command);
-      const record = await withClient(global.home, actor('system', 'cli'), (client) =>
+      const record = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
         client.kudos.get(id),
       );
       output(io, global.json, record, showRecord(record));
@@ -1437,7 +1453,7 @@ export function createCli(
       ) => {
         const global = globals(command);
         if (!agentId) throw new SynomemError('INVALID_INPUT', 'Specify an agent.');
-        const details = await withClient(global.home, actor('system', 'cli'), async (client) => {
+        const details = await withClient(global.home, defaultActor(env, 'system', 'cli'), async (client) => {
           const profile = await client.agents.get(agentId);
           const info = await client.info();
           if (info.backend !== 'local') {
@@ -1478,7 +1494,7 @@ export function createCli(
     kudosCommand.command('stats').description('Show aggregate kudos statistics'),
   ).action(async (options: Record<string, string>, command: Command) => {
     const global = globals(command);
-    const stats = await withClient(global.home, actor('system', 'cli'), (client) =>
+    const stats = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
       client.stats(listInput(options)),
     );
     output(
@@ -1494,7 +1510,7 @@ export function createCli(
     .description('Regenerate current-state and filesystem projections from canonical events')
     .action(async (_options, command: Command) => {
       const global = globals(command);
-      const result = await withClient(global.home, actor('system', 'cli'), (client) =>
+      const result = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
         client.rebuild(),
       );
       output(
@@ -1510,7 +1526,7 @@ export function createCli(
     .description('Create a transactionally consistent SQLite backup')
     .action(async (destination: string, _options, command: Command) => {
       const global = globals(command);
-      const path = await withClient(global.home, actor('system', 'cli'), (client) => {
+      const path = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) => {
         if (!client.backup) {
           throw new SynomemError(
             'INVALID_INPUT',
@@ -1535,7 +1551,7 @@ export function createCli(
         command: Command,
       ) => {
         const global = globals(command);
-        const content = await withClient(global.home, actor('system', 'cli'), (client) =>
+        const content = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
           client.export(options.format),
         );
         if (options.output) {
@@ -1558,7 +1574,7 @@ export function createCli(
     .description('Run safe diagnostics')
     .action(async (_options, command: Command) => {
       const global = globals(command);
-      const result = await withClient(global.home, actor('system', 'cli'), (client) =>
+      const result = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
         client.doctor(),
       );
       const human = result.diagnostics
