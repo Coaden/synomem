@@ -43,8 +43,8 @@ MCP server, compact change feeds, and readable Markdown projections. V1 runs ent
 and opens no network listener.
 
 > [!IMPORTANT]
-> The renamed `synomem` package has not been published yet. It is pre-1.0 software, so review the
-> release notes and rename guidance before upgrading persisted storage or public API consumers.
+> Synomem is pre-1.0 software. Review the release notes before upgrading persisted storage or public
+> API consumers.
 
 ## Quick start
 

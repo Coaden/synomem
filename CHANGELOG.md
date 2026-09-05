@@ -5,6 +5,13 @@ All notable changes will be documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-04
+
+### Fixed
+
+- Allow configured `SYNOMEM_ACTOR_ID`, `SYNOMEM_ACTOR_KIND`, and `SYNOMEM_ACTOR_NAME` values to
+  override historical CLI default identities for remote commands while preserving local fallbacks.
+
 ## [0.1.0] - 2026-09-04
 
 ### Added
@@ -31,5 +38,6 @@ All notable changes will be documented here. The format follows
 - Skill installation is explicit, constrained to supported runtime directories, and dry-run by
   default.
 
-[Unreleased]: https://github.com/Coaden/synomem/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Coaden/synomem/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Coaden/synomem/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Coaden/synomem/releases/tag/v0.1.0
