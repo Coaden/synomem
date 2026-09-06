@@ -36,7 +36,12 @@ export type {
 } from './service.js';
 export { defaultConfig, resolveHome } from './config.js';
 export { asSynomemError, errorCodes, SynomemError } from './errors.js';
-export { escapeMarkdown, recordsFromEvents, renderMarkdownExport } from './projections.js';
+export {
+  dueInstant,
+  escapeMarkdown,
+  recordsFromEvents,
+  renderMarkdownExport,
+} from './projections.js';
 export {
   actorSchema,
   agentAliasSchema,

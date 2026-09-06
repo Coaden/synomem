@@ -22,6 +22,7 @@ import {
   ensureDirectory,
   readJsonFile,
 } from './fs-utils.js';
+import { dueInstant } from './projections.js';
 import { actorSchema, eventSchema, profileSchema } from './schemas.js';
 import type {
   ActorIdentity,
@@ -37,7 +38,6 @@ import type {
   ItemListInput,
   ItemSummary,
   RecordKind,
-  TaskDue,
   KudosListInput,
   KudosSummary,
   Page,
@@ -361,11 +361,6 @@ function itemSummaryFromRow(row: ItemRow): ItemSummary {
  * day has passed rather than merely begun. Treating 2026-09-15 as midnight
  * would report a task due today as already late.
  */
-function dueInstant(due: TaskDue | undefined): string | undefined {
-  if (!due) return undefined;
-  return due.kind === 'date' ? `${due.date}T23:59:59.999Z` : due.datetime;
-}
-
 function eventKind(event: SynomemEvent): RecordKind | undefined {
   if (event.type.startsWith('kudos.')) return 'kudos';
   if (event.type.startsWith('memo.')) return 'memo';
