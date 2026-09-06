@@ -1,6 +1,10 @@
 import type {
   ActorIdentity,
+  AgentDirectoryEntry,
   AgentProfile,
+  AgentResolution,
+  AgentRuntimeBinding,
+  BindRuntimeInput,
   ChangePage,
   ChangesInput,
   CreateAgentInput,
@@ -70,6 +74,11 @@ export interface SynomemDomainService {
     update(id: string, changes: UpdateAgentInput): Promise<AgentProfile>;
     get(idOrAlias: string): Promise<AgentProfile>;
     list(): Promise<AgentProfile[]>;
+    resolve(query: string): Promise<AgentResolution>;
+    directory(): Promise<AgentDirectoryEntry[]>;
+    bindings(idOrAlias: string): Promise<AgentRuntimeBinding[]>;
+    bindRuntime(input: BindRuntimeInput): Promise<AgentRuntimeBinding>;
+    unbindRuntime(bindingId: string): Promise<boolean>;
   };
   readonly kudos: {
     give(input: GiveKudosInput): Promise<GiveKudosResult>;

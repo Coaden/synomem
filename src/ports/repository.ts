@@ -1,8 +1,10 @@
 import type {
   ActorIdentity,
   AgentProfile,
+  AgentRuntimeBinding,
   ChangePage,
   ItemListInput,
+  JsonValue,
   ItemSummary,
   KudosListInput,
   KudosSummary,
@@ -41,6 +43,20 @@ export interface SynomemRepository {
   updateAgent(profile: AgentProfile, updatedAt: string): Awaitable<void>;
   getAgent(idOrAlias: string): Awaitable<AgentProfile | undefined>;
   listAgents(): Awaitable<AgentProfile[]>;
+  /** Resolves a name case-insensitively, reporting ambiguity instead of guessing. */
+  resolveAgent(query: string): Awaitable<{ match?: AgentProfile; candidates: AgentProfile[] }>;
+  listRuntimeBindings(agentId: string): Awaitable<AgentRuntimeBinding[]>;
+  bindRuntime(binding: {
+    id: string;
+    agentId: string;
+    installationId?: string;
+    runtime: string;
+    profile?: string;
+    capabilities?: Record<string, JsonValue>;
+    boundAt: string;
+  }): Awaitable<void>;
+  unbindRuntime(bindingId: string): Awaitable<boolean>;
+  touchRuntimeBinding(agentId: string, runtime: string, at: string): Awaitable<void>;
 
   listKudosSummaries(
     input: Required<Pick<KudosListInput, 'limit' | 'offset'>> & KudosListInput,

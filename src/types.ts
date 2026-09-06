@@ -36,6 +36,53 @@ export interface AgentProfile {
   metadata?: Record<string, JsonValue>;
 }
 
+/**
+ * Where an agent is currently reachable, as far as Synomem has been told.
+ *
+ * A binding is a claim made at registration, not a live connection. `lastSeenAt`
+ * is advisory: it says when Synomem last observed this binding act, never that
+ * the runtime is reachable now. Callers must not treat its absence as offline.
+ */
+export interface AgentRuntimeBinding {
+  id: string;
+  agentId: string;
+  /** Hosted deployment this binding belongs to; absent for local installs. */
+  installationId?: string;
+  /** Runtime family, e.g. `claude-code`, `hermes`, `openai-agents`. */
+  runtime: string;
+  /** Named configuration within a runtime, when one runtime hosts several. */
+  profile?: string;
+  capabilities: Record<string, JsonValue>;
+  boundAt: string;
+  lastSeenAt?: string;
+}
+
+/**
+ * One agent as the directory exposes it: visible identity plus advisory
+ * reachability.
+ *
+ * Roles and capabilities are deliberately absent. Authorization is decided by
+ * the control plane against the caller's credential, so publishing a role here
+ * would only invite a reader to treat the directory as a permission check.
+ */
+export interface AgentDirectoryEntry {
+  profile: AgentProfile;
+  runtimeBindings: AgentRuntimeBinding[];
+}
+
+/**
+ * The outcome of resolving a name, which may legitimately name no one or
+ * several.
+ *
+ * `match` is set only when exactly one agent answers to the name. Anything else
+ * hands back `candidates` so the caller can ask rather than pick.
+ */
+export interface AgentResolution {
+  query: string;
+  match?: AgentProfile;
+  candidates: AgentProfile[];
+}
+
 export interface BaseEvent {
   schemaVersion: 1;
   id: string;
@@ -523,6 +570,14 @@ export type GiveKudosResult = MutationResult<KudosRecord>;
 export type SendMemoResult = MutationResult<MemoRecord>;
 export type CreateNoteResult = MutationResult<NoteRecord>;
 export type CreateTaskResult = MutationResult<TaskRecord>;
+
+export interface BindRuntimeInput {
+  agentId: string;
+  runtime: string;
+  profile?: string;
+  installationId?: string;
+  capabilities?: Record<string, JsonValue>;
+}
 
 export interface CreateAgentInput {
   id: string;

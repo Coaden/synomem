@@ -4,6 +4,7 @@ import type { SynomemService, SynomemServiceCapabilities, SynomemServiceInfo } f
 import type {
   ActorIdentity,
   ChangesInput,
+  BindRuntimeInput,
   CreateAgentInput,
   CreateNoteInput,
   CreateTaskInput,
@@ -171,6 +172,32 @@ export class RemoteSynomemService implements SynomemService {
       ),
     list: () =>
       this.request<Awaited<ReturnType<SynomemService['agents']['list']>>>('GET', 'agents'),
+    resolve: (query: string) =>
+      this.request<Awaited<ReturnType<SynomemService['agents']['resolve']>>>(
+        'GET',
+        `agents/resolve?query=${encodeURIComponent(query)}`,
+      ),
+    directory: () =>
+      this.request<Awaited<ReturnType<SynomemService['agents']['directory']>>>(
+        'GET',
+        'agents/directory',
+      ),
+    bindings: (idOrAlias: string) =>
+      this.request<Awaited<ReturnType<SynomemService['agents']['bindings']>>>(
+        'GET',
+        `agents/${encodeURIComponent(idOrAlias)}/runtimes`,
+      ),
+    bindRuntime: (input: BindRuntimeInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['agents']['bindRuntime']>>>(
+        'POST',
+        `agents/${encodeURIComponent(input.agentId)}/runtimes`,
+        input,
+      ),
+    unbindRuntime: (bindingId: string) =>
+      this.request<Awaited<ReturnType<SynomemService['agents']['unbindRuntime']>>>(
+        'DELETE',
+        `agents/runtimes/${encodeURIComponent(bindingId)}`,
+      ),
   };
 
   readonly kudos = {
@@ -520,7 +547,7 @@ export class RemoteSynomemService implements SynomemService {
   }
 
   private async request<T>(
-    method: 'GET' | 'POST' | 'PATCH',
+    method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
     path: string,
     body?: object,
     idempotencyKey?: string,

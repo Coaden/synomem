@@ -15,7 +15,8 @@ import {
 } from './projections.js';
 import {
   actorSchema,
-  agentIdSchema,
+  agentLookupSchema,
+  bindRuntimeSchema,
   createAgentSchema,
   createNoteSchema,
   createTaskSchema,
@@ -42,7 +43,11 @@ import type { SynomemRepository } from './ports/repository.js';
 import type { ProjectionWriter } from './ports/projections.js';
 import type {
   ActorIdentity,
+  AgentDirectoryEntry,
   AgentProfile,
+  AgentResolution,
+  AgentRuntimeBinding,
+  BindRuntimeInput,
   CreateAgentInput,
   Diagnostic,
   DoctorResult,
@@ -108,6 +113,11 @@ export class SynomemCore implements SynomemDomainService {
     update: (id: string, changes: UpdateAgentInput) => this.updateAgent(id, changes),
     get: (idOrAlias: string) => this.getAgent(idOrAlias),
     list: () => this.listAgents(),
+    resolve: (query: string) => this.resolveAgent(query),
+    directory: () => this.agentDirectory(),
+    bindings: (idOrAlias: string) => this.listRuntimeBindings(idOrAlias),
+    bindRuntime: (input: BindRuntimeInput) => this.bindRuntime(input),
+    unbindRuntime: (bindingId: string) => this.unbindRuntime(bindingId),
   };
 
   readonly kudos = {
@@ -312,7 +322,7 @@ export class SynomemCore implements SynomemDomainService {
   private async updateAgent(idOrAlias: string, changes: UpdateAgentInput): Promise<AgentProfile> {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
-    this.validate(() => agentIdSchema.parse(idOrAlias));
+    this.validate(() => agentLookupSchema.parse(idOrAlias));
     const parsed = this.validate(() => updateAgentSchema.parse(changes));
     const existing = await this.repository.getAgent(idOrAlias);
     if (!existing) throw new SynomemError('AGENT_NOT_FOUND', `Unknown agent: ${idOrAlias}`);
@@ -348,7 +358,7 @@ export class SynomemCore implements SynomemDomainService {
 
   private async getAgent(idOrAlias: string): Promise<AgentProfile> {
     this.checkAbort();
-    this.validate(() => agentIdSchema.parse(idOrAlias));
+    this.validate(() => agentLookupSchema.parse(idOrAlias));
     const profile = await this.repository.getAgent(idOrAlias);
     if (!profile) throw new SynomemError('AGENT_NOT_FOUND', `Unknown agent: ${idOrAlias}`);
     return profile;
@@ -357,6 +367,77 @@ export class SynomemCore implements SynomemDomainService {
   private async listAgents(): Promise<AgentProfile[]> {
     this.checkAbort();
     return await this.repository.listAgents();
+  }
+
+  /**
+   * Resolves a name without ever choosing between equally valid answers.
+   *
+   * Callers that want a single agent should treat an empty `match` as a
+   * question for the user, not as "not found": `candidates` distinguishes the
+   * two cases.
+   */
+  private async resolveAgent(query: string): Promise<AgentResolution> {
+    this.checkAbort();
+    const trimmed = query.trim();
+    if (!trimmed) throw new SynomemError('INVALID_INPUT', 'A lookup name is required.');
+    const resolved = await this.repository.resolveAgent(trimmed);
+    return {
+      query: trimmed,
+      ...(resolved.match ? { match: resolved.match } : {}),
+      candidates: resolved.candidates,
+    };
+  }
+
+  private async agentDirectory(): Promise<AgentDirectoryEntry[]> {
+    this.checkAbort();
+    const profiles = await this.repository.listAgents();
+    const entries: AgentDirectoryEntry[] = [];
+    for (const profile of profiles) {
+      entries.push({
+        profile,
+        runtimeBindings: await this.repository.listRuntimeBindings(profile.id),
+      });
+    }
+    return entries;
+  }
+
+  private async listRuntimeBindings(idOrAlias: string): Promise<AgentRuntimeBinding[]> {
+    const profile = await this.getAgent(idOrAlias);
+    return await this.repository.listRuntimeBindings(profile.id);
+  }
+
+  /**
+   * Records where an agent runs. Re-binding the same runtime and profile
+   * updates the claim in place rather than accumulating duplicates, because a
+   * reinstall is the same agent in the same place, not a second one.
+   */
+  private async bindRuntime(input: BindRuntimeInput): Promise<AgentRuntimeBinding> {
+    this.checkAbort();
+    const parsed = this.validate(() => bindRuntimeSchema.parse(input));
+    const profile = await this.getAgent(parsed.agentId);
+    await this.repository.bindRuntime({
+      id: this.idGenerator(),
+      agentId: profile.id,
+      ...(parsed.installationId !== undefined ? { installationId: parsed.installationId } : {}),
+      runtime: parsed.runtime,
+      ...(parsed.profile !== undefined ? { profile: parsed.profile } : {}),
+      ...(parsed.capabilities !== undefined ? { capabilities: parsed.capabilities } : {}),
+      boundAt: this.now(),
+    });
+    const bindings = await this.repository.listRuntimeBindings(profile.id);
+    const binding = bindings.find(
+      (candidate) =>
+        candidate.runtime === parsed.runtime &&
+        (candidate.profile ?? '') === (parsed.profile ?? '') &&
+        (candidate.installationId ?? '') === (parsed.installationId ?? ''),
+    );
+    if (!binding) throw new SynomemError('INTERNAL_ERROR', 'Runtime binding was not persisted.');
+    return binding;
+  }
+
+  private async unbindRuntime(bindingId: string): Promise<boolean> {
+    this.checkAbort();
+    return await this.repository.unbindRuntime(bindingId);
   }
 
   private async giveKudos(input: GiveKudosInput): Promise<GiveKudosResult> {
@@ -1262,8 +1343,8 @@ export class SynomemCore implements SynomemDomainService {
  * check that silently lags the migration runner reports a healthy database as
  * broken.
  */
-const CURRENT_SCHEMA_VERSION = 4;
-const EXPECTED_APPLIED_MIGRATIONS = [1, 2, 3, 4];
+const CURRENT_SCHEMA_VERSION = 5;
+const EXPECTED_APPLIED_MIGRATIONS = [1, 2, 3, 4, 5];
 
 export class SynomemClient extends SynomemCore implements SynomemService {
   readonly home: string;

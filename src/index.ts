@@ -39,7 +39,10 @@ export { asSynomemError, errorCodes, SynomemError } from './errors.js';
 export { escapeMarkdown, recordsFromEvents, renderMarkdownExport } from './projections.js';
 export {
   actorSchema,
+  agentAliasSchema,
   agentIdSchema,
+  agentLookupSchema,
+  bindRuntimeSchema,
   changesInputSchema,
   createAgentSchema,
   createNoteSchema,

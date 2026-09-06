@@ -147,7 +147,7 @@ describe('SQLite storage and projections', () => {
     const dbPath = initialized.storage.databasePath;
     await initialized.close();
     const raw = new DatabaseSync(dbPath);
-    raw.exec('PRAGMA user_version = 5');
+    raw.exec('PRAGMA user_version = 6');
     raw.close();
     const unsupported = new SynomemClient({ home: otherHome, readOnly: true });
     await expect(unsupported.init()).rejects.toMatchObject({ code: 'UNSUPPORTED_SCHEMA' });
@@ -215,14 +215,14 @@ describe('SQLite storage and projections', () => {
     expect(
       (client.storage.db().prepare('PRAGMA user_version').get() as { user_version: number })
         .user_version,
-    ).toBe(4);
+    ).toBe(5);
     expect(
       (
         client.storage.db().prepare('SELECT COUNT(*) AS count FROM schema_migrations').get() as {
           count: number;
         }
       ).count,
-    ).toBe(4);
+    ).toBe(5);
     await client.close();
   });
 
@@ -253,7 +253,10 @@ describe('SQLite storage and projections', () => {
       ALTER TABLE events DROP COLUMN aggregate_id;
       ALTER TABLE events DROP COLUMN workspace_id;
       ALTER TABLE events DROP COLUMN sequence;
-      DELETE FROM schema_migrations WHERE version IN (2, 3);
+      DROP INDEX aliases_normalized;
+      ALTER TABLE aliases DROP COLUMN normalized_alias;
+      DROP TABLE agent_runtime_bindings;
+      DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5);
       PRAGMA user_version = 1;
     `);
     legacy.close();
@@ -265,7 +268,7 @@ describe('SQLite storage and projections', () => {
     expect(
       (migrated.storage.db().prepare('PRAGMA user_version').get() as { user_version: number })
         .user_version,
-    ).toBe(4);
+    ).toBe(5);
     expect((await migrated.kudos.list()).items[0]?.id).toBe(given.record.event.id);
     expect(migrated.storage.currentIndexHealth()).toEqual({
       given: 1,

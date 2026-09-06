@@ -327,6 +327,53 @@ export async function createSynomemMcpServer(
   );
 
   server.registerTool(
+    'synomem_agent_resolve',
+    {
+      title: 'Resolve an agent name',
+      description:
+        'Resolve a name or alias to exactly one agent. Matching ignores case. When several agents answer to the name, no match is returned and the candidates are listed instead — ask which one is meant rather than choosing.',
+      inputSchema: z.object({
+        query: z.string().min(1).describe('An agent ID or alias, in any casing.'),
+      }),
+      outputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ query }) => {
+      try {
+        const resolution = await client.agents.resolve(query);
+        const message = resolution.match
+          ? `"${resolution.query}" resolves to ${resolution.match.id}.`
+          : resolution.candidates.length
+            ? `"${resolution.query}" is ambiguous across ${resolution.candidates.length} agents. Ask which one is meant.`
+            : `No agent answers to "${resolution.query}".`;
+        return success(actor, message, resolution);
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
+    'synomem_agent_directory',
+    {
+      title: 'Browse the agent directory',
+      description:
+        'List known agents with their aliases and runtime bindings. Runtime bindings describe where an agent was registered to run and when Synomem last observed it act; they never mean the agent is reachable now. This is read-only.',
+      inputSchema: z.object({}),
+      outputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    },
+    async () => {
+      try {
+        const entries = await client.agents.directory();
+        return success(actor, `Found ${entries.length} agent identity or identities.`, { entries });
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
     'synomem_rebuild',
     {
       title: 'Rebuild projections',

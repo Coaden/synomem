@@ -28,7 +28,9 @@ import type {
   SynomemConfig,
   SynomemConfigOverrides,
   AgentProfile,
+  AgentRuntimeBinding,
   ChangePage,
+  JsonValue,
   KudosChange,
   SynomemEvent,
   ItemChange,
@@ -199,6 +201,40 @@ CREATE INDEX kudos_current_status ON kudos_current(status, revocation_status, gi
 const migrationV4 = `
 ALTER TABLE items_current ADD COLUMN due_at TEXT;
 CREATE INDEX items_current_due ON items_current(kind, status, due_at);
+`;
+
+/**
+ * v5 makes alias lookup case-insensitive and unambiguous.
+ *
+ * The plan requires that `mycroft`, `Mycroft` and `Mike` may all resolve to one
+ * canonical agent, while a name two agents both claim must return candidates
+ * rather than guessing. A normalized column with a unique index enforces the
+ * second half at write time: the collision is refused when the alias is added,
+ * not discovered later by whoever happens to look it up first.
+ *
+ * Runtime bindings arrive here too. An agent is not one harness forever —
+ * Mycroft may run Hermes on two machines, or move between harnesses — so the
+ * binding is its own row keyed by agent, installation, runtime and profile
+ * rather than a field on the agent.
+ */
+const migrationV5 = `
+ALTER TABLE aliases ADD COLUMN normalized_alias TEXT;
+UPDATE aliases SET normalized_alias = lower(alias);
+CREATE UNIQUE INDEX aliases_normalized ON aliases(normalized_alias);
+
+CREATE TABLE agent_runtime_bindings (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  installation_id TEXT,
+  runtime TEXT NOT NULL,
+  profile TEXT,
+  capabilities_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(capabilities_json)),
+  bound_at TEXT NOT NULL,
+  last_seen_at TEXT
+) STRICT;
+CREATE UNIQUE INDEX agent_runtime_bindings_unique
+  ON agent_runtime_bindings(agent_id, runtime, COALESCE(profile, ''), COALESCE(installation_id, ''));
+CREATE INDEX agent_runtime_bindings_agent ON agent_runtime_bindings(agent_id);
 `;
 
 const migrationV3 = `
@@ -468,7 +504,7 @@ export class SynomemStorage implements SynomemRepository {
     const version = Number(
       (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
     );
-    if (version > 4) {
+    if (version > 5) {
       throw new SynomemError(
         'UNSUPPORTED_SCHEMA',
         `Database schema version ${version} is newer than this package supports.`,
@@ -524,14 +560,26 @@ export class SynomemStorage implements SynomemRepository {
         db.exec('PRAGMA user_version = 4');
       });
     }
+    const afterV4 = Number(
+      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    );
+    if (afterV4 === 4) {
+      this.transactionSync(() => {
+        db.exec(migrationV5);
+        db.prepare(
+          'INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        ).run(5, new Date().toISOString());
+        db.exec('PRAGMA user_version = 5');
+      });
+    }
   }
 
   private assertSchemaSupported(): void {
     const version = Number(
       (this.db().prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
     );
-    if (version !== 4) {
-      if (version === 1 || version === 2 || version === 3) {
+    if (version !== 5) {
+      if (version >= 1 && version <= 4) {
         throw new SynomemError(
           'UNSUPPORTED_SCHEMA',
           `Database schema version ${version} requires migration. Open this home once with readOnly: false, then retry the read-only client.`,
@@ -539,7 +587,7 @@ export class SynomemStorage implements SynomemRepository {
       }
       throw new SynomemError(
         'UNSUPPORTED_SCHEMA',
-        `Expected database schema version 4; found ${version}.`,
+        `Expected database schema version 5; found ${version}.`,
       );
     }
   }
@@ -1602,9 +1650,7 @@ export class SynomemStorage implements SynomemRepository {
         parsed.createdAt,
         parsed.createdAt,
       );
-    for (const alias of parsed.aliases ?? []) {
-      this.db().prepare('INSERT INTO aliases(alias, agent_id) VALUES (?, ?)').run(alias, parsed.id);
-    }
+    this.insertAliases(parsed.id, parsed.aliases ?? []);
   }
 
   updateAgent(profile: AgentProfile, updatedAt: string): void {
@@ -1613,22 +1659,153 @@ export class SynomemStorage implements SynomemRepository {
       .prepare('UPDATE agents SET display_name = ?, profile_json = ?, updated_at = ? WHERE id = ?')
       .run(parsed.displayName, JSON.stringify(parsed), updatedAt, parsed.id);
     this.db().prepare('DELETE FROM aliases WHERE agent_id = ?').run(parsed.id);
-    for (const alias of parsed.aliases ?? []) {
-      this.db().prepare('INSERT INTO aliases(alias, agent_id) VALUES (?, ?)').run(alias, parsed.id);
-    }
+    this.insertAliases(parsed.id, parsed.aliases ?? []);
   }
 
   getAgent(idOrAlias: string): AgentProfile | undefined {
-    const direct = this.db()
-      .prepare('SELECT profile_json FROM agents WHERE id = ?')
-      .get(idOrAlias) as ProfileRow | undefined;
-    if (direct) return profileSchema.parse(JSON.parse(direct.profile_json));
-    const alias = this.db()
+    const resolved = this.resolveAgent(idOrAlias);
+    return resolved.match;
+  }
+
+  /**
+   * Resolves a name to a canonical agent, reporting ambiguity rather than
+   * guessing.
+   *
+   * The plan is specific: `mycroft`, `Mycroft` and `Mike` may all resolve to one
+   * agent, but a name two visible agents both claim must return candidates. An
+   * alias that collides with a different agent's canonical ID is exactly that
+   * case — silently preferring the ID would attribute work to the wrong agent,
+   * and the person who typed the name would never know.
+   */
+  resolveAgent(query: string): { match?: AgentProfile; candidates: AgentProfile[] } {
+    const normalized = query.trim().toLowerCase();
+    const rows = this.db()
       .prepare(
-        'SELECT a.profile_json FROM agents a JOIN aliases x ON x.agent_id = a.id WHERE x.alias = ?',
+        `SELECT DISTINCT a.profile_json
+           FROM agents a
+           LEFT JOIN aliases x ON x.agent_id = a.id
+          WHERE lower(a.id) = ? OR x.normalized_alias = ?
+          ORDER BY a.id ASC`,
       )
-      .get(idOrAlias) as ProfileRow | undefined;
-    return alias ? profileSchema.parse(JSON.parse(alias.profile_json)) : undefined;
+      .all(normalized, normalized) as unknown as ProfileRow[];
+    const candidates = rows.map((row) => profileSchema.parse(JSON.parse(row.profile_json)));
+    return candidates.length === 1
+      ? { match: candidates[0]!, candidates }
+      : { candidates };
+  }
+
+  /* ------------------------------------------------------- runtime bindings */
+
+  listRuntimeBindings(agentId: string): AgentRuntimeBinding[] {
+    const rows = this.db()
+      .prepare(
+        `SELECT id, agent_id, installation_id, runtime, profile, capabilities_json,
+                bound_at, last_seen_at
+           FROM agent_runtime_bindings WHERE agent_id = ? ORDER BY bound_at ASC`,
+      )
+      .all(agentId) as unknown as Array<{
+      id: string;
+      agent_id: string;
+      installation_id: string | null;
+      runtime: string;
+      profile: string | null;
+      capabilities_json: string;
+      bound_at: string;
+      last_seen_at: string | null;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      agentId: row.agent_id,
+      ...(row.installation_id ? { installationId: row.installation_id } : {}),
+      runtime: row.runtime,
+      ...(row.profile ? { profile: row.profile } : {}),
+      capabilities: JSON.parse(row.capabilities_json) as Record<string, JsonValue>,
+      boundAt: row.bound_at,
+      ...(row.last_seen_at ? { lastSeenAt: row.last_seen_at } : {}),
+    }));
+  }
+
+  bindRuntime(binding: {
+    id: string;
+    agentId: string;
+    installationId?: string;
+    runtime: string;
+    profile?: string;
+    capabilities?: Record<string, JsonValue>;
+    boundAt: string;
+  }): void {
+    this.db()
+      .prepare(
+        `INSERT INTO agent_runtime_bindings(
+           id, agent_id, installation_id, runtime, profile, capabilities_json, bound_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(agent_id, runtime, COALESCE(profile, ''), COALESCE(installation_id, ''))
+         DO UPDATE SET capabilities_json = excluded.capabilities_json`,
+      )
+      .run(
+        binding.id,
+        binding.agentId,
+        binding.installationId ?? null,
+        binding.runtime,
+        binding.profile ?? null,
+        JSON.stringify(binding.capabilities ?? {}),
+        binding.boundAt,
+      );
+  }
+
+  unbindRuntime(bindingId: string): boolean {
+    const result = this.db()
+      .prepare('DELETE FROM agent_runtime_bindings WHERE id = ?')
+      .run(bindingId);
+    return Number(result.changes) > 0;
+  }
+
+  /**
+   * Advisory only. Records that Synomem observed this binding act — never that
+   * the runtime is reachable now, and never that a delivery succeeded.
+   */
+  touchRuntimeBinding(agentId: string, runtime: string, at: string): void {
+    this.db()
+      .prepare(
+        'UPDATE agent_runtime_bindings SET last_seen_at = ? WHERE agent_id = ? AND runtime = ?',
+      )
+      .run(at, agentId, runtime);
+  }
+
+  /**
+   * Writes an agent's aliases, refusing any that would make a name ambiguous.
+   *
+   * Two collisions matter and both are rejected here rather than at lookup: an
+   * alias another agent already claims, and an alias equal to a different
+   * agent's canonical ID. Catching them at write means the person adding the
+   * alias sees the conflict, instead of a later reader silently getting one of
+   * two possible agents.
+   */
+  private insertAliases(agentId: string, aliases: string[]): void {
+    for (const alias of aliases) {
+      const normalized = alias.trim().toLowerCase();
+      const conflictingAgent = this.db()
+        .prepare('SELECT id FROM agents WHERE lower(id) = ? AND id != ?')
+        .get(normalized, agentId) as { id: string } | undefined;
+      if (conflictingAgent) {
+        throw new SynomemError(
+          'ALIAS_CONFLICT',
+          `Alias "${alias}" is already the canonical ID of agent ${conflictingAgent.id}. Aliases must resolve to exactly one agent.`,
+        );
+      }
+      const conflictingAlias = this.db()
+        .prepare('SELECT agent_id FROM aliases WHERE normalized_alias = ? AND agent_id != ?')
+        .get(normalized, agentId) as { agent_id: string } | undefined;
+      if (conflictingAlias) {
+        throw new SynomemError(
+          'ALIAS_CONFLICT',
+          `Alias "${alias}" already belongs to agent ${conflictingAlias.agent_id}. Aliases must resolve to exactly one agent.`,
+        );
+      }
+      this.db()
+        .prepare('INSERT INTO aliases(alias, agent_id, normalized_alias) VALUES (?, ?, ?)')
+        .run(alias, agentId, normalized);
+    }
   }
 
   listAgents(): AgentProfile[] {

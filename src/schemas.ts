@@ -24,6 +24,30 @@ export const agentIdSchema = z
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Use lowercase ASCII letters, digits, and hyphens')
   .refine((id) => !reservedIds.has(id), 'Reserved agent ID');
 
+/**
+ * An alias as written, folded to the canonical lowercase form.
+ *
+ * People type `Mike` and `mike` interchangeably, so accepting either and
+ * storing one keeps a single alias from being claimed twice in two casings.
+ */
+export const agentAliasSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(63)
+  .regex(/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/, 'Use ASCII letters, digits, and hyphens')
+  .transform((alias) => alias.toLowerCase())
+  .refine((alias) => !reservedIds.has(alias), 'Reserved agent ID');
+
+/**
+ * A name offered for lookup, which may be an ID or an alias in any casing.
+ *
+ * Lookups are deliberately more permissive than writes: rejecting `Mycroft`
+ * for its capital letter would tell the caller nothing useful about whether
+ * that agent exists.
+ */
+export const agentLookupSchema = z.string().trim().min(1).max(100);
+
 export const actorSchema = z.object({
   kind: z.enum(['human', 'agent', 'system']),
   id: agentIdSchema,
@@ -88,7 +112,7 @@ export const evidenceSchema = z
 export const profileSchema = z.object({
   id: agentIdSchema,
   displayName: z.string().trim().min(1).max(200),
-  aliases: z.array(agentIdSchema).max(50).optional(),
+  aliases: z.array(agentAliasSchema).max(50).optional(),
   description: z.string().trim().max(2000).optional(),
   createdAt: z.string().datetime({ offset: true }),
   metadata: metadataSchema.optional(),
@@ -96,6 +120,21 @@ export const profileSchema = z.object({
 
 export const createAgentSchema = profileSchema.omit({ createdAt: true });
 export const updateAgentSchema = createAgentSchema.omit({ id: true }).partial();
+
+/**
+ * A runtime binding is a claim about where an agent runs, so the fields stay
+ * deliberately loose: Synomem should record a runtime it has never heard of
+ * rather than reject an install it cannot classify.
+ */
+export const bindRuntimeSchema = z
+  .object({
+    agentId: z.string().trim().min(1).max(100),
+    runtime: z.string().trim().min(1).max(100),
+    profile: z.string().trim().min(1).max(100).optional(),
+    installationId: z.string().trim().min(1).max(100).optional(),
+    capabilities: metadataSchema.optional(),
+  })
+  .strict();
 
 const baseEventSchema = z.object({
   schemaVersion: z.literal(1),

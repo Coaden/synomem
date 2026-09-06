@@ -762,6 +762,135 @@ export function createCli(
       },
     );
 
+  agentCommand
+    .command('resolve <name>')
+    .description('Resolve a name or alias to one agent, or list the candidates')
+    .action(async (name: string, _options, command: Command) => {
+      const global = globals(command);
+      const resolution = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli'),
+        (client) => client.agents.resolve(name),
+      );
+      // An ambiguous name is a question, not a failure: exit zero and show the
+      // candidates so the caller can pick one.
+      const human = resolution.match
+        ? `${resolution.match.displayName} (${resolution.match.id})`
+        : resolution.candidates.length
+          ? `"${resolution.query}" is ambiguous. Candidates:\n${resolution.candidates
+              .map((profile) => `  ${profile.id}  ${profile.displayName}`)
+              .join('\n')}`
+          : `No agent answers to "${resolution.query}".`;
+      output(io, global.json, resolution, human);
+    });
+
+  agentCommand
+    .command('directory')
+    .description('List agents with their runtime bindings')
+    .action(async (_options, command: Command) => {
+      const global = globals(command);
+      const entries = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli'),
+        (client) => client.agents.directory(),
+      );
+      const human = entries.length
+        ? entries
+            .map((entry) => {
+              const runtimes = entry.runtimeBindings.length
+                ? entry.runtimeBindings
+                    .map(
+                      (binding) =>
+                        `    ${binding.runtime}${binding.profile ? `/${binding.profile}` : ''}` +
+                        // Last-seen is advisory, so it is labelled as an
+                        // observation rather than a status.
+                        `${binding.lastSeenAt ? `  last seen ${binding.lastSeenAt}` : '  not yet seen'}`,
+                    )
+                    .join('\n')
+                : '    no runtime bindings';
+              return `${entry.profile.id}  ${entry.profile.displayName}\n${runtimes}`;
+            })
+            .join('\n')
+        : 'No agents configured.';
+      output(io, global.json, { entries }, human);
+    });
+
+  const runtimeCommand = agentCommand
+    .command('runtime')
+    .description('Record where an agent runs');
+
+  runtimeCommand
+    .command('bind <agent>')
+    .description('Bind an agent to a runtime')
+    .requiredOption('--runtime <name>', 'runtime family, e.g. claude-code')
+    .option('--profile <name>', 'named configuration within the runtime')
+    .option('--installation <id>', 'hosted installation this binding belongs to')
+    .action(
+      async (
+        agent: string,
+        options: { runtime: string; profile?: string; installation?: string },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const binding = await withClient(
+          global.home,
+          defaultActor(env, 'system', 'cli'),
+          (client) =>
+            client.agents.bindRuntime({
+              agentId: agent,
+              runtime: options.runtime,
+              ...(options.profile ? { profile: options.profile } : {}),
+              ...(options.installation ? { installationId: options.installation } : {}),
+            }),
+        );
+        output(
+          io,
+          global.json,
+          binding,
+          `Bound ${binding.agentId} to ${binding.runtime}${binding.profile ? `/${binding.profile}` : ''} (${binding.id})`,
+        );
+      },
+    );
+
+  runtimeCommand
+    .command('list <agent>')
+    .description('List an agent runtime bindings')
+    .action(async (agent: string, _options, command: Command) => {
+      const global = globals(command);
+      const bindings = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli'),
+        (client) => client.agents.bindings(agent),
+      );
+      const human = bindings.length
+        ? bindings
+            .map(
+              (binding) =>
+                `${binding.id}  ${binding.runtime}${binding.profile ? `/${binding.profile}` : ''}  bound ${binding.boundAt}`,
+            )
+            .join('\n')
+        : 'No runtime bindings.';
+      output(io, global.json, { bindings }, human);
+    });
+
+  runtimeCommand
+    .command('unbind <binding-id>')
+    .description('Remove a runtime binding')
+    .action(async (bindingId: string, _options, command: Command) => {
+      const global = globals(command);
+      const removed = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli'),
+        (client) => client.agents.unbindRuntime(bindingId),
+      );
+      output(
+        io,
+        global.json,
+        { removed },
+        removed ? `Removed binding ${bindingId}.` : `No binding ${bindingId}.`,
+      );
+    });
+
   const kudosCommand = program.command('kudos').description('Give and manage agent recognition');
 
   kudosCommand
