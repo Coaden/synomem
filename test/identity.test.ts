@@ -1,3 +1,5 @@
+import { spawn } from 'node:child_process';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { tempHome, testClient } from './helpers.js';
 
@@ -101,5 +103,73 @@ describe('agent identity and discovery', () => {
       client.agents.bindRuntime({ agentId: 'ghost', runtime: 'claude-code' }),
     ).rejects.toMatchObject({ code: 'AGENT_NOT_FOUND' });
     await client.close();
+  });
+});
+
+describe('agent-bound MCP registration', () => {
+  it('reads the display name from the profile rather than the command line', async () => {
+    const home = tempHome();
+    const client = await testClient(home);
+    await client.agents.create({
+      id: 'mycroft',
+      displayName: 'Mycroft',
+      aliases: ['mike'],
+    });
+    await client.close();
+
+    const server = spawn(
+      process.execPath,
+      [join(process.cwd(), 'dist', 'mcp-server.js'), '--home', home, '--agent-id', 'mike'],
+      { stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+    const stdout = await new Promise<string>((resolveOutput, rejectOutput) => {
+      let buffer = '';
+      server.stdout.on('data', (chunk: Buffer) => {
+        buffer += chunk.toString();
+        if (buffer.includes('\n')) resolveOutput(buffer);
+      });
+      server.on('error', rejectOutput);
+      server.stdin.write(
+        `${JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2025-06-18',
+            capabilities: {},
+            clientInfo: { name: 'identity-test', version: '1.0.0' },
+          },
+        })}\n`,
+      );
+    });
+    server.kill();
+    expect(stdout).toContain('"result"');
+
+    // The alias resolved to the canonical agent, and nothing on the command
+    // line asserted a name.
+    const verifier = await testClient(home, { kind: 'agent', id: 'mycroft' });
+    expect((await verifier.agents.get('mike')).displayName).toBe('Mycroft');
+    await verifier.close();
+  });
+
+  it('refuses to start against an agent that does not exist', async () => {
+    const home = tempHome();
+    const client = await testClient(home);
+    await client.close();
+
+    const exit = await new Promise<{ code: number | null; stderr: string }>((resolveExit) => {
+      const server = spawn(
+        process.execPath,
+        [join(process.cwd(), 'dist', 'mcp-server.js'), '--home', home, '--agent-id', 'ghost'],
+        { stdio: ['ignore', 'ignore', 'pipe'] },
+      );
+      let stderr = '';
+      server.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      server.on('close', (code) => resolveExit({ code, stderr }));
+    });
+    expect(exit.code).not.toBe(0);
+    expect(exit.stderr).toContain('Unknown agent');
   });
 });

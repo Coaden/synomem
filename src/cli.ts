@@ -637,29 +637,73 @@ export function createCli(
     .option('--yes', 'apply the displayed plan', false)
     .option('--force', 'replace a conflicting synomem directory', false)
     .option('--link', 'symlink to the packaged skill instead of copying it', false)
-    .option('--actor-id <id>', 'print actor-bound MCP registration commands')
-    .option('--actor-name <name>', 'display name used in MCP registration commands')
+    .option('--agent <id-or-alias>', 'bind this installation to an agent')
     .action(
-      (
+      async (
         options: {
           runtime: string[];
           yes: boolean;
           force: boolean;
           link: boolean;
-          actorId?: string;
-          actorName?: string;
+          agent?: string;
         },
         command: Command,
       ) => {
         const global = globals(command);
+        const runtimes = skillRuntimes(options.runtime);
+
+        /*
+         * The agent is resolved BEFORE anything is written. An ambiguous or
+         * unknown name then stops the command with a name to fix, rather than
+         * leaving a skill installed and pointed at an agent that does not
+         * exist.
+         */
+        let agentId: string | undefined;
+        if (options.agent) {
+          agentId = await withClient(
+            global.home,
+            defaultActor(env, 'system', 'cli'),
+            async (client) => {
+              const resolution = await client.agents.resolve(options.agent!);
+              if (!resolution.match) {
+                throw new SynomemError(
+                  'AGENT_NOT_FOUND',
+                  resolution.candidates.length
+                    ? `"${options.agent}" matches ${resolution.candidates.length} agents: ${resolution.candidates
+                        .map((candidate) => candidate.id)
+                        .join(', ')}. Name one of them.`
+                    : `Unknown agent: ${options.agent}`,
+                );
+              }
+              return resolution.match.id;
+            },
+          );
+        }
+
         const result = installSkill({
-          runtimes: skillRuntimes(options.runtime),
+          ...(runtimes ? { runtimes } : {}),
           apply: options.yes,
           force: options.force,
           link: options.link,
-          actorId: options.actorId,
-          actorName: options.actorName,
+          ...(agentId ? { agentId } : {}),
         });
+
+        // Bindings follow what was actually installed, and only on a real run:
+        // a dry run must not claim a binding it did not make, and a runtime
+        // whose harness is not present here is not somewhere this agent runs.
+        if (agentId && options.yes) {
+          const installed = result.locations
+            .filter((location) => location.state !== 'unavailable')
+            .map((location) => location.runtime);
+          if (installed.length) {
+            await withClient(global.home, defaultActor(env, 'system', 'cli'), async (client) => {
+              for (const runtime of installed) {
+                await client.agents.bindRuntime({ agentId: agentId!, runtime });
+              }
+            });
+          }
+        }
+
         output(io, global.json, result, formatSkillResult(result, 'install'));
       },
     );
@@ -668,19 +712,15 @@ export function createCli(
     .command('status')
     .description('Show installed, stale, missing, or conflicting skill copies')
     .option('--runtime <runtime>', `${skillRuntimeHelp} (repeatable)`, collect, [])
-    .option('--actor-id <id>', 'print actor-bound MCP registration commands')
-    .option('--actor-name <name>', 'display name used in MCP registration commands')
-    .action(
-      (options: { runtime: string[]; actorId?: string; actorName?: string }, command: Command) => {
-        const global = globals(command);
-        const result = skillStatus({
-          runtimes: skillRuntimes(options.runtime),
-          actorId: options.actorId,
-          actorName: options.actorName,
-        });
-        output(io, global.json, result, formatSkillResult(result, 'status'));
-      },
-    );
+    .option('--agent <id>', 'print the registration command for this agent')
+    .action((options: { runtime: string[]; agent?: string }, command: Command) => {
+      const global = globals(command);
+      const result = skillStatus({
+        runtimes: skillRuntimes(options.runtime),
+        ...(options.agent ? { agentId: options.agent } : {}),
+      });
+      output(io, global.json, result, formatSkillResult(result, 'status'));
+    });
 
   skillCommand
     .command('uninstall')
@@ -1912,18 +1952,44 @@ export function createCli(
   program
     .command('mcp')
     .description('Run the actor-bound MCP server over stdio')
-    .requiredOption('--actor-id <id>')
-    .requiredOption('--actor-kind <kind>', 'human, agent, or system')
-    .option('--actor-name <display-name>')
+    .option('--agent-id <id>', 'bound agent, whose identity is read from Synomem')
+    .option('--actor-id <id>', 'bound non-agent actor ID')
+    .option('--actor-kind <kind>', 'human or system')
+    .option('--actor-name <display-name>', 'display name for a non-agent actor')
     .action(
       async (
-        options: { actorId: string; actorKind: string; actorName?: string },
+        options: { agentId?: string; actorId?: string; actorKind?: string; actorName?: string },
         command: Command,
       ) => {
         const global = globals(command);
+        // An agent's name comes from its profile, never from the command line:
+        // the name is written into every event the session appends, and a
+        // harness must not be able to sign another agent's name to work.
+        const bound = options.agentId
+          ? await withClient(global.home, defaultActor(env, 'system', 'cli'), async (client) => {
+              const resolution = await client.agents.resolve(options.agentId!);
+              if (!resolution.match) {
+                throw new SynomemError(
+                  'AGENT_NOT_FOUND',
+                  resolution.candidates.length
+                    ? `"${options.agentId}" matches ${resolution.candidates.length} agents: ${resolution.candidates
+                        .map((candidate) => candidate.id)
+                        .join(', ')}. Name one of them.`
+                    : `Unknown agent: ${options.agentId}`,
+                );
+              }
+              return actor('agent', resolution.match.id, resolution.match.displayName);
+            })
+          : undefined;
+        if (!bound && !(options.actorId && options.actorKind)) {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            'Specify --agent-id, or --actor-id with --actor-kind for a non-agent actor.',
+          );
+        }
         await startMcpServer({
           ...(global.home ? { home: global.home } : {}),
-          actor: actor(options.actorKind, options.actorId, options.actorName),
+          actor: bound ?? actor(options.actorKind!, options.actorId!, options.actorName),
         });
       },
     );

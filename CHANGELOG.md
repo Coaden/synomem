@@ -5,6 +5,13 @@ All notable changes will be documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The MCP server binds to an agent with `--agent-id`, reading the display name and actor kind from
+  the agent's profile. `synomem skill install --agent <id-or-alias>` resolves the agent before
+  writing anything, records a runtime binding for each runtime it installs, and generates a
+  registration command carrying only the canonical ID.
+
 ## [0.2.0] - 2026-09-05
 
 ### Added

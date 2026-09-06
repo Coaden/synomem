@@ -57,8 +57,14 @@ export interface SkillOptions {
   apply?: boolean;
   force?: boolean;
   link?: boolean;
-  actorId?: string;
-  actorName?: string;
+  /**
+   * The agent this installation binds to.
+   *
+   * Only the canonical ID is written into the generated registration command.
+   * The display name and kind are read from the agent's profile at startup, so
+   * a harness cannot sign another agent's name to work it did.
+   */
+  agentId?: string;
   userHome?: string;
   env?: NodeJS.ProcessEnv;
   source?: string;
@@ -160,19 +166,10 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-function mcpCommand(
-  runtime: SkillRuntime,
-  actorId?: string,
-  actorName?: string,
-): string | undefined {
-  if (!actorId) return undefined;
-  const identity = actorSchema.parse({
-    kind: 'agent',
-    id: actorId,
-    displayName: actorName ?? actorId,
-  });
-  const name = identity.displayName ?? identity.id;
-  const args = ['--actor-id', identity.id, '--actor-kind', 'agent', '--actor-name', name];
+function mcpCommand(runtime: SkillRuntime, agentId?: string): string | undefined {
+  if (!agentId) return undefined;
+  const identity = actorSchema.parse({ kind: 'agent', id: agentId });
+  const args = ['--agent-id', identity.id];
   if (runtime === 'codex') {
     return `codex mcp add synomem -- synomem-mcp ${args.map(shellQuote).join(' ')}`;
   }
@@ -258,7 +255,7 @@ export function skillStatus(options: SkillOptions = {}): SkillOperationResult {
     packageVersion: packageVersion(),
     locations,
     mcpCommands: locations
-      .map((location) => mcpCommand(location.runtime, options.actorId, options.actorName))
+      .map((location) => mcpCommand(location.runtime, options.agentId))
       .filter((value): value is string => Boolean(value)),
   };
 }
@@ -326,7 +323,7 @@ export function formatSkillResult(
     lines.push('', 'Dry run only. Re-run with --yes to apply.');
   if (result.mcpCommands.length) lines.push('', 'MCP registration:', ...result.mcpCommands);
   else if (operation === 'install') {
-    lines.push('', 'Tip: add --actor-id <agent-id> to print MCP registration commands.');
+    lines.push('', 'Tip: add --agent <agent-id> to print MCP registration commands.');
   }
   return lines.join('\n');
 }

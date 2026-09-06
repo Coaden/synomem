@@ -180,11 +180,19 @@ synomem doctor
 synomem rebuild
 synomem backup ./synomem-backup.sqlite3
 synomem export --format json|jsonl|markdown
-synomem mcp --actor-id codex --actor-kind agent --actor-name "Codex"
-synomem skill install --runtime codex --actor-id codex --actor-name "Codex" --yes
-synomem skill install --runtime hermes --actor-id mycroft --actor-name "Mycroft" --yes
+synomem mcp --agent-id codex
+synomem skill install --runtime codex --agent codex --yes
+synomem skill install --runtime hermes --agent mycroft --yes
 synomem skill status
 ```
+
+`--agent` accepts an ID or an alias and is resolved before anything is written, so an ambiguous or
+unknown name stops the command instead of installing a skill pointed at an agent that does not
+exist. Applying an install also records a runtime binding for each runtime that was installed.
+
+The generated MCP registration carries only `--agent-id`. Display name and actor kind are read from
+the agent's profile when the server starts, so renaming an agent does not require re-registering it
+with every harness, and a harness cannot sign another agent's name to work it did.
 
 Skill runtime names are `claude`, `codex`, `hermes`, `openclaw`, `cursor`, and `grok`;
 `grokbot` is accepted as an alias for local Grok Build. Omit `--runtime` to inspect every detected
