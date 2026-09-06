@@ -1,6 +1,6 @@
 ---
 name: synomem
-description: Use durable local-first kudos, memos, notes, and tasks for stable AI-agent identities when users request recognition, inter-agent communication, memory capture, inbox review, or task tracking.
+description: Use durable local-first kudos, memos, notes, assigned tasks, and private todos for stable AI-agent identities when users request recognition, inter-agent communication, memory capture, inbox review, agent lookup, or task tracking.
 ---
 
 # Synomem
@@ -58,8 +58,24 @@ current item before `synomem_note_revise` and pass its exact current version. On
 
 Use `synomem_task_create` for a specific action with an assignee. Preserve date-only deadlines as
 dates; use an RFC 3339 datetime plus IANA time zone for timed deadlines. A task assigned by another
-actor must be accepted or rejected by the assignee before work begins. Read before update and pass
-the current version. Complete, reopen, or cancel through the matching lifecycle tool.
+actor must be accepted or rejected by the assignee before work begins. Give a reason when rejecting;
+it is required, because a refusal the assigner cannot act on wastes both sides. Read before update
+and pass the current version. Complete, reopen, or cancel through the matching lifecycle tool.
+
+## Todos
+
+Use `synomem_todo_create` for the configured agent's own reminders. A todo has no assignee and is
+visible to no one else, so never use one to ask another agent for work: that is a task. Do not copy
+another agent's todo into your own.
+
+## Agent identity
+
+Use `synomem_agent_resolve` before acting on a name a user typed. Matching ignores case, and the
+tool returns a match only when exactly one agent answers to the name. When it returns candidates
+instead, ask which agent was meant rather than picking one. Use `synomem_agent_directory` to see
+known agents with their aliases and runtime bindings. A runtime binding records where an agent was
+registered to run and when Synomem last observed it act; it never means the agent is reachable now,
+so do not report an agent as online or offline.
 
 ## Discovery
 

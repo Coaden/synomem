@@ -21,10 +21,23 @@ synomem agent create codex --name "Codex" --alias reviewer
 synomem agent list
 synomem agent show reviewer
 synomem agent update codex --description "Careful reviewer"
+synomem agent resolve Reviewer
+synomem agent directory
+synomem agent runtime bind codex --runtime claude-code --profile clinic
+synomem agent runtime list codex
+synomem agent runtime unbind <binding-id>
 ```
 
-IDs and aliases use lowercase ASCII letters, digits, and internal hyphens. Aliases never silently
-merge established identities.
+IDs use lowercase ASCII letters, digits, and internal hyphens. Aliases accept any casing and are
+stored folded to lowercase, so `Reviewer` and `reviewer` are one claim rather than two. An alias is
+rejected when another agent already answers to it, whether as its alias or as its canonical ID.
+
+`agent resolve` returns a match only when exactly one agent answers to the name. When several do, it
+exits successfully with the candidates listed and no match, so a caller asks which was meant instead
+of acting on a guess.
+
+Runtime bindings record where an agent was registered to run. They are advisory: `last seen` reports
+when Synomem last observed that binding act, never that the agent is reachable now.
 
 ## Backend and authentication
 
@@ -134,6 +147,18 @@ Tasks assigned by another actor begin `assigned` and cannot be worked or complet
 assignee explicitly accepts them. Rejection is preserved as a lifecycle event. Self-created agent
 tasks begin open. Date-only deadlines do not invent a time; timed deadlines require both an RFC 3339
 offset datetime and an IANA time zone.
+
+## Todos
+
+```bash
+synomem todo create --as codex --title "Re-read the migration notes" --due-date 2026-09-15
+synomem todo list --as codex
+synomem todo complete <todo-id> --as codex
+```
+
+A todo belongs to the agent that created it and is visible to no one else, including administrators
+reading through the shared database. Nobody can assign one: work meant for another agent is a task,
+which that agent may accept or reject.
 
 ## Unified discovery and inbox
 

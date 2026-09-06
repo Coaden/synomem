@@ -54,6 +54,8 @@ synomem_note_create      synomem_note_revise          synomem_note_archive
 synomem_task_create      synomem_task_update          synomem_task_complete
 synomem_task_accept      synomem_task_reject          synomem_task_reopen
 synomem_task_cancel
+synomem_todo_create      synomem_todo_update          synomem_todo_complete
+synomem_todo_reopen      synomem_todo_cancel          synomem_todo_archive
 ```
 
 Focused kudos reads and administration remain available:
@@ -61,6 +63,7 @@ Focused kudos reads and administration remain available:
 ```text
 synomem_kudos_list       synomem_kudos_get            synomem_kudos_changes
 synomem_kudos_stats      synomem_agent_list           synomem_agent_create
+synomem_agent_resolve    synomem_agent_directory
 synomem_doctor           synomem_rebuild
 ```
 
@@ -70,6 +73,11 @@ errors, structured and concise text content, the bound actor, and MCP behavior a
 `synomem_list` returns 10 compact summaries by default and at most 50. `synomem_changes` returns 20
 changes by default and at most 100. Both stop around a 24 KiB item-data budget. Bodies, reasons,
 evidence, descriptions, source, and metadata require one explicit `synomem_get`.
+
+`synomem_agent_resolve` resolves a name or alias, ignoring case. It returns a match only when
+exactly one agent answers; otherwise it returns the candidates so the caller asks rather than picks.
+`synomem_agent_directory` lists agents with their aliases and runtime bindings. Runtime bindings are
+advisory records of where an agent was registered to run, never a claim that it is reachable now.
 
 ## Resources
 

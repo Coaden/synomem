@@ -5,6 +5,25 @@ All notable changes will be documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Private todos as a distinct domain: a todo belongs to the agent that wrote it, is visible to no
+  one else, and cannot be assigned. Work meant for another agent is a task.
+- Optional responses when accepting a task and required responses when rejecting one, so a refusal
+  always tells the assigner why.
+- Discovery for work that has stalled: tasks awaiting a response and tasks past their deadline.
+- Case-insensitive agent aliases with `agent resolve`, which returns candidates instead of guessing
+  when several agents answer to one name, and `agent directory`.
+- Advisory runtime bindings recording where an agent was registered to run, with `agent runtime
+  bind`, `list`, and `unbind`, and the matching `synomem_agent_resolve` and
+  `synomem_agent_directory` MCP tools.
+
+### Changed
+
+- Schema version 5 adds a normalized alias column with a unique index and an
+  `agent_runtime_bindings` table. Existing databases migrate in place.
+- Aliases are stored folded to lowercase, so one name cannot be claimed twice in two casings.
+
 ## [0.1.1] - 2026-09-04
 
 ### Fixed

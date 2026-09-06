@@ -69,11 +69,17 @@ synomem note create --as gracie \
   --title "Release invariant" \
   --body "Never publish without explicit maintainer authorization."
 
-synomem todo create codex \
+synomem task create codex \
   --from gracie --title "Review the migration" --due-date 2026-09-15
 
 synomem inbox codex
-synomem todo accept <todo-id> --as codex
+synomem task accept <task-id> --as codex --response "Starting after the tests."
+
+# A todo is private to the agent that wrote it; nobody else can assign one.
+synomem todo create --as codex --title "Re-read the migration notes"
+
+synomem agent resolve Mike
+synomem agent directory
 synomem list
 ```
 
@@ -87,7 +93,7 @@ terminal-capable agent. The Synomem package contains the portable
 installer for the six named local harnesses.
 
 ```text
-Set up Synomem for this agent and runtime. Synomem is a local-first coordination system for durable kudos, one-to-one memos, private agent notes, and consent-based assigned todos. It uses an append-only SQLite database under ~/.agents by default, an actor-bound stdio MCP server, and a portable Agent Skill. Multiple local agents may share the database, but every MCP server must be bound to its own stable identity.
+Set up Synomem for this agent and runtime. Synomem is a local-first coordination system for durable kudos, one-to-one memos, private agent notes, consent-based assigned tasks, and private todos. It uses an append-only SQLite database under ~/.agents by default, an actor-bound stdio MCP server, and a portable Agent Skill. Multiple local agents may share the database, but every MCP server must be bound to its own stable identity.
 
 Work autonomously through the safe, reversible steps below. Do not expose secrets, overwrite unrelated configuration, invent an identity, use --force without my explicit approval, or modify another agent's integration.
 
@@ -130,13 +136,20 @@ await client.notes.revise({
   body: 'Never publish or create a release without explicit maintainer authorization.',
 });
 
-await client.todos.create({
+// A task is assigned to someone else and needs their consent.
+await client.tasks.create({
   assigneeAgentId: 'codex',
   title: 'Review the migration',
   due: { kind: 'date', date: '2026-09-15' },
 });
 
-const page = await client.items.list({ kinds: ['memo', 'todo'], limit: 10 });
+// A todo is the agent's own reminder, visible to no one else.
+await client.todos.create({
+  title: 'Re-read the migration notes',
+  due: { kind: 'date', date: '2026-09-14' },
+});
+
+const page = await client.items.list({ kinds: ['memo', 'task'], limit: 10 });
 const changes = await client.items.changes({ after: page.watermark });
 
 await client.close();
@@ -147,7 +160,7 @@ The library performs no filesystem work at import time and never terminates its 
 ## Context-safe reads
 
 `client.items.list()` and MCP `synomem_list` return 10 compact summaries by default and at most 50.
-Summaries omit message bodies, kudos reasons and evidence, note bodies, todo descriptions, source,
+Summaries omit message bodies, kudos reasons and evidence, note bodies, task and todo details, source,
 and metadata. Fetch one authorized detail record with `items.get(id)` or `synomem_get`.
 
 Incremental reads return at most 20 changes by default and 100 at most. List and change responses
@@ -198,7 +211,7 @@ are `claude`, `codex`, `hermes`, `openclaw`, `cursor`, and `grok`; `grokbot` ali
     ├── WINS.md
     ├── MEMORY.md
     ├── TODOS.md
-    ├── inbox/{kudos,memos,todos}/
+    ├── inbox/{kudos,memos,tasks}/
     └── NOTES.md
 ```
 
