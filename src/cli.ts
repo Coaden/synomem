@@ -698,7 +698,7 @@ export function createCli(
           if (installed.length) {
             await withClient(global.home, defaultActor(env, 'system', 'cli'), async (client) => {
               for (const runtime of installed) {
-                await client.agents.bindRuntime({ agentId: agentId!, runtime });
+                await client.agents.bindRuntime({ agentId, runtime });
               }
             });
           }
