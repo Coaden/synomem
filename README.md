@@ -210,7 +210,7 @@ are `claude`, `codex`, `hermes`, `openclaw`, `cursor`, and `grok`; `grokbot` ali
     ├── profile.json
     ├── WINS.md
     ├── MEMORY.md
-    ├── TODOS.md
+    ├── TASKS.md
     ├── inbox/{kudos,memos,tasks}/
     └── NOTES.md
 ```

@@ -18,7 +18,7 @@ title: Storage format
     ├── profile.json
     ├── WINS.md
     ├── MEMORY.md
-    ├── TODOS.md
+    ├── TASKS.md
     ├── inbox/{kudos,memos,tasks}/<item-id>.md
     └── NOTES.md
 ```
@@ -66,7 +66,7 @@ metadata remain in canonical events and require detail reads. Machine APIs never
 
 ## Generated and owned files
 
-`profile.json`, `WINS.md`, `MEMORY.md`, `TODOS.md`, and inbox entries are generated. Normal mutations
+`profile.json`, `WINS.md`, `MEMORY.md`, `TASKS.md`, and inbox entries are generated. Normal mutations
 synchronize only affected agents; `synomem rebuild` performs full deterministic regeneration.
 Cleanup removes only manifest-listed regular files and never follows symlinks.
 

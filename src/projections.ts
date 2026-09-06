@@ -521,7 +521,7 @@ export class ProjectionManager implements ProjectionWriter {
       }
       const agentTasks = tasks.filter((record) => record.event.assigneeAgentId === profile.id);
       if (this.storage.config.projection.writeTasksMarkdown) {
-        const tasksPath = join(agentDirectory, 'TODOS.md');
+        const tasksPath = join(agentDirectory, 'TASKS.md');
         atomicWriteDerivedFile(tasksPath, tasksMarkdown(profile, agentTasks, rebuiltAt));
         generated.push(manifestPath(this.storage.home, tasksPath));
       }
@@ -628,7 +628,7 @@ export class ProjectionManager implements ProjectionWriter {
     }
 
     if (this.storage.config.projection.writeTasksMarkdown) {
-      const tasksPath = join(agentDirectory, 'TODOS.md');
+      const tasksPath = join(agentDirectory, 'TASKS.md');
       atomicWriteDerivedFile(tasksPath, tasksMarkdown(profile, tasks, rebuiltAt));
       generated.push(manifestPath(this.storage.home, tasksPath));
     }
@@ -690,7 +690,7 @@ export class ProjectionManager implements ProjectionWriter {
       paths.push(`${profile.id}/profile.json`);
       if (this.storage.config.projection.writeWinsMarkdown) paths.push(`${profile.id}/WINS.md`);
       if (this.storage.config.projection.writeMemoryMarkdown) paths.push(`${profile.id}/MEMORY.md`);
-      if (this.storage.config.projection.writeTasksMarkdown) paths.push(`${profile.id}/TODOS.md`);
+      if (this.storage.config.projection.writeTasksMarkdown) paths.push(`${profile.id}/TASKS.md`);
       if (this.storage.config.projection.writeInboxEntries) {
         for (const record of records.filter(
           (item) =>

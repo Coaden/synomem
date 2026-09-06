@@ -150,7 +150,7 @@ describe('Synomem domains', () => {
     expect(
       (await codex.tasks.cancel({ taskId: created.record.event.id, reason: 'Superseded.' })).status,
     ).toBe('canceled');
-    expect(readFileSync(join(home, 'codex', 'TODOS.md'), 'utf8')).toContain('Review migration');
+    expect(readFileSync(join(home, 'codex', 'TASKS.md'), 'utf8')).toContain('Review migration');
     await codex.close();
   });
 

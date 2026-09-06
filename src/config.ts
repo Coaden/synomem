@@ -144,7 +144,7 @@ function environmentConfig(env: NodeJS.ProcessEnv): SynomemConfigOverrides {
 
   const writeWinsMarkdown = optionalBoolean(env, 'SYNOMEM_WRITE_WINS_MARKDOWN');
   const writeMemoryMarkdown = optionalBoolean(env, 'SYNOMEM_WRITE_MEMORY_MARKDOWN');
-  const writeTasksMarkdown = optionalBoolean(env, 'SYNOMEM_WRITE_TODOS_MARKDOWN');
+  const writeTasksMarkdown = optionalBoolean(env, 'SYNOMEM_WRITE_TASKS_MARKDOWN');
   const writeInboxEntries = optionalBoolean(env, 'SYNOMEM_WRITE_INBOX_ENTRIES');
   const allowSelfAwards = optionalBoolean(env, 'SYNOMEM_ALLOW_SELF_AWARDS');
   const allowCrossAgentTasks = optionalBoolean(env, 'SYNOMEM_ALLOW_CROSS_AGENT_TODOS');
