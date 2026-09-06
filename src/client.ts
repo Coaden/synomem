@@ -173,6 +173,41 @@ export class SynomemCore implements SynomemDomainService {
       this.todoTransition(input, 'todo.archived'),
   };
 
+  /**
+   * Unanswered and overdue discovery.
+   *
+   * The plan asks for shared work to be observable without treating runtime
+   * metadata as a delivery guarantee. These are query states derived from
+   * durable events: they say nobody has answered yet, not that the agent was
+   * offline, missed a notification, or lacks a capability it claimed.
+   */
+  readonly discovery = {
+    /**
+     * Tasks awaiting acceptance, unread memos, and unacknowledged kudos —
+     * optionally only those older than a given age or instant.
+     */
+    unanswered: (
+      input: Omit<ItemListInput, 'awaitingResponse' | 'pending'> & { olderThanHours?: number } = {},
+    ) => {
+      const { olderThanHours, awaitingSince, ...rest } = input;
+      const since =
+        awaitingSince ??
+        (olderThanHours !== undefined
+          ? new Date(Date.now() - olderThanHours * 3_600_000).toISOString()
+          : undefined);
+      return this.listItems({
+        ...rest,
+        awaitingResponse: true,
+        ...(since ? { awaitingSince: since } : {}),
+      });
+    },
+    /** Open work whose deadline has passed. Defaults to "now". */
+    overdue: (input: Omit<ItemListInput, 'overdueAsOf'> & { asOf?: string } = {}) => {
+      const { asOf, ...rest } = input;
+      return this.listItems({ ...rest, overdueAsOf: asOf ?? new Date().toISOString() });
+    },
+  };
+
   readonly items = {
     list: (input: ItemListInput = {}) => this.listItems(input),
     get: (id: string) => this.getItem(id),
@@ -1221,6 +1256,15 @@ export class SynomemCore implements SynomemDomainService {
   }
 }
 
+/**
+ * The schema version this package writes and expects. Named rather than
+ * repeated as a literal because it is asserted in three places, and a doctor
+ * check that silently lags the migration runner reports a healthy database as
+ * broken.
+ */
+const CURRENT_SCHEMA_VERSION = 4;
+const EXPECTED_APPLIED_MIGRATIONS = [1, 2, 3, 4];
+
 export class SynomemClient extends SynomemCore implements SynomemService {
   readonly home: string;
   readonly storage: SynomemStorage;
@@ -1319,8 +1363,9 @@ export class SynomemClient extends SynomemCore implements SynomemService {
       });
       const migrationState = this.storage.migrationState();
       const migrationsValid =
-        migrationState.schemaVersion === 3 &&
-        JSON.stringify(migrationState.appliedVersions) === JSON.stringify([1, 2, 3]);
+        migrationState.schemaVersion === CURRENT_SCHEMA_VERSION &&
+        JSON.stringify(migrationState.appliedVersions) ===
+          JSON.stringify(EXPECTED_APPLIED_MIGRATIONS);
       diagnostics.push({
         level: migrationsValid ? 'ok' : 'error',
         code: migrationsValid ? 'MIGRATIONS_VALID' : 'MIGRATIONS_INCONSISTENT',

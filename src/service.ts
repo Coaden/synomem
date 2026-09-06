@@ -7,6 +7,8 @@ import type {
   CreateNoteInput,
   CreateNoteResult,
   CreateTaskInput,
+  CreateTodoInput,
+  CreateTodoResult,
   CreateTaskResult,
   DoctorResult,
   GiveKudosInput,
@@ -28,8 +30,10 @@ import type {
   SendMemoInput,
   SendMemoResult,
   TaskRecord,
+  TodoRecord,
   UpdateAgentInput,
   UpdateTaskInput,
+  UpdateTodoInput,
 } from './types.js';
 
 export interface SynomemServiceCapabilities {
@@ -98,10 +102,16 @@ export interface SynomemDomainService {
     list(input?: Omit<ItemListInput, 'kinds'>): Promise<Page<ItemSummary>>;
     get(id: string): Promise<TaskRecord>;
     update(input: UpdateTaskInput): Promise<TaskRecord>;
-    accept(input: { taskId: string; idempotencyKey?: string }): Promise<TaskRecord>;
+    accept(input: {
+      taskId: string;
+      /** Optional: conditions, timing, or partial capability. */
+      response?: string;
+      idempotencyKey?: string;
+    }): Promise<TaskRecord>;
     reject(input: {
       taskId: string;
-      reason?: string;
+      /** Required: a refusal the assigner cannot act on is barely an answer. */
+      response: string;
       idempotencyKey?: string;
     }): Promise<TaskRecord>;
     complete(input: {
@@ -115,6 +125,39 @@ export interface SynomemDomainService {
       reason?: string;
       idempotencyKey?: string;
     }): Promise<TaskRecord>;
+  };
+  /**
+   * Private self-reminders. No assignee, no acceptance, owner-only reads.
+   */
+  readonly todos: {
+    create(input: CreateTodoInput): Promise<CreateTodoResult>;
+    list(input?: Omit<ItemListInput, 'kinds'>): Promise<Page<ItemSummary>>;
+    get(id: string): Promise<TodoRecord>;
+    update(input: UpdateTodoInput): Promise<TodoRecord>;
+    complete(input: {
+      todoId: string;
+      note?: string;
+      idempotencyKey?: string;
+    }): Promise<TodoRecord>;
+    reopen(input: { todoId: string; idempotencyKey?: string }): Promise<TodoRecord>;
+    cancel(input: {
+      todoId: string;
+      reason?: string;
+      idempotencyKey?: string;
+    }): Promise<TodoRecord>;
+    archive(input: { todoId: string; idempotencyKey?: string }): Promise<TodoRecord>;
+  };
+  /**
+   * Unanswered and overdue discovery. Derived from durable events; never a
+   * statement about whether an agent is reachable.
+   */
+  readonly discovery: {
+    unanswered(
+      input?: Omit<ItemListInput, 'awaitingResponse' | 'pending'> & { olderThanHours?: number },
+    ): Promise<Page<ItemSummary>>;
+    overdue(
+      input?: Omit<ItemListInput, 'overdueAsOf'> & { asOf?: string },
+    ): Promise<Page<ItemSummary>>;
   };
   readonly items: {
     list(input?: ItemListInput): Promise<Page<ItemSummary>>;

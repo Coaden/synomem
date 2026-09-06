@@ -10,12 +10,14 @@ import {
   changesInputSchema,
   createNoteSchema,
   createTaskSchema,
+  createTodoSchema,
   giveKudosMcpSchema,
   itemListInputSchema,
   listInputSchema,
   reviseNoteSchema,
   sendMemoSchema,
   updateTaskSchema,
+  updateTodoSchema,
 } from '../schemas.js';
 import { packageVersion } from '../version.js';
 import type { SynomemService, SynomemServiceFactory } from '../service.js';
@@ -631,11 +633,119 @@ export async function createSynomemMcpServer(
       }
     },
   );
+  server.registerTool(
+    'synomem_todo_create',
+    {
+      title: 'Create a private todo',
+      description:
+        'Create a private reminder for yourself. A todo has no assignee and nobody else can read it — use synomem_task_create when the work belongs to another agent.',
+      inputSchema: createTodoSchema,
+      outputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    async (input) => {
+      try {
+        const result = await client.todos.create(input);
+        return success(
+          actor,
+          `${result.deduplicated ? 'Returned existing' : 'Created'} private todo “${result.record.current.title}” (ID ${result.record.event.id}).`,
+          result,
+        );
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+  server.registerTool(
+    'synomem_todo_update',
+    {
+      title: 'Update a private todo',
+      description:
+        'Append an update to one of your own todos using the version last read. Stale versions fail rather than overwriting concurrent work.',
+      inputSchema: updateTodoSchema,
+      outputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    async (input) => {
+      try {
+        const record = await client.todos.update(input);
+        return success(
+          actor,
+          `Updated todo ${record.event.id} to version ${record.current.version}.`,
+          {
+            record,
+          },
+        );
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+  for (const operation of ['complete', 'reopen', 'cancel', 'archive'] as const) {
+    const todoInputSchema = z.object({
+      todoId: z.string().length(26),
+      note: z.string().trim().min(1).max(2000).optional(),
+      reason: z.string().trim().min(1).max(2000).optional(),
+      idempotencyKey: z.string().max(200).optional(),
+    });
+    server.registerTool(
+      `synomem_todo_${operation}`,
+      {
+        title: `${operation[0]!.toUpperCase()}${operation.slice(1)} a private todo`,
+        description: `${operation[0]!.toUpperCase()}${operation.slice(1)} one of your own todos by appending a lifecycle event; history is never deleted.`,
+        inputSchema: todoInputSchema,
+        outputSchema,
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: operation === 'cancel',
+          idempotentHint: true,
+        },
+      },
+      async (input) => {
+        try {
+          const record =
+            operation === 'complete'
+              ? await client.todos.complete({
+                  todoId: input.todoId,
+                  ...(input.note ? { note: input.note } : {}),
+                  ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+                })
+              : operation === 'cancel'
+                ? await client.todos.cancel({
+                    todoId: input.todoId,
+                    ...(input.reason ? { reason: input.reason } : {}),
+                    ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+                  })
+                : operation === 'archive'
+                  ? await client.todos.archive({
+                      todoId: input.todoId,
+                      ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+                    })
+                  : await client.todos.reopen({
+                      todoId: input.todoId,
+                      ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+                    });
+          return success(actor, `Todo ${record.event.id} is now ${record.status}.`, { record });
+        } catch (error) {
+          return failure(actor, error);
+        }
+      },
+    );
+  }
+
   for (const operation of ['accept', 'reject', 'complete', 'reopen', 'cancel'] as const) {
     const inputSchema = z.object({
       taskId: z.string().length(26),
       note: z.string().trim().min(1).max(2000).optional(),
       reason: z.string().trim().min(1).max(2000).optional(),
+      // Required on reject, optional on accept. Declaring it required in the
+      // tool schema for reject means a model is told before it calls, rather
+      // than discovering it from an error.
+      ...(operation === 'reject'
+        ? { response: z.string().trim().min(1).max(2000) }
+        : operation === 'accept'
+          ? { response: z.string().trim().min(1).max(2000).optional() }
+          : {}),
       idempotencyKey: z.string().max(200).optional(),
     });
     server.registerTool(
@@ -657,12 +767,14 @@ export async function createSynomemMcpServer(
             operation === 'accept'
               ? await client.tasks.accept({
                   taskId: input.taskId,
+                  ...('response' in input && input.response ? { response: input.response } : {}),
                   ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
                 })
               : operation === 'reject'
                 ? await client.tasks.reject({
                     taskId: input.taskId,
-                    ...(input.reason ? { reason: input.reason } : {}),
+                    response:
+                      ('response' in input ? input.response : undefined) ?? input.reason ?? '',
                     ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
                   })
                 : operation === 'complete'

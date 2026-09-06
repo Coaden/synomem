@@ -391,6 +391,22 @@ export interface ItemListInput extends PaginationInput {
   to?: string;
   /** Limit results to actionable inbox states; intended for the participant's own inbox. */
   pending?: boolean;
+  /**
+   * Limit results to items still waiting for somebody to answer: tasks awaiting
+   * acceptance, unread memos, unacknowledged kudos.
+   *
+   * Narrower than `pending`, which also counts accepted work in progress. These
+   * are query states derived from durable events — they do not prove an agent
+   * was online, saw a notification, or possessed a claimed capability.
+   */
+  awaitingResponse?: boolean;
+  /** With `awaitingResponse`, only items created at or before this instant. */
+  awaitingSince?: string;
+  /**
+   * Items whose deadline has passed at this instant and which are still open.
+   * A date-only deadline counts as the end of that day.
+   */
+  overdueAsOf?: string;
 }
 export interface KudosListInput extends PaginationInput {
   recipientAgentId?: string;

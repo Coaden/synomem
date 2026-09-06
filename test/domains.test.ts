@@ -388,3 +388,113 @@ describe('private todos', () => {
     await gracie.close();
   });
 });
+
+describe('unanswered and overdue discovery', () => {
+  it('finds work nobody has answered yet, without claiming why', async () => {
+    const home = tempHome();
+    const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
+    await gracie.agents.create({ id: 'codex', displayName: 'Codex' });
+
+    await gracie.tasks.create({ assigneeAgentId: 'codex', title: 'Awaiting a decision' });
+    await gracie.memos.send({ recipientAgentId: 'codex', subject: 'Unread', body: 'Please read.' });
+    await gracie.kudos.give({
+      recipientAgentId: 'codex',
+      title: 'Nice catch',
+      reason: 'Spotted the off-by-one.',
+    });
+
+    const answered = await gracie.tasks.create({
+      assigneeAgentId: 'codex',
+      title: 'Already answered',
+    });
+    await gracie.close();
+
+    const codex = await testClient(home, { kind: 'agent', id: 'codex' });
+    await codex.tasks.accept({ taskId: answered.record.event.id });
+
+    const unanswered = await codex.discovery.unanswered({ participantAgentId: 'codex' });
+    const titles = unanswered.items.map((item) => item.title).sort();
+    expect(titles).toEqual(['Awaiting a decision', 'Nice catch', 'Unread']);
+
+    // An accepted task is no longer awaiting an answer.
+    expect(titles).not.toContain('Already answered');
+    await codex.close();
+  });
+
+  it('respects an age filter', async () => {
+    const home = tempHome();
+    const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
+    await gracie.agents.create({ id: 'codex', displayName: 'Codex' });
+    await gracie.tasks.create({ assigneeAgentId: 'codex', title: 'Fresh' });
+
+    // Nothing is older than a day yet.
+    const stale = await gracie.discovery.unanswered({ olderThanHours: 24 });
+    expect(stale.items).toHaveLength(0);
+
+    const all = await gracie.discovery.unanswered({});
+    expect(all.items.length).toBeGreaterThan(0);
+    await gracie.close();
+  });
+
+  it('reports open work past its deadline and ignores finished work', async () => {
+    const home = tempHome();
+    const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
+    await gracie.agents.create({ id: 'codex', displayName: 'Codex' });
+
+    await gracie.tasks.create({
+      assigneeAgentId: 'codex',
+      title: 'Late',
+      due: { kind: 'date', date: '2020-01-01' },
+    });
+    const done = await gracie.tasks.create({
+      assigneeAgentId: 'codex',
+      title: 'Late but finished',
+      due: { kind: 'date', date: '2020-01-01' },
+    });
+    await gracie.tasks.create({
+      assigneeAgentId: 'codex',
+      title: 'Due much later',
+      due: { kind: 'date', date: '2999-01-01' },
+    });
+    await gracie.close();
+
+    const codex = await testClient(home, { kind: 'agent', id: 'codex' });
+    await codex.tasks.accept({ taskId: done.record.event.id });
+    await codex.tasks.complete({ taskId: done.record.event.id });
+
+    const overdue = await codex.discovery.overdue({});
+    expect(overdue.items.map((item) => item.title)).toEqual(['Late']);
+    await codex.close();
+  });
+
+  it('treats a date-only deadline as the end of that day', async () => {
+    const home = tempHome();
+    const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
+    await gracie.agents.create({ id: 'codex', displayName: 'Codex' });
+    const today = new Date().toISOString().slice(0, 10);
+    await gracie.tasks.create({
+      assigneeAgentId: 'codex',
+      title: 'Due today',
+      due: { kind: 'date', date: today },
+    });
+
+    // Due today is not yet overdue — midnight would wrongly say otherwise.
+    const now = await gracie.discovery.overdue({});
+    expect(now.items).toHaveLength(0);
+    await gracie.close();
+  });
+
+  it('never shows another actor a private todo, even to a human', async () => {
+    const home = tempHome();
+    const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
+    await gracie.todos.create({ title: 'Private to gracie' });
+    await gracie.close();
+
+    // A human actor is the operator of a local home, and the visibility rules
+    // exempt humans generally — but not from another actor's private todos.
+    const troy = await testClient(home, { kind: 'human', id: 'troy' });
+    const listed = await troy.items.list({ kinds: ['todo'] });
+    expect(listed.items).toHaveLength(0);
+    await troy.close();
+  });
+});

@@ -35,6 +35,7 @@ import type {
   ItemListInput,
   ItemSummary,
   RecordKind,
+  TaskDue,
   KudosListInput,
   KudosSummary,
   Page,
@@ -186,6 +187,20 @@ CREATE INDEX kudos_current_actor ON kudos_current(actor_kind, actor_id, given_se
 CREATE INDEX kudos_current_status ON kudos_current(status, revocation_status, given_sequence DESC);
 `;
 
+/**
+ * v4 records a task's or todo's deadline on the item index.
+ *
+ * The plan asks for "accepted Tasks past their due date" as a bounded query.
+ * Answering that from the event log means replaying every task on every call,
+ * so the deadline is projected alongside the rest of the summary. It is stored
+ * as an ISO instant: a date-only due date resolves to the end of that day, so
+ * "overdue" means the day has actually passed rather than merely started.
+ */
+const migrationV4 = `
+ALTER TABLE items_current ADD COLUMN due_at TEXT;
+CREATE INDEX items_current_due ON items_current(kind, status, due_at);
+`;
+
 const migrationV3 = `
 DROP TRIGGER IF EXISTS events_append_only_update;
 DROP TRIGGER IF EXISTS events_append_only_delete;
@@ -301,6 +316,18 @@ function itemSummaryFromRow(row: ItemRow): ItemSummary {
     ...(row.owner_agent_id ? { ownerAgentId: row.owner_agent_id } : {}),
     ...(row.assignee_agent_id ? { assigneeAgentId: row.assignee_agent_id } : {}),
   };
+}
+
+/**
+ * Resolves a due value to a comparable instant.
+ *
+ * A date-only deadline resolves to the END of that day, so "overdue" means the
+ * day has passed rather than merely begun. Treating 2026-09-15 as midnight
+ * would report a task due today as already late.
+ */
+function dueInstant(due: TaskDue | undefined): string | undefined {
+  if (!due) return undefined;
+  return due.kind === 'date' ? `${due.date}T23:59:59.999Z` : due.datetime;
 }
 
 function eventKind(event: SynomemEvent): RecordKind | undefined {
@@ -441,7 +468,7 @@ export class SynomemStorage implements SynomemRepository {
     const version = Number(
       (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
     );
-    if (version > 3) {
+    if (version > 4) {
       throw new SynomemError(
         'UNSUPPORTED_SCHEMA',
         `Database schema version ${version} is newer than this package supports.`,
@@ -475,11 +502,26 @@ export class SynomemStorage implements SynomemRepository {
     if (afterV2 === 2) {
       this.transactionSync(() => {
         db.exec(migrationV3);
-        this.rebuildItemsCurrentIndex();
+        // The item index is left empty here and populated by v4, which adds the
+        // due-date column the projection writes. Rebuilding before that column
+        // exists fails on the first task.
         db.prepare(
           'INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         ).run(3, new Date().toISOString());
         db.exec('PRAGMA user_version = 3');
+      });
+    }
+    const afterV3 = Number(
+      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    );
+    if (afterV3 === 3) {
+      this.transactionSync(() => {
+        db.exec(migrationV4);
+        this.rebuildItemsCurrentIndex();
+        db.prepare(
+          'INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        ).run(4, new Date().toISOString());
+        db.exec('PRAGMA user_version = 4');
       });
     }
   }
@@ -488,16 +530,16 @@ export class SynomemStorage implements SynomemRepository {
     const version = Number(
       (this.db().prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
     );
-    if (version !== 3) {
-      if (version === 1 || version === 2) {
+    if (version !== 4) {
+      if (version === 1 || version === 2 || version === 3) {
         throw new SynomemError(
           'UNSUPPORTED_SCHEMA',
-          'Database schema version 1 requires migration. Open this home once with readOnly: false, then retry the read-only client.',
+          `Database schema version ${version} requires migration. Open this home once with readOnly: false, then retry the read-only client.`,
         );
       }
       throw new SynomemError(
         'UNSUPPORTED_SCHEMA',
-        `Expected database schema version 3; found ${version}.`,
+        `Expected database schema version 4; found ${version}.`,
       );
     }
   }
@@ -674,6 +716,7 @@ export class SynomemStorage implements SynomemRepository {
       ownerDisplayName?: string;
       assigneeAgentId?: string;
       assigneeDisplayName?: string;
+      dueAt?: string;
     }): void => {
       this.db()
         .prepare(
@@ -681,8 +724,8 @@ export class SynomemStorage implements SynomemRepository {
           item_id, kind, created_sequence, updated_sequence, created_at, updated_at,
           actor_kind, actor_id, actor_display_name, title, tags_json, visibility, status,
           recipient_agent_id, recipient_display_name, owner_agent_id, owner_display_name,
-          assignee_agent_id, assignee_display_name
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          assignee_agent_id, assignee_display_name, due_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           event.aggregateId,
@@ -704,6 +747,7 @@ export class SynomemStorage implements SynomemRepository {
           values.ownerDisplayName ?? null,
           values.assigneeAgentId ?? null,
           values.assigneeDisplayName ?? null,
+          values.dueAt ?? null,
         );
     };
     const updateStatus = (status: string): void => {
@@ -772,17 +816,19 @@ export class SynomemStorage implements SynomemRepository {
         status: event.requiresAcceptance ? 'assigned' : 'open',
         assigneeAgentId: event.assigneeAgentId,
         assigneeDisplayName: event.assigneeDisplayName,
+        ...((due) => (due ? { dueAt: due } : {}))(dueInstant(event.due)),
       });
     } else if (event.type === 'task.updated') {
       this.db()
         .prepare(
-          `UPDATE items_current SET title = ?, tags_json = ?, visibility = ?,
+          `UPDATE items_current SET title = ?, tags_json = ?, visibility = ?, due_at = ?,
          updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
         )
         .run(
           event.title,
           JSON.stringify(event.tags ?? []),
           event.visibility,
+          dueInstant(event.due) ?? null,
           sequence,
           event.createdAt,
           event.aggregateId,
@@ -804,16 +850,18 @@ export class SynomemStorage implements SynomemRepository {
         status: 'open',
         ownerAgentId: event.actor.id,
         ...(event.actor.displayName ? { ownerDisplayName: event.actor.displayName } : {}),
+        ...((due) => (due ? { dueAt: due } : {}))(dueInstant(event.due)),
       });
     } else if (event.type === 'todo.updated') {
       this.db()
         .prepare(
-          `UPDATE items_current SET title = ?, tags_json = ?,
+          `UPDATE items_current SET title = ?, tags_json = ?, due_at = ?,
          updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
         )
         .run(
           event.title,
           JSON.stringify(event.tags ?? []),
+          dueInstant(event.due) ?? null,
           sequence,
           event.createdAt,
           event.aggregateId,
@@ -1073,6 +1121,43 @@ export class SynomemStorage implements SynomemRepository {
     if (input.visibility) add('visibility = ?', input.visibility);
     if (input.from) add('created_at >= ?', input.from);
     if (input.to) add('created_at <= ?', input.to);
+
+    // Unanswered discovery: items still waiting for somebody to respond. Kept
+    // distinct from `pending`, which also counts accepted-and-in-progress work.
+    if (input.awaitingResponse) {
+      add(`((kind = 'kudos' AND status = 'unacknowledged') OR
+        (kind = 'memo' AND status = 'unread') OR
+        (kind = 'task' AND status = 'assigned'))`);
+    }
+    if (input.awaitingSince) add('created_at <= ?', input.awaitingSince);
+
+    // Overdue discovery: a deadline that has passed, on work still open. A
+    // completed or canceled item is not overdue, however late it was.
+    if (input.overdueAsOf) {
+      add(
+        `(due_at IS NOT NULL AND due_at < ? AND status IN ('assigned', 'open'))`,
+        input.overdueAsOf,
+      );
+    }
+
+    /*
+     * Private todos are owner-only for EVERY viewer, including a human.
+     *
+     * The visibility rules below exempt human actors, on the reasoning that a
+     * person operating a local home is its operator. That does not extend to
+     * todos: the plan is explicit that a todo is visible only to its owner
+     * except through an explicitly authorized administrative capability, and
+     * this release has no such capability. Without this clause a human actor
+     * would see every agent's private reminders in an item list.
+     */
+    add(
+      `(kind != 'todo' OR (owner_agent_id = ? AND ? = 'agent') OR (actor_id = ? AND actor_kind = ?))`,
+      viewer.id,
+      viewer.kind,
+      viewer.id,
+      viewer.kind,
+    );
+
     if (viewer.kind !== 'human') {
       if (viewer.kind === 'agent') {
         add(

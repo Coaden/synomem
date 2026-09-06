@@ -1194,6 +1194,161 @@ export function createCli(
       },
     );
 
+  const todoCommand = program
+    .command('todo')
+    .description('Create and manage your own private reminders');
+  todoCommand
+    .command('create')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .requiredOption('--title <title>')
+    .option('--details <text>', 'private working detail')
+    .option('--priority <number>', '1 highest, 4 lowest', '3')
+    .option('--due-date <date>')
+    .option('--due-at <datetime>')
+    .option('--time-zone <iana-zone>')
+    .option('--tag <tag>', 'tag (repeatable)', collect, [])
+    .option('--idempotency-key <key>')
+    .action(
+      async (
+        options: {
+          as: string;
+          actorKind: string;
+          title: string;
+          details?: string;
+          priority: string;
+          dueDate?: string;
+          dueAt?: string;
+          timeZone?: string;
+          tag: string[];
+          idempotencyKey?: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const result = await withClient(
+          global.home,
+          actor(options.actorKind, options.as),
+          (client) =>
+            client.todos.create({
+              title: options.title,
+              ...(options.details ? { details: options.details } : {}),
+              priority: Number(options.priority) as 1 | 2 | 3 | 4,
+              ...((due) => (due ? { due } : {}))(taskDue(options)),
+              ...(options.tag.length ? { tags: options.tag } : {}),
+              ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+            }),
+        );
+        output(
+          io,
+          global.json,
+          result,
+          `${result.deduplicated ? 'Found existing' : 'Created'} private todo\nTitle: ${result.record.current.title}\nID: ${result.record.event.id}`,
+        );
+      },
+    );
+  todoCommand
+    .command('list')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .option('--status <status>')
+    .option('--limit <number>', 'maximum results', '10')
+    .action(
+      async (
+        options: { as: string; actorKind: string; status?: string; limit: string },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const page = await withClient(global.home, actor(options.actorKind, options.as), (client) =>
+          client.todos.list({
+            ...(options.status ? { status: options.status } : {}),
+            limit: Number(options.limit),
+          }),
+        );
+        output(
+          io,
+          global.json,
+          page,
+          page.items.length
+            ? page.items
+                .map((item) => `${item.id}  ${item.status.padEnd(9)}  ${item.title}`)
+                .join('\n')
+            : 'No todos.',
+        );
+      },
+    );
+  todoCommand
+    .command('show <todo-id>')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .action(async (id: string, options: { as: string; actorKind: string }, command: Command) => {
+      const global = globals(command);
+      const record = await withClient(global.home, actor(options.actorKind, options.as), (client) =>
+        client.todos.get(id),
+      );
+      output(
+        io,
+        global.json,
+        record,
+        `${record.current.title}\nStatus: ${record.status}\nPriority: ${record.current.priority}\nVersion: ${record.current.version}${record.current.details ? `\n\n${record.current.details}` : ''}`,
+      );
+    });
+  for (const operation of ['complete', 'reopen', 'cancel', 'archive'] as const) {
+    todoCommand
+      .command(`${operation} <todo-id>`)
+      .requiredOption('--as <actor-id>')
+      .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+      .option('--note <text>')
+      .option('--reason <text>')
+      .option('--idempotency-key <key>')
+      .action(
+        async (
+          id: string,
+          options: {
+            as: string;
+            actorKind: string;
+            note?: string;
+            reason?: string;
+            idempotencyKey?: string;
+          },
+          command: Command,
+        ) => {
+          const global = globals(command);
+          const record = await withClient(
+            global.home,
+            actor(options.actorKind, options.as),
+            (client) =>
+              operation === 'complete'
+                ? client.todos.complete({
+                    todoId: id,
+                    ...(options.note ? { note: options.note } : {}),
+                    ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+                  })
+                : operation === 'cancel'
+                  ? client.todos.cancel({
+                      todoId: id,
+                      ...(options.reason ? { reason: options.reason } : {}),
+                      ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+                    })
+                  : operation === 'archive'
+                    ? client.todos.archive({
+                        todoId: id,
+                        ...(options.idempotencyKey
+                          ? { idempotencyKey: options.idempotencyKey }
+                          : {}),
+                      })
+                    : client.todos.reopen({
+                        todoId: id,
+                        ...(options.idempotencyKey
+                          ? { idempotencyKey: options.idempotencyKey }
+                          : {}),
+                      }),
+          );
+          output(io, global.json, record, `Todo ${id} is now ${record.status}.`);
+        },
+      );
+  }
+
   const taskCommand = program.command('task').description('Create and manage agent tasks');
   taskCommand
     .command('create <assignee>')
@@ -1339,67 +1494,74 @@ export function createCli(
       },
     );
   for (const operation of ['accept', 'reject', 'complete', 'reopen', 'cancel'] as const) {
-    taskCommand
+    const command_ = taskCommand
       .command(`${operation} <task-id>`)
       .requiredOption('--as <actor-id>')
       .option('--actor-kind <kind>', 'agent or human', 'agent')
       .option('--note <text>')
       .option('--reason <text>')
-      .option('--idempotency-key <key>')
-      .action(
-        async (
-          id: string,
-          options: {
-            as: string;
-            actorKind: string;
-            note?: string;
-            reason?: string;
-            idempotencyKey?: string;
-          },
-          command: Command,
-        ) => {
-          const global = globals(command);
-          const record = await withClient(
-            global.home,
-            actor(options.actorKind, options.as),
-            (client) =>
-              operation === 'accept'
-                ? client.tasks.accept({
+      .option('--idempotency-key <key>');
+    // Rejecting requires saying why; accepting may. Marked required at the
+    // parser so the CLI refuses before touching the store.
+    if (operation === 'reject') {
+      command_.requiredOption('--response <text>', 'why the task is being refused');
+    } else if (operation === 'accept') {
+      command_.option('--response <text>', 'conditions, timing, or partial capability');
+    }
+    command_.action(
+      async (
+        id: string,
+        options: {
+          as: string;
+          actorKind: string;
+          note?: string;
+          reason?: string;
+          response?: string;
+          idempotencyKey?: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const record = await withClient(
+          global.home,
+          actor(options.actorKind, options.as),
+          (client) =>
+            operation === 'accept'
+              ? client.tasks.accept({
+                  taskId: id,
+                  ...(options.response ? { response: options.response } : {}),
+                  ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+                })
+              : operation === 'reject'
+                ? client.tasks.reject({
                     taskId: id,
+                    response: options.response ?? options.reason ?? '',
                     ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
                   })
-                : operation === 'reject'
-                  ? client.tasks.reject({
+                : operation === 'complete'
+                  ? client.tasks.complete({
                       taskId: id,
-                      ...(options.reason ? { reason: options.reason } : {}),
+                      ...(options.note ? { note: options.note } : {}),
                       ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
                     })
-                  : operation === 'complete'
-                    ? client.tasks.complete({
+                  : operation === 'cancel'
+                    ? client.tasks.cancel({
                         taskId: id,
-                        ...(options.note ? { note: options.note } : {}),
+                        ...(options.reason ? { reason: options.reason } : {}),
                         ...(options.idempotencyKey
                           ? { idempotencyKey: options.idempotencyKey }
                           : {}),
                       })
-                    : operation === 'cancel'
-                      ? client.tasks.cancel({
-                          taskId: id,
-                          ...(options.reason ? { reason: options.reason } : {}),
-                          ...(options.idempotencyKey
-                            ? { idempotencyKey: options.idempotencyKey }
-                            : {}),
-                        })
-                      : client.tasks.reopen({
-                          taskId: id,
-                          ...(options.idempotencyKey
-                            ? { idempotencyKey: options.idempotencyKey }
-                            : {}),
-                        }),
-          );
-          output(io, global.json, record, `Task ${id} is ${record.status}.`);
-        },
-      );
+                    : client.tasks.reopen({
+                        taskId: id,
+                        ...(options.idempotencyKey
+                          ? { idempotencyKey: options.idempotencyKey }
+                          : {}),
+                      }),
+        );
+        output(io, global.json, record, `Task ${id} is ${record.status}.`);
+      },
+    );
   }
 
   kudosCommand
