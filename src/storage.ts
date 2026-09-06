@@ -1684,9 +1684,7 @@ export class SynomemStorage implements SynomemRepository {
       )
       .all(normalized, normalized) as unknown as ProfileRow[];
     const candidates = rows.map((row) => profileSchema.parse(JSON.parse(row.profile_json)));
-    return candidates.length === 1
-      ? { match: candidates[0]!, candidates }
-      : { candidates };
+    return candidates.length === 1 ? { match: candidates[0]!, candidates } : { candidates };
   }
 
   /* ------------------------------------------------------- runtime bindings */

@@ -30,9 +30,9 @@ describe('agent identity and discovery', () => {
 
     // Nor may an alias shadow a different agent's canonical ID.
     await client.agents.create({ id: 'atlas', displayName: 'Atlas' });
-    await expect(
-      client.agents.update('mycroft', { aliases: ['Atlas'] }),
-    ).rejects.toMatchObject({ code: 'ALIAS_CONFLICT' });
+    await expect(client.agents.update('mycroft', { aliases: ['Atlas'] })).rejects.toMatchObject({
+      code: 'ALIAS_CONFLICT',
+    });
 
     await client.close();
   });

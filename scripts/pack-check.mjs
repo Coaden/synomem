@@ -3,6 +3,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
+function runExpectingFailure(command, args, cwd, env = process.env) {
+  const result = spawnSync(command, args, { cwd, encoding: 'utf8', env });
+  if (result.status === 0) {
+    throw new Error(`${command} ${args.join(' ')} unexpectedly succeeded\n${result.stdout}`);
+  }
+  return `${result.stdout}${result.stderr}`;
+}
+
 function run(command, args, cwd, env = process.env) {
   const result = spawnSync(command, args, { cwd, encoding: 'utf8', env });
   if (result.status !== 0) {
@@ -130,12 +138,20 @@ try {
   run(synomemBin, ['skill', 'install', '--runtime', 'codex'], consumer, skillEnv);
   const installedSkill = join(codexHome, 'skills', 'synomem', 'SKILL.md');
   if (existsSync(installedSkill)) throw new Error('Skill dry run unexpectedly wrote files.');
-  run(
+  // Binding to an agent that does not exist must stop before anything is
+  // installed, rather than leaving a skill pointed at nobody.
+  const refused = runExpectingFailure(
     synomemBin,
-    ['skill', 'install', '--runtime', 'codex', '--actor-id', 'codex', '--yes'],
+    ['skill', 'install', '--runtime', 'codex', '--agent', 'ghost', '--yes'],
     consumer,
     skillEnv,
   );
+  if (!refused.includes('Unknown agent')) {
+    throw new Error(`Unknown agent was not reported clearly:\n${refused}`);
+  }
+  if (existsSync(installedSkill)) throw new Error('A refused install still wrote files.');
+
+  run(synomemBin, ['skill', 'install', '--runtime', 'codex', '--yes'], consumer, skillEnv);
   if (!existsSync(installedSkill))
     throw new Error('Installed package could not install its skill.');
   const installedSkillStatus = JSON.parse(

@@ -829,10 +829,8 @@ export function createCli(
     .description('List agents with their runtime bindings')
     .action(async (_options, command: Command) => {
       const global = globals(command);
-      const entries = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli'),
-        (client) => client.agents.directory(),
+      const entries = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
+        client.agents.directory(),
       );
       const human = entries.length
         ? entries
@@ -855,9 +853,7 @@ export function createCli(
       output(io, global.json, { entries }, human);
     });
 
-  const runtimeCommand = agentCommand
-    .command('runtime')
-    .description('Record where an agent runs');
+  const runtimeCommand = agentCommand.command('runtime').description('Record where an agent runs');
 
   runtimeCommand
     .command('bind <agent>')
@@ -897,10 +893,8 @@ export function createCli(
     .description('List an agent runtime bindings')
     .action(async (agent: string, _options, command: Command) => {
       const global = globals(command);
-      const bindings = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli'),
-        (client) => client.agents.bindings(agent),
+      const bindings = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
+        client.agents.bindings(agent),
       );
       const human = bindings.length
         ? bindings
@@ -918,10 +912,8 @@ export function createCli(
     .description('Remove a runtime binding')
     .action(async (bindingId: string, _options, command: Command) => {
       const global = globals(command);
-      const removed = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli'),
-        (client) => client.agents.unbindRuntime(bindingId),
+      const removed = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
+        client.agents.unbindRuntime(bindingId),
       );
       output(
         io,
