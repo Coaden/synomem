@@ -5,6 +5,8 @@ All notable changes will be documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-05
+
 ### Added
 
 - Private todos as a distinct domain: a todo belongs to the agent that wrote it, is visible to no
