@@ -8,6 +8,7 @@ import {
   escapeMarkdown,
   memoRecordsFromEvents,
   noteRecordsFromEvents,
+  postRecordsFromEvents,
   ProjectionManager,
   recordsFromEvents,
   taskRecordsFromEvents,
@@ -18,6 +19,8 @@ import {
   agentLookupSchema,
   bindRuntimeSchema,
   createAgentSchema,
+  createPostSchema,
+  updatePostSchema,
   createNoteSchema,
   createTaskSchema,
   createTodoSchema,
@@ -49,6 +52,10 @@ import type {
   AgentRuntimeBinding,
   BindRuntimeInput,
   CreateAgentInput,
+  CreatePostInput,
+  PostRecord,
+  PostRoster,
+  UpdatePostInput,
   Diagnostic,
   DoctorResult,
   GiveKudosInput,
@@ -137,6 +144,27 @@ export class SynomemCore implements SynomemDomainService {
     get: (id: string) => this.getMemo(id),
     read: (input: { memoId: string; idempotencyKey?: string }) => this.readMemo(input),
     archive: (input: { memoId: string; idempotencyKey?: string }) => this.archiveMemo(input),
+  };
+
+  readonly posts = {
+    create: (input: CreatePostInput) => this.createPost(input),
+    list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
+      this.listItems({ ...input, kinds: ['post'] }),
+    get: (id: string) => this.getPost(id),
+    update: (input: UpdatePostInput) => this.updatePost(input),
+    archive: (input: { postId: string; reason?: string; idempotencyKey?: string }) =>
+      this.archivePost(input),
+    /*
+     * Acknowledging is an explicit call and always speaks for the caller alone.
+     * There is no bulk form and no acknowledge-on-behalf-of: an acknowledgement
+     * is one actor saying "I have seen this", and reading a post must never
+     * append one, or the roster stops meaning anything.
+     */
+    acknowledge: (input: { postId: string; note?: string; idempotencyKey?: string }) =>
+      this.acknowledgePost(input),
+    withdrawAcknowledgment: (input: { postId: string; reason?: string }) =>
+      this.withdrawPostAcknowledgment(input),
+    roster: (postId: string) => this.postRoster(postId),
   };
 
   readonly notes = {
@@ -757,6 +785,174 @@ export class SynomemCore implements SynomemDomainService {
     return await this.getMemoRecord(input.memoId);
   }
 
+  private async getPostRecord(id: string): Promise<PostRecord> {
+    await this.requireVisibleItem(id, 'post');
+    const record = postRecordsFromEvents(await this.repository.getReadableItemEvents(id))[0];
+    if (!record) throw new SynomemError('ITEM_NOT_FOUND', `Unknown post: ${id}`);
+    return record;
+  }
+
+  private async getPost(id: string): Promise<PostRecord> {
+    this.checkAbort();
+    return await this.getPostRecord(id);
+  }
+
+  private async createPost(input: CreatePostInput): Promise<{
+    record: PostRecord;
+    created: boolean;
+    deduplicated: boolean;
+  }> {
+    this.checkAbort();
+    await this.repository.assertEventCompatibility();
+    const parsed = this.validate(() => createPostSchema.parse(input));
+
+    // A reply inherits its parent's workspace by construction, and cannot name
+    // a different target — there is no target to name.
+    if (parsed.replyTo) await this.requireVisibleItem(parsed.replyTo, 'post');
+
+    const outcome = await this.repository.transaction(async () => {
+      const prior = await this.priorMutation(parsed.idempotencyKey, 'post.created');
+      if (prior?.type === 'post.created') return { id: prior.id, created: false };
+      const id = this.nextId();
+      const event: SynomemEvent = {
+        ...this.eventBase(id, 1, id),
+        type: 'post.created',
+        title: parsed.title,
+        body: parsed.body,
+        tags: [...new Set(parsed.tags ?? [])].sort(),
+        ...(parsed.replyTo ? { replyTo: parsed.replyTo } : {}),
+        ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
+        ...(parsed.source ? { source: parsed.source } : {}),
+        ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
+      };
+      await this.repository.insertEvent(event);
+      return { id, created: true };
+    });
+    return {
+      record: await this.getPostRecord(outcome.id),
+      created: outcome.created,
+      deduplicated: !outcome.created,
+    };
+  }
+
+  /** Only the author edits a post. Everyone else responds to it. */
+  private assertPostAuthor(record: PostRecord): void {
+    if (this.administrative) return;
+    if (record.event.actor.id !== this.actor.id || record.event.actor.kind !== this.actor.kind) {
+      throw new SynomemError('MUTATION_FORBIDDEN', 'Only the author can change a post.');
+    }
+  }
+
+  private async updatePost(input: UpdatePostInput): Promise<PostRecord> {
+    this.checkAbort();
+    const parsed = this.validate(() => updatePostSchema.parse(input));
+    const record = await this.getPostRecord(parsed.postId);
+    this.assertPostAuthor(record);
+    if (record.status === 'archived') {
+      throw new SynomemError('MUTATION_FORBIDDEN', 'An archived post cannot be edited.');
+    }
+    if (record.version !== parsed.expectedVersion) {
+      throw new SynomemError(
+        'REVISION_CONFLICT',
+        `Post ${parsed.postId} is at version ${record.version}.`,
+      );
+    }
+    await this.repository.transaction(async () => {
+      const event: SynomemEvent = {
+        ...this.eventBase(parsed.postId, await this.repository.nextAggregateVersion(parsed.postId)),
+        type: 'post.edited',
+        postId: parsed.postId,
+        title: parsed.title ?? record.title,
+        body: parsed.body ?? record.body,
+        tags: [...new Set(parsed.tags ?? record.tags ?? [])].sort(),
+        ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
+      };
+      await this.repository.insertEvent(event);
+    });
+    return await this.getPostRecord(parsed.postId);
+  }
+
+  private async archivePost(input: {
+    postId: string;
+    reason?: string;
+    idempotencyKey?: string;
+  }): Promise<PostRecord> {
+    this.checkAbort();
+    const record = await this.getPostRecord(input.postId);
+    this.assertPostAuthor(record);
+    if (record.status !== 'archived') {
+      await this.repository.transaction(async () => {
+        const event: SynomemEvent = {
+          ...this.eventBase(input.postId, await this.repository.nextAggregateVersion(input.postId)),
+          type: 'post.archived',
+          postId: input.postId,
+          ...(input.reason ? { reason: input.reason } : {}),
+          ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+        };
+        await this.repository.insertEvent(event);
+      });
+    }
+    return await this.getPostRecord(input.postId);
+  }
+
+  private async acknowledgePost(input: {
+    postId: string;
+    note?: string;
+    idempotencyKey?: string;
+  }): Promise<PostRecord> {
+    this.checkAbort();
+    const record = await this.getPostRecord(input.postId);
+    // Acknowledging twice is the same statement, so the second is a no-op
+    // rather than a second row or an error.
+    const already = record.acknowledgments.some(
+      (entry) => entry.actor.id === this.actor.id && entry.actor.kind === this.actor.kind,
+    );
+    if (!already) {
+      await this.repository.transaction(async () => {
+        const event: SynomemEvent = {
+          ...this.eventBase(input.postId, await this.repository.nextAggregateVersion(input.postId)),
+          type: 'post.acknowledged',
+          postId: input.postId,
+          ...(input.note ? { note: input.note } : {}),
+          ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+        };
+        await this.repository.insertEvent(event);
+      });
+    }
+    return await this.getPostRecord(input.postId);
+  }
+
+  private async withdrawPostAcknowledgment(input: {
+    postId: string;
+    reason?: string;
+  }): Promise<PostRecord> {
+    this.checkAbort();
+    const record = await this.getPostRecord(input.postId);
+    const mine = record.acknowledgments.some(
+      (entry) => entry.actor.id === this.actor.id && entry.actor.kind === this.actor.kind,
+    );
+    if (mine) {
+      await this.repository.transaction(async () => {
+        const event: SynomemEvent = {
+          ...this.eventBase(input.postId, await this.repository.nextAggregateVersion(input.postId)),
+          type: 'post.acknowledgment.withdrawn',
+          postId: input.postId,
+          ...(input.reason ? { reason: input.reason } : {}),
+        };
+        await this.repository.insertEvent(event);
+      });
+    }
+    return await this.getPostRecord(input.postId);
+  }
+
+  private async postRoster(postId: string): Promise<PostRoster> {
+    this.checkAbort();
+    await this.requireVisibleItem(postId, 'post');
+    const roster = await this.repository.postRoster(postId);
+    if (!roster) throw new SynomemError('ITEM_NOT_FOUND', `Unknown post: ${postId}`);
+    return roster;
+  }
+
   private async getNoteRecord(id: string): Promise<NoteRecord> {
     await this.requireVisibleItem(id, 'note');
     const record = noteRecordsFromEvents(await this.repository.getReadableItemEvents(id))[0];
@@ -1343,8 +1539,8 @@ export class SynomemCore implements SynomemDomainService {
  * check that silently lags the migration runner reports a healthy database as
  * broken.
  */
-const CURRENT_SCHEMA_VERSION = 5;
-const EXPECTED_APPLIED_MIGRATIONS = [1, 2, 3, 4, 5];
+const CURRENT_SCHEMA_VERSION = 6;
+const EXPECTED_APPLIED_MIGRATIONS = [1, 2, 3, 4, 5, 6];
 
 export class SynomemClient extends SynomemCore implements SynomemService {
   readonly home: string;

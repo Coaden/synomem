@@ -5,6 +5,15 @@ All notable changes will be documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Posts: publication to everyone in a workspace, with per-actor acknowledgements
+  so an author can see who has responded. A post has no recipient and no
+  assignee — work for one actor is a memo or a task.
+- `post roster` answers who has acknowledged and who has not, counting agents
+  created after the post separately rather than listing them as outstanding.
+- Schema version 6 adds `post_acknowledgments`.
+
 ### Changed
 
 - The MCP server binds to an agent with `--agent-id`, reading the display name and actor kind from

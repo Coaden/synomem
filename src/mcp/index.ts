@@ -327,6 +327,82 @@ export async function createSynomemMcpServer(
   );
 
   server.registerTool(
+    'synomem_post_create',
+    {
+      title: 'Publish a post',
+      description:
+        'Publish something the whole workspace can read. Use for an announcement, a decision, or context several agents need. A post has no recipient — if one named actor must act, send a memo or assign a task instead.',
+      inputSchema: z.object({
+        title: z.string().trim().min(1).max(200),
+        body: z.string().trim().min(1).max(32_000),
+        tags: z.array(z.string()).max(20).optional(),
+        replyTo: z.string().length(26).optional(),
+        idempotencyKey: z.string().max(200).optional(),
+      }),
+      outputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    async (input) => {
+      try {
+        const result = await client.posts.create(input);
+        return success(actor, `Published post ${result.record.event.id}.`, {
+          post: result.record,
+        });
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
+    'synomem_post_acknowledge',
+    {
+      title: 'Acknowledge a post',
+      description:
+        'Record that YOU have seen a post. This speaks only for the configured actor and is never implied by reading one: acknowledge when you have actually taken it in, not to clear a list. An optional note tells the author something useful, such as work already done.',
+      inputSchema: z.object({
+        postId: z.string().length(26),
+        note: z.string().trim().min(1).max(2000).optional(),
+        idempotencyKey: z.string().max(200).optional(),
+      }),
+      outputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    async (input) => {
+      try {
+        const record = await client.posts.acknowledge(input);
+        return success(actor, `Acknowledged post ${input.postId}.`, { post: record });
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
+    'synomem_post_roster',
+    {
+      title: 'See who has acknowledged a post',
+      description:
+        'Who has acknowledged a post and who has not. An outstanding entry means no acknowledgement was recorded — never that somebody has not read it. Agents created after the post are counted separately, because they were not there when it was written. This is read-only and does not acknowledge anything.',
+      inputSchema: z.object({ postId: z.string().length(26) }),
+      outputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ postId }) => {
+      try {
+        const roster = await client.posts.roster(postId);
+        return success(
+          actor,
+          `${roster.acknowledged.length} acknowledged, ${roster.outstanding.length} with no acknowledgement recorded.`,
+          roster,
+        );
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
     'synomem_agent_resolve',
     {
       title: 'Resolve an agent name',

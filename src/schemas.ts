@@ -257,6 +257,47 @@ const noteArchivedSchema = baseEventSchema.extend({
   noteId: z.string().length(26),
 });
 
+/**
+ * Post events. A post carries no recipient, assignee or visibility: it is
+ * addressed to the workspace, and workspace membership is the audience. Adding
+ * a visibility field would create a second, weaker way to hide a record.
+ */
+const postFields = {
+  title: z
+    .string()
+    .trim()
+    .min(1)
+    .max(200)
+    .regex(/^[^\r\n]+$/),
+  body: z.string().trim().min(1).max(32_000),
+  tags: z.array(kudosTagSchema).max(20).optional(),
+};
+const postCreatedSchema = baseEventSchema.extend({
+  type: z.literal('post.created'),
+  ...postFields,
+  replyTo: z.string().length(26).optional(),
+});
+const postEditedSchema = baseEventSchema.extend({
+  type: z.literal('post.edited'),
+  postId: z.string().length(26),
+  ...postFields,
+});
+const postArchivedSchema = baseEventSchema.extend({
+  type: z.literal('post.archived'),
+  postId: z.string().length(26),
+  reason: z.string().trim().min(1).max(2000).optional(),
+});
+const postAcknowledgedSchema = baseEventSchema.extend({
+  type: z.literal('post.acknowledged'),
+  postId: z.string().length(26),
+  note: z.string().trim().min(1).max(2000).optional(),
+});
+const postAcknowledgmentWithdrawnSchema = baseEventSchema.extend({
+  type: z.literal('post.acknowledgment.withdrawn'),
+  postId: z.string().length(26),
+  reason: z.string().trim().min(1).max(2000).optional(),
+});
+
 const taskDueSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('date'),
@@ -380,6 +421,11 @@ const todoArchivedSchema = baseEventSchema.extend({
 });
 
 export const eventSchema = z.discriminatedUnion('type', [
+  postCreatedSchema,
+  postEditedSchema,
+  postArchivedSchema,
+  postAcknowledgedSchema,
+  postAcknowledgmentWithdrawnSchema,
   kudosGivenSchema,
   acknowledgedSchema,
   revokedSchema,
@@ -477,6 +523,24 @@ export const sendMemoSchema = z
     ...mutationMetadata,
   })
   .strict();
+export const createPostSchema = z
+  .object({
+    ...postFields,
+    replyTo: z.string().length(26).optional(),
+    ...mutationMetadata,
+  })
+  .strict();
+export const updatePostSchema = z
+  .object({
+    postId: z.string().length(26),
+    expectedVersion: z.number().int().min(1),
+    title: postFields.title.optional(),
+    body: postFields.body.optional(),
+    tags: postFields.tags,
+    idempotencyKey: z.string().trim().min(1).max(200).optional(),
+  })
+  .strict();
+
 export const createNoteSchema = z
   .object({
     ownerAgentId: agentIdSchema.optional(),
@@ -553,7 +617,7 @@ export const updateTodoSchema = z
 export const itemListInputSchema = z
   .object({
     kinds: z
-      .array(z.enum(['kudos', 'memo', 'note', 'task', 'todo']))
+      .array(z.enum(['kudos', 'memo', 'note', 'post', 'task', 'todo']))
       .max(5)
       .optional(),
     participantAgentId: agentIdSchema.optional(),

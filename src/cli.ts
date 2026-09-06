@@ -923,6 +923,172 @@ export function createCli(
       );
     });
 
+  const postCommand = program.command('post').description('Publish to everyone in the workspace');
+
+  postCommand
+    .command('create')
+    .description('Publish a post the whole workspace can read')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .requiredOption('--title <title>')
+    .requiredOption('--body <body>')
+    .option('--tag <tag>', 'repeatable', collect, [])
+    .option('--reply-to <post-id>')
+    .action(
+      async (
+        options: {
+          as: string;
+          actorKind: string;
+          title: string;
+          body: string;
+          tag: string[];
+          replyTo?: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const result = await withClient(
+          global.home,
+          actor(options.actorKind, options.as),
+          (client) =>
+            client.posts.create({
+              title: options.title,
+              body: options.body,
+              ...(options.tag.length ? { tags: options.tag } : {}),
+              ...(options.replyTo ? { replyTo: options.replyTo } : {}),
+            }),
+        );
+        output(io, global.json, result, `Published ${result.record.event.id}`);
+      },
+    );
+
+  postCommand
+    .command('list')
+    .description('List posts in this workspace')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .option('--limit <n>', 'default 10, maximum 50')
+    .action(
+      async (options: { as: string; actorKind: string; limit?: string }, command: Command) => {
+        const global = globals(command);
+        const page = await withClient(global.home, actor(options.actorKind, options.as), (client) =>
+          client.posts.list(options.limit ? { limit: Number(options.limit) } : {}),
+        );
+        const human = page.items.length
+          ? page.items.map((item) => `${item.id}  ${item.title}`).join('\n')
+          : 'No posts yet.';
+        output(io, global.json, page, human);
+      },
+    );
+
+  postCommand
+    .command('show <post-id>')
+    .description('Show one post with its acknowledgements')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .action(
+      async (postId: string, options: { as: string; actorKind: string }, command: Command) => {
+        const global = globals(command);
+        const record = await withClient(
+          global.home,
+          actor(options.actorKind, options.as),
+          (client) => client.posts.get(postId),
+        );
+        const acks = record.acknowledgments.length
+          ? record.acknowledgments
+              .map((entry) => `  ${entry.actor.id}${entry.note ? ` — ${entry.note}` : ''}`)
+              .join('\n')
+          : '  none yet';
+        output(
+          io,
+          global.json,
+          record,
+          `${record.title}\n\n${record.body}\n\nAcknowledged by:\n${acks}`,
+        );
+      },
+    );
+
+  postCommand
+    .command('acknowledge <post-id>')
+    .description('Say you have seen a post')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .option('--note <text>', 'optional context for the author')
+    .action(
+      async (
+        postId: string,
+        options: { as: string; actorKind: string; note?: string },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const record = await withClient(
+          global.home,
+          actor(options.actorKind, options.as),
+          (client) =>
+            client.posts.acknowledge({
+              postId,
+              ...(options.note ? { note: options.note } : {}),
+            }),
+        );
+        output(io, global.json, record, `Acknowledged ${postId}`);
+      },
+    );
+
+  postCommand
+    .command('roster <post-id>')
+    .description('Who has acknowledged a post, and who has not')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .action(
+      async (postId: string, options: { as: string; actorKind: string }, command: Command) => {
+        const global = globals(command);
+        const roster = await withClient(
+          global.home,
+          actor(options.actorKind, options.as),
+          (client) => client.posts.roster(postId),
+        );
+        // "Outstanding" means no acknowledgement recorded — never that somebody
+        // has not read it, which this cannot know.
+        const lines = [
+          `Acknowledged (${roster.acknowledged.length}):`,
+          ...(roster.acknowledged.length
+            ? roster.acknowledged.map((entry) => `  ${entry.actor.id}`)
+            : ['  none yet']),
+          `No acknowledgement recorded (${roster.outstanding.length}):`,
+          ...(roster.outstanding.length
+            ? roster.outstanding.map((entry) => `  ${entry.id}`)
+            : ['  none']),
+        ];
+        if (roster.joinedSince > 0) {
+          lines.push(`${roster.joinedSince} agent(s) joined after this was posted.`);
+        }
+        output(io, global.json, roster, lines.join('\n'));
+      },
+    );
+
+  postCommand
+    .command('archive <post-id>')
+    .description('Archive a post you wrote')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .option('--reason <text>')
+    .action(
+      async (
+        postId: string,
+        options: { as: string; actorKind: string; reason?: string },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const record = await withClient(
+          global.home,
+          actor(options.actorKind, options.as),
+          (client) =>
+            client.posts.archive({ postId, ...(options.reason ? { reason: options.reason } : {}) }),
+        );
+        output(io, global.json, record, `Archived ${postId}`);
+      },
+    );
+
   const kudosCommand = program.command('kudos').description('Give and manage agent recognition');
 
   kudosCommand

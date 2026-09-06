@@ -6,6 +6,8 @@ import type {
   ChangesInput,
   BindRuntimeInput,
   CreateAgentInput,
+  CreatePostInput,
+  UpdatePostInput,
   CreateNoteInput,
   CreateTaskInput,
   GiveKudosInput,
@@ -197,6 +199,52 @@ export class RemoteSynomemService implements SynomemService {
       this.request<Awaited<ReturnType<SynomemService['agents']['unbindRuntime']>>>(
         'DELETE',
         `agents/runtimes/${encodeURIComponent(bindingId)}`,
+      ),
+  };
+
+  readonly posts = {
+    create: (input: CreatePostInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['posts']['create']>>>('POST', 'posts', input),
+    list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
+      this.request<Awaited<ReturnType<SynomemService['posts']['list']>>>(
+        'GET',
+        `posts${queryString(input)}`,
+      ),
+    get: (id: string) =>
+      this.request<Awaited<ReturnType<SynomemService['posts']['get']>>>(
+        'GET',
+        `posts/${encodeURIComponent(id)}`,
+      ),
+    update: (input: UpdatePostInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['posts']['update']>>>(
+        'POST',
+        `posts/${encodeURIComponent(input.postId)}/revisions`,
+        input,
+        ['postId'],
+      ),
+    archive: (input: { postId: string; reason?: string; idempotencyKey?: string }) =>
+      this.mutation<Awaited<ReturnType<SynomemService['posts']['archive']>>>(
+        'POST',
+        `posts/${encodeURIComponent(input.postId)}/archive`,
+        input,
+        ['postId'],
+      ),
+    acknowledge: (input: { postId: string; note?: string; idempotencyKey?: string }) =>
+      this.mutation<Awaited<ReturnType<SynomemService['posts']['acknowledge']>>>(
+        'POST',
+        `posts/${encodeURIComponent(input.postId)}/acknowledgment`,
+        input,
+        ['postId'],
+      ),
+    withdrawAcknowledgment: (input: { postId: string; reason?: string }) =>
+      this.request<Awaited<ReturnType<SynomemService['posts']['withdrawAcknowledgment']>>>(
+        'DELETE',
+        `posts/${encodeURIComponent(input.postId)}/acknowledgment`,
+      ),
+    roster: (postId: string) =>
+      this.request<Awaited<ReturnType<SynomemService['posts']['roster']>>>(
+        'GET',
+        `posts/${encodeURIComponent(postId)}/roster`,
       ),
   };
 

@@ -16,6 +16,7 @@ import type {
   KudosRecord,
   MemoRecord,
   NoteRecord,
+  PostRecord,
   TaskDue,
   TaskRecord,
   TodoRecord,
@@ -252,6 +253,75 @@ export function memoRecordsFromEvents(events: SynomemEvent[]): MemoRecord[] {
     }
   }
   return [...records.values()].sort((a, b) => b.event.createdAt.localeCompare(a.event.createdAt));
+}
+
+/**
+ * Rebuilds posts from their events, acknowledgements included.
+ *
+ * Edits are kept as a list rather than collapsed into the current text. A reader
+ * has to be able to see that a post changed after somebody acknowledged it —
+ * silently rewriting what was acknowledged is how a record becomes a lie.
+ */
+export function postRecordsFromEvents(events: SynomemEvent[]): PostRecord[] {
+  const records = new Map<string, PostRecord>();
+  for (const event of events) {
+    if (event.type === 'post.created') {
+      records.set(event.id, {
+        event,
+        edits: [],
+        acknowledgments: [],
+        status: 'active',
+        title: event.title,
+        body: event.body,
+        ...(event.tags ? { tags: event.tags } : {}),
+        // The text version, counting only changes to the text.
+        //
+        // Deliberately not the aggregate version, which also counts every
+        // acknowledgement. If they were the same number, somebody
+        // acknowledging a post would invalidate an edit the author was in the
+        // middle of making — a conflict with nothing to reconcile.
+        version: 1,
+      });
+    } else if (event.type === 'post.edited') {
+      const record = records.get(event.postId);
+      if (record) {
+        record.edits.push(event);
+        record.title = event.title;
+        record.body = event.body;
+        if (event.tags) record.tags = event.tags;
+        record.version += 1;
+      }
+    } else if (event.type === 'post.archived') {
+      const record = records.get(event.postId);
+      if (record) {
+        record.archived = event;
+        record.status = 'archived';
+      }
+    } else if (event.type === 'post.acknowledged') {
+      const record = records.get(event.postId);
+      if (record) {
+        // One statement per actor: a repeat replaces rather than accumulates.
+        const existing = record.acknowledgments.findIndex(
+          (entry) => entry.actor.id === event.actor.id && entry.actor.kind === event.actor.kind,
+        );
+        const entry = {
+          actor: event.actor,
+          acknowledgedAt: event.createdAt,
+          ...(event.note ? { note: event.note } : {}),
+        };
+        if (existing >= 0) record.acknowledgments[existing] = entry;
+        else record.acknowledgments.push(entry);
+      }
+    } else if (event.type === 'post.acknowledgment.withdrawn') {
+      const record = records.get(event.postId);
+      if (record) {
+        record.acknowledgments = record.acknowledgments.filter(
+          (entry) => !(entry.actor.id === event.actor.id && entry.actor.kind === event.actor.kind),
+        );
+      }
+    }
+  }
+  return [...records.values()];
 }
 
 export function noteRecordsFromEvents(events: SynomemEvent[]): NoteRecord[] {

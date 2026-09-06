@@ -2,6 +2,10 @@ import type {
   ActorIdentity,
   AgentDirectoryEntry,
   AgentProfile,
+  CreatePostInput,
+  PostRecord,
+  PostRoster,
+  UpdatePostInput,
   AgentResolution,
   AgentRuntimeBinding,
   BindRuntimeInput,
@@ -79,6 +83,28 @@ export interface SynomemDomainService {
     bindings(idOrAlias: string): Promise<AgentRuntimeBinding[]>;
     bindRuntime(input: BindRuntimeInput): Promise<AgentRuntimeBinding>;
     unbindRuntime(bindingId: string): Promise<boolean>;
+  };
+  readonly posts: {
+    create(input: CreatePostInput): Promise<{
+      record: PostRecord;
+      created: boolean;
+      deduplicated: boolean;
+    }>;
+    list(input?: Omit<ItemListInput, 'kinds'>): Promise<Page<ItemSummary>>;
+    get(id: string): Promise<PostRecord>;
+    update(input: UpdatePostInput): Promise<PostRecord>;
+    archive(input: {
+      postId: string;
+      reason?: string;
+      idempotencyKey?: string;
+    }): Promise<PostRecord>;
+    acknowledge(input: {
+      postId: string;
+      note?: string;
+      idempotencyKey?: string;
+    }): Promise<PostRecord>;
+    withdrawAcknowledgment(input: { postId: string; reason?: string }): Promise<PostRecord>;
+    roster(postId: string): Promise<PostRoster>;
   };
   readonly kudos: {
     give(input: GiveKudosInput): Promise<GiveKudosResult>;

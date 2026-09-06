@@ -5,6 +5,8 @@ import type {
   ChangePage,
   ItemListInput,
   JsonValue,
+  PostAcknowledgment,
+  PostRoster,
   ItemSummary,
   KudosListInput,
   KudosSummary,
@@ -45,6 +47,9 @@ export interface SynomemRepository {
   listAgents(): Awaitable<AgentProfile[]>;
   /** Resolves a name case-insensitively, reporting ambiguity instead of guessing. */
   resolveAgent(query: string): Awaitable<{ match?: AgentProfile; candidates: AgentProfile[] }>;
+  listPostAcknowledgments(postId: string): Awaitable<PostAcknowledgment[]>;
+  /** Who has acknowledged a post and who has not; see PostRoster. */
+  postRoster(postId: string): Awaitable<PostRoster | undefined>;
   listRuntimeBindings(agentId: string): Awaitable<AgentRuntimeBinding[]>;
   bindRuntime(binding: {
     id: string;

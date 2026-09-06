@@ -3,7 +3,7 @@ export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue
 
 export type ActorKind = 'human' | 'agent' | 'system';
 export type Visibility = 'private' | 'workspace' | 'public';
-export type RecordKind = 'kudos' | 'memo' | 'note' | 'task' | 'todo';
+export type RecordKind = 'kudos' | 'memo' | 'note' | 'post' | 'task' | 'todo';
 
 export interface ActorIdentity {
   kind: ActorKind;
@@ -138,6 +138,54 @@ export interface MemoArchivedEvent extends BaseEvent {
   type: 'memo.archived';
   memoId: string;
   recipientAgentId: string;
+}
+
+/**
+ * A Post is publication: an author says something to the whole workspace rather
+ * than to a named recipient.
+ *
+ * It has no recipient and no assignee, which is what separates it from a memo
+ * and a task. Everyone who can read the workspace can read it, and each of them
+ * can acknowledge it independently — a memo is read by one person, a post by
+ * many, so "who has responded" is the interesting question rather than "was it
+ * read".
+ */
+export interface PostCreatedEvent extends BaseEvent {
+  type: 'post.created';
+  title: string;
+  body: string;
+  tags?: string[];
+  /** The post this replies to. A reply inherits its parent's workspace. */
+  replyTo?: string;
+}
+export interface PostEditedEvent extends BaseEvent {
+  type: 'post.edited';
+  postId: string;
+  title: string;
+  body: string;
+  tags?: string[];
+}
+export interface PostArchivedEvent extends BaseEvent {
+  type: 'post.archived';
+  postId: string;
+  reason?: string;
+}
+/**
+ * One actor saying "I have seen this", and only ever about themselves.
+ *
+ * Appended by an explicit call. Reading a post never acknowledges it: a roster
+ * built from read receipts would answer "whose client fetched this", which for
+ * an agent means "whose runtime happened to poll".
+ */
+export interface PostAcknowledgedEvent extends BaseEvent {
+  type: 'post.acknowledged';
+  postId: string;
+  note?: string;
+}
+export interface PostAcknowledgmentWithdrawnEvent extends BaseEvent {
+  type: 'post.acknowledgment.withdrawn';
+  postId: string;
+  reason?: string;
 }
 
 export interface NoteCreatedEvent extends BaseEvent {
@@ -322,6 +370,11 @@ export type SynomemEvent =
   | MemoSentEvent
   | MemoReadEvent
   | MemoArchivedEvent
+  | PostCreatedEvent
+  | PostEditedEvent
+  | PostArchivedEvent
+  | PostAcknowledgedEvent
+  | PostAcknowledgmentWithdrawnEvent
   | NoteCreatedEvent
   | NoteRevisedEvent
   | NoteArchivedEvent
@@ -356,6 +409,40 @@ export interface MemoRecord {
   archived?: MemoArchivedEvent;
   status: 'unread' | 'read' | 'archived';
 }
+export interface PostAcknowledgment {
+  actor: ActorIdentity;
+  acknowledgedAt: string;
+  note?: string;
+}
+export interface PostRecord {
+  event: PostCreatedEvent;
+  edits: PostEditedEvent[];
+  archived?: PostArchivedEvent;
+  /** Everyone who has said they have seen it, in the order they said so. */
+  acknowledgments: PostAcknowledgment[];
+  status: 'active' | 'archived';
+  title: string;
+  body: string;
+  tags?: string[];
+  version: number;
+}
+
+/**
+ * Who has acknowledged a post, and who has not.
+ *
+ * `outstanding` is the honest denominator: actors who can read the post now AND
+ * could have read it when it was posted. Someone who joined afterwards is
+ * neither acknowledged nor outstanding — they were not there — and is reported
+ * as a count instead, so a roster never accuses a newcomer of ignoring
+ * something written before they arrived.
+ */
+export interface PostRoster {
+  postId: string;
+  acknowledged: PostAcknowledgment[];
+  outstanding: Array<{ id: string; displayName: string }>;
+  joinedSince: number;
+}
+
 export interface NoteRecord {
   event: NoteCreatedEvent;
   revision?: NoteRevisedEvent;
@@ -529,6 +616,23 @@ export interface SendMemoInput extends MutationInput {
   tags?: string[];
   visibility?: Visibility;
 }
+export interface CreatePostInput extends MutationInput {
+  title: string;
+  body: string;
+  tags?: string[];
+  /** The post being replied to; a reply inherits its parent's workspace. */
+  replyTo?: string;
+}
+
+export interface UpdatePostInput {
+  postId: string;
+  expectedVersion: number;
+  title?: string;
+  body?: string;
+  tags?: string[];
+  idempotencyKey?: string;
+}
+
 export interface CreateNoteInput extends MutationInput {
   ownerAgentId?: string;
   title: string;

@@ -31,6 +31,8 @@ import type {
   AgentProfile,
   AgentRuntimeBinding,
   ChangePage,
+  PostAcknowledgment,
+  PostRoster,
   JsonValue,
   KudosChange,
   SynomemEvent,
@@ -237,6 +239,22 @@ CREATE UNIQUE INDEX agent_runtime_bindings_unique
 CREATE INDEX agent_runtime_bindings_agent ON agent_runtime_bindings(agent_id);
 `;
 
+const migrationV6 = `
+-- Acknowledgements are their own rows rather than a column on the post: many
+-- actors acknowledge one post independently, and the interesting question is
+-- who, not how many.
+CREATE TABLE post_acknowledgments (
+  post_id TEXT NOT NULL,
+  actor_kind TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  actor_display_name TEXT,
+  note TEXT,
+  acknowledged_at TEXT NOT NULL,
+  PRIMARY KEY (post_id, actor_kind, actor_id)
+) STRICT;
+CREATE INDEX post_acknowledgments_post ON post_acknowledgments(post_id);
+`;
+
 const migrationV3 = `
 DROP TRIGGER IF EXISTS events_append_only_update;
 DROP TRIGGER IF EXISTS events_append_only_delete;
@@ -365,6 +383,7 @@ function eventKind(event: SynomemEvent): RecordKind | undefined {
   if (event.type.startsWith('kudos.')) return 'kudos';
   if (event.type.startsWith('memo.')) return 'memo';
   if (event.type.startsWith('note.')) return 'note';
+  if (event.type.startsWith('post.')) return 'post';
   if (event.type.startsWith('task.')) return 'task';
   if (event.type.startsWith('todo.')) return 'todo';
   return undefined;
@@ -499,7 +518,7 @@ export class SynomemStorage implements SynomemRepository {
     const version = Number(
       (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
     );
-    if (version > 5) {
+    if (version > 6) {
       throw new SynomemError(
         'UNSUPPORTED_SCHEMA',
         `Database schema version ${version} is newer than this package supports.`,
@@ -567,14 +586,26 @@ export class SynomemStorage implements SynomemRepository {
         db.exec('PRAGMA user_version = 5');
       });
     }
+    const afterV5 = Number(
+      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    );
+    if (afterV5 === 5) {
+      this.transactionSync(() => {
+        db.exec(migrationV6);
+        db.prepare(
+          'INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        ).run(6, new Date().toISOString());
+        db.exec('PRAGMA user_version = 6');
+      });
+    }
   }
 
   private assertSchemaSupported(): void {
     const version = Number(
       (this.db().prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
     );
-    if (version !== 5) {
-      if (version >= 1 && version <= 4) {
+    if (version !== 6) {
+      if (version >= 1 && version <= 5) {
         throw new SynomemError(
           'UNSUPPORTED_SCHEMA',
           `Database schema version ${version} requires migration. Open this home once with readOnly: false, then retry the read-only client.`,
@@ -835,6 +866,61 @@ export class SynomemStorage implements SynomemRepository {
         ownerAgentId: event.ownerAgentId,
         ownerDisplayName: event.ownerDisplayName,
       });
+    } else if (event.type === 'post.created') {
+      /*
+       * A post is addressed to the workspace, so it is recorded as `workspace`
+       * visibility rather than carrying a visibility of its own. There is no
+       * owner-scoped or recipient-scoped read filter to apply: everyone who can
+       * read the workspace can read it, which is the whole point of the domain.
+       */
+      insert({
+        kind: 'post',
+        title: event.title,
+        tags: event.tags,
+        visibility: 'workspace',
+        status: 'active',
+      });
+    } else if (event.type === 'post.edited') {
+      this.db()
+        .prepare(
+          `UPDATE items_current SET title = ?, tags_json = ?,
+         updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
+        )
+        .run(
+          event.title,
+          JSON.stringify(event.tags ?? []),
+          sequence,
+          event.createdAt,
+          event.postId,
+        );
+    } else if (event.type === 'post.archived') {
+      updateStatus('archived');
+    } else if (event.type === 'post.acknowledged') {
+      // One row per actor per post: acknowledging twice is the same statement,
+      // not a second one.
+      this.db()
+        .prepare(
+          `INSERT INTO post_acknowledgments
+             (post_id, actor_kind, actor_id, actor_display_name, note, acknowledged_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(post_id, actor_kind, actor_id) DO UPDATE SET
+             note = excluded.note,
+             acknowledged_at = excluded.acknowledged_at`,
+        )
+        .run(
+          event.postId,
+          event.actor.kind,
+          event.actor.id,
+          event.actor.displayName ?? null,
+          event.note ?? null,
+          event.createdAt,
+        );
+    } else if (event.type === 'post.acknowledgment.withdrawn') {
+      this.db()
+        .prepare(
+          'DELETE FROM post_acknowledgments WHERE post_id = ? AND actor_kind = ? AND actor_id = ?',
+        )
+        .run(event.postId, event.actor.kind, event.actor.id);
     } else if (event.type === 'note.revised') {
       this.db()
         .prepare(
@@ -1418,7 +1504,7 @@ export class SynomemStorage implements SynomemRepository {
         this.db()
           .prepare(
             `SELECT COUNT(*) AS count FROM events WHERE type IN
-       ('kudos.given', 'memo.sent', 'note.created', 'task.created')`,
+       ('kudos.given', 'memo.sent', 'note.created', 'post.created', 'task.created')`,
           )
           .get() as { count: number }
       ).count,
@@ -1571,6 +1657,11 @@ export class SynomemStorage implements SynomemRepository {
           'note.created',
           'note.revised',
           'note.archived',
+          'post.created',
+          'post.edited',
+          'post.archived',
+          'post.acknowledged',
+          'post.acknowledgment.withdrawn',
           'task.created',
           'task.updated',
           'task.completed',
@@ -1685,6 +1776,61 @@ export class SynomemStorage implements SynomemRepository {
       .all(normalized, normalized) as unknown as ProfileRow[];
     const candidates = rows.map((row) => profileSchema.parse(JSON.parse(row.profile_json)));
     return candidates.length === 1 ? { match: candidates[0]!, candidates } : { candidates };
+  }
+
+  /* -------------------------------------------------------- post acknowledgment */
+
+  listPostAcknowledgments(postId: string): PostAcknowledgment[] {
+    const rows = this.db()
+      .prepare(
+        `SELECT actor_kind, actor_id, actor_display_name, note, acknowledged_at
+           FROM post_acknowledgments WHERE post_id = ? ORDER BY acknowledged_at ASC`,
+      )
+      .all(postId) as unknown as Array<{
+      actor_kind: string;
+      actor_id: string;
+      actor_display_name: string | null;
+      note: string | null;
+      acknowledged_at: string;
+    }>;
+    return rows.map((row) => ({
+      actor: {
+        kind: row.actor_kind as ActorIdentity['kind'],
+        id: row.actor_id,
+        ...(row.actor_display_name ? { displayName: row.actor_display_name } : {}),
+      },
+      acknowledgedAt: row.acknowledged_at,
+      ...(row.note ? { note: row.note } : {}),
+    }));
+  }
+
+  /**
+   * Who has acknowledged a post and who has not.
+   *
+   * The denominator is agents that existed when the post was written. An agent
+   * created afterwards is counted separately rather than listed as
+   * outstanding — it was not there, and a roster that says otherwise accuses a
+   * newcomer of ignoring something written before it arrived.
+   */
+  postRoster(postId: string): PostRoster | undefined {
+    const post = this.db()
+      .prepare("SELECT created_at FROM items_current WHERE item_id = ? AND kind = 'post'")
+      .get(postId) as { created_at: string } | undefined;
+    if (!post) return undefined;
+
+    const acknowledged = this.listPostAcknowledgments(postId);
+    const acknowledgedIds = new Set(acknowledged.map((entry) => entry.actor.id));
+
+    const eligible = this.db()
+      .prepare('SELECT id, display_name, created_at FROM agents ORDER BY id ASC')
+      .all() as unknown as Array<{ id: string; display_name: string; created_at: string }>;
+
+    const outstanding = eligible
+      .filter((agent) => agent.created_at <= post.created_at && !acknowledgedIds.has(agent.id))
+      .map((agent) => ({ id: agent.id, displayName: agent.display_name }));
+    const joinedSince = eligible.filter((agent) => agent.created_at > post.created_at).length;
+
+    return { postId, acknowledged, outstanding, joinedSince };
   }
 
   /* ------------------------------------------------------- runtime bindings */
