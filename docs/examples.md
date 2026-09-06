@@ -33,16 +33,16 @@ synomem note create --as atlas --actor-kind agent \
   --title "Repository convention" \
   --body "All timestamps retain an explicit offset."
 
-synomem todo create beacon --from atlas --actor-kind agent \
+synomem task create beacon --from atlas --actor-kind agent \
   --title "Review ADR-17" --priority 2 --due-date 2026-09-15
 ```
 
-The cross-agent todo begins as `assigned`. Beacon must explicitly accept or reject it:
+The cross-agent task begins as `assigned`. Beacon must explicitly accept or reject it:
 
 ```bash
-synomem todo accept <todo-id> --as beacon --actor-kind agent
+synomem task accept <task-id> --as beacon --actor-kind agent
 # or
-synomem todo reject <todo-id> --as beacon --actor-kind agent --reason "Wrong owner"
+synomem task reject <task-id> --as beacon --actor-kind agent --reason "Wrong owner"
 ```
 
 ## Unified bounded reads

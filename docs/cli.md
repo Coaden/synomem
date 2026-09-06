@@ -114,39 +114,39 @@ synomem note archive <note-id> --as codex
 Agents may mutate only their own notes. Revisions require the last-read version and fail with
 `REVISION_CONFLICT` if state changed concurrently.
 
-## Todos
+## Tasks
 
 ```bash
-synomem todo create codex --from gracie --title "Review migration" --due-date 2026-09-15
-synomem todo create codex --from gracie --title "Join review" \
+synomem task create codex --from gracie --title "Review migration" --due-date 2026-09-15
+synomem task create codex --from gracie --title "Join review" \
   --due-at 2026-09-15T14:00:00-05:00 --time-zone America/Chicago
-synomem todo list --assignee codex --status open
-synomem todo show <todo-id>
-synomem todo accept <todo-id> --as codex
-synomem todo reject <todo-id> --as codex --reason "Outside current scope."
-synomem todo update <todo-id> --as codex --expected-version 2 --priority 2
-synomem todo complete <todo-id> --as codex
-synomem todo reopen <todo-id> --as codex
-synomem todo cancel <todo-id> --as codex --reason "Superseded."
+synomem task list --assignee codex --status open
+synomem task show <task-id>
+synomem task accept <task-id> --as codex
+synomem task reject <task-id> --as codex --reason "Outside current scope."
+synomem task update <task-id> --as codex --expected-version 2 --priority 2
+synomem task complete <task-id> --as codex
+synomem task reopen <task-id> --as codex
+synomem task cancel <task-id> --as codex --reason "Superseded."
 ```
 
-Todos assigned by another actor begin `assigned` and cannot be worked or completed until the
+Tasks assigned by another actor begin `assigned` and cannot be worked or completed until the
 assignee explicitly accepts them. Rejection is preserved as a lifecycle event. Self-created agent
-todos begin open. Date-only deadlines do not invent a time; timed deadlines require both an RFC 3339
+tasks begin open. Date-only deadlines do not invent a time; timed deadlines require both an RFC 3339
 offset datetime and an IANA time zone.
 
 ## Unified discovery and inbox
 
 ```bash
 synomem inbox codex
-synomem list --kind memo --kind todo --participant codex --limit 10
+synomem list --kind memo --kind task --participant codex --limit 10
 synomem changes --after <opaque-watermark>
 ```
 
 List results are compact, default to 10, allow at most 50, and omit full detail fields. Changes
 default to 20 and allow at most 100. Both apply an approximate 24 KiB budget and return opaque
 continuation state. Fetch full detail with the appropriate `kudos show`, `memo show`, `note show`,
-or `todo show` command.
+or `task show` command.
 
 ## Administration
 

@@ -475,7 +475,7 @@ describe('CLI', () => {
     await invoke(['backup', backup]);
   });
 
-  it('exercises memo, note, todo, and unified list commands', async () => {
+  it('exercises memo, note, task, and unified list commands', async () => {
     const home = tempHome();
     const invoke = async (args: string[]) => {
       const captured = capture();
@@ -515,9 +515,9 @@ describe('CLI', () => {
     expect(await invoke(['note', 'show', note.record.event.id])).toContain(
       'Events remain append-only',
     );
-    const todo = JSON.parse(
+    const task = JSON.parse(
       await invoke([
-        'todo',
+        'task',
         'create',
         'codex',
         '--from',
@@ -531,13 +531,13 @@ describe('CLI', () => {
     ) as {
       record: { event: { id: string } };
     };
-    expect(await invoke(['todo', 'accept', todo.record.event.id, '--as', 'codex'])).toContain(
+    expect(await invoke(['task', 'accept', task.record.event.id, '--as', 'codex'])).toContain(
       'is open',
     );
-    expect(await invoke(['todo', 'show', todo.record.event.id])).toContain('Review migration');
+    expect(await invoke(['task', 'show', task.record.event.id])).toContain('Review migration');
     const list = await invoke(['list']);
     expect(list).toContain('memo');
     expect(list).toContain('note');
-    expect(list).toContain('todo');
+    expect(list).toContain('task');
   });
 });

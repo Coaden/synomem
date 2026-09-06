@@ -55,7 +55,7 @@ describe('remote Synomem service', () => {
             projections: {
               writeWinsMarkdown: false,
               writeMemoryMarkdown: false,
-              writeTodosMarkdown: false,
+              writeTasksMarkdown: false,
               writeInboxEntries: false,
             },
           },
@@ -138,7 +138,7 @@ describe('remote Synomem service', () => {
             projections: {
               writeWinsMarkdown: false,
               writeMemoryMarkdown: false,
-              writeTodosMarkdown: false,
+              writeTasksMarkdown: false,
               writeInboxEntries: false,
             },
           },

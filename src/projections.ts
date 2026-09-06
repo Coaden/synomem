@@ -16,6 +16,7 @@ import type {
   KudosRecord,
   MemoRecord,
   NoteRecord,
+  TaskRecord,
   TodoRecord,
 } from './types.js';
 
@@ -111,7 +112,7 @@ function memoInboxMarkdown(record: MemoRecord): string {
   ].join('\n')}\n`;
 }
 
-function todoInboxMarkdown(record: TodoRecord): string {
+function taskInboxMarkdown(record: TaskRecord): string {
   const due =
     record.current.due?.kind === 'date'
       ? record.current.due.date
@@ -126,7 +127,7 @@ function todoInboxMarkdown(record: TodoRecord): string {
     `**Status:** ${record.status}  `,
     `**Priority:** ${record.current.priority}  `,
     `**Due:** ${escapeMarkdown(due)}  `,
-    `**Todo ID:** \`${record.event.id}\``,
+    `**Task ID:** \`${record.event.id}\``,
     '',
     ...(record.current.description ? [escapeMarkdown(record.current.description), ''] : []),
   ].join('\n')}\n`;
@@ -157,16 +158,16 @@ function memoryMarkdown(profile: AgentProfile, records: NoteRecord[], rebuiltAt:
   return `${lines.join('\n')}\n`;
 }
 
-function todosMarkdown(profile: AgentProfile, records: TodoRecord[], rebuiltAt: string): string {
+function tasksMarkdown(profile: AgentProfile, records: TaskRecord[], rebuiltAt: string): string {
   const lines = [
     generatedMarker,
     '',
-    `# Todos — ${escapeMarkdown(profile.displayName)}`,
+    `# Tasks — ${escapeMarkdown(profile.displayName)}`,
     '',
     `_Last rebuilt: ${rebuiltAt}_`,
     '',
   ];
-  if (!records.length) lines.push('_No todos yet._', '');
+  if (!records.length) lines.push('_No tasks yet._', '');
   for (const record of records) {
     const due =
       record.current.due?.kind === 'date'
@@ -180,7 +181,7 @@ function todosMarkdown(profile: AgentProfile, records: TodoRecord[], rebuiltAt: 
       `**Status:** ${record.status}  `,
       `**Priority:** ${record.current.priority}  `,
       `**Due:** ${escapeMarkdown(due)}  `,
-      `**Todo ID:** \`${record.event.id}\``,
+      `**Task ID:** \`${record.event.id}\``,
       '',
     );
   }
@@ -278,10 +279,75 @@ export function noteRecordsFromEvents(events: SynomemEvent[]): NoteRecord[] {
   return [...records.values()].sort((a, b) => b.event.createdAt.localeCompare(a.event.createdAt));
 }
 
+/**
+ * Builds private Todo records.
+ *
+ * Deliberately simpler than the Task reducer: there is no acceptance state and
+ * no response history, because there is nobody to negotiate with. A Todo goes
+ * open → completed / canceled / archived, and back to open on reopen.
+ */
 export function todoRecordsFromEvents(events: SynomemEvent[]): TodoRecord[] {
   const records = new Map<string, TodoRecord>();
   for (const event of events) {
     if (event.type === 'todo.created') {
+      records.set(event.id, {
+        event,
+        current: {
+          title: event.title,
+          ...(event.details !== undefined ? { details: event.details } : {}),
+          priority: event.priority,
+          ...(event.due ? { due: event.due } : {}),
+          tags: event.tags ?? [],
+          version: event.aggregateVersion,
+        },
+        status: 'open',
+      });
+    } else if (event.type === 'todo.updated') {
+      const record = records.get(event.todoId);
+      if (record) {
+        record.update = event;
+        record.current = {
+          title: event.title,
+          ...(event.details !== undefined ? { details: event.details } : {}),
+          priority: event.priority,
+          ...(event.due ? { due: event.due } : {}),
+          tags: event.tags ?? [],
+          version: event.aggregateVersion,
+        };
+      }
+    } else if (event.type === 'todo.reopened') {
+      const record = records.get(event.todoId);
+      if (record) {
+        record.reopened = event;
+        record.current.version = event.aggregateVersion;
+        record.status = 'open';
+        delete record.terminal;
+      }
+    } else if (
+      event.type === 'todo.completed' ||
+      event.type === 'todo.canceled' ||
+      event.type === 'todo.archived'
+    ) {
+      const record = records.get(event.todoId);
+      if (record) {
+        record.terminal = event;
+        record.current.version = event.aggregateVersion;
+        record.status =
+          event.type === 'todo.completed'
+            ? 'completed'
+            : event.type === 'todo.canceled'
+              ? 'canceled'
+              : 'archived';
+      }
+    }
+  }
+  return [...records.values()];
+}
+
+export function taskRecordsFromEvents(events: SynomemEvent[]): TaskRecord[] {
+  const records = new Map<string, TaskRecord>();
+  for (const event of events) {
+    if (event.type === 'task.created') {
       records.set(event.id, {
         event,
         current: {
@@ -294,9 +360,10 @@ export function todoRecordsFromEvents(events: SynomemEvent[]): TodoRecord[] {
           version: event.aggregateVersion,
         },
         status: event.requiresAcceptance ? 'assigned' : 'open',
+        responses: [],
       });
-    } else if (event.type === 'todo.updated') {
-      const record = records.get(event.todoId);
+    } else if (event.type === 'task.updated') {
+      const record = records.get(event.taskId);
       if (record) {
         record.update = event;
         record.current = {
@@ -309,30 +376,44 @@ export function todoRecordsFromEvents(events: SynomemEvent[]): TodoRecord[] {
           version: event.aggregateVersion,
         };
       }
-    } else if (event.type === 'todo.accepted') {
-      const record = records.get(event.todoId);
+    } else if (event.type === 'task.accepted') {
+      const record = records.get(event.taskId);
       if (record) {
         record.current.version = event.aggregateVersion;
         record.status = 'open';
+        record.responses.push({
+          kind: 'accepted',
+          ...(event.response !== undefined ? { response: event.response } : {}),
+          actor: event.actor,
+          at: event.createdAt,
+        });
       }
     } else if (
-      event.type === 'todo.completed' ||
-      event.type === 'todo.rejected' ||
-      event.type === 'todo.canceled'
+      event.type === 'task.completed' ||
+      event.type === 'task.rejected' ||
+      event.type === 'task.canceled'
     ) {
-      const record = records.get(event.todoId);
+      const record = records.get(event.taskId);
       if (record) {
         record.terminal = event;
         record.current.version = event.aggregateVersion;
+        if (event.type === 'task.rejected') {
+          record.responses.push({
+            kind: 'rejected',
+            response: event.response,
+            actor: event.actor,
+            at: event.createdAt,
+          });
+        }
         record.status =
-          event.type === 'todo.completed'
+          event.type === 'task.completed'
             ? 'completed'
-            : event.type === 'todo.rejected'
+            : event.type === 'task.rejected'
               ? 'rejected'
               : 'canceled';
       }
-    } else if (event.type === 'todo.reopened') {
-      const record = records.get(event.todoId);
+    } else if (event.type === 'task.reopened') {
+      const record = records.get(event.taskId);
       if (record) {
         record.reopened = event;
         record.current.version = event.aggregateVersion;
@@ -358,9 +439,9 @@ export function renderMarkdownExport(events: SynomemEvent[]): string {
       (record) =>
         `## Note: ${escapeMarkdown(record.current.title)}\n\n${escapeMarkdown(record.current.body)}\n\nStatus: ${record.status}; version ${record.current.version}\n\nID: \`${record.event.id}\``,
     ),
-    ...todoRecordsFromEvents(events).map(
+    ...taskRecordsFromEvents(events).map(
       (record) =>
-        `## Todo: ${escapeMarkdown(record.current.title)}\n\n${record.current.description ? `${escapeMarkdown(record.current.description)}\n\n` : ''}Status: ${record.status}; priority ${record.current.priority}\n\nID: \`${record.event.id}\``,
+        `## Task: ${escapeMarkdown(record.current.title)}\n\n${record.current.description ? `${escapeMarkdown(record.current.description)}\n\n` : ''}Status: ${record.status}; priority ${record.current.priority}\n\nID: \`${record.event.id}\``,
     ),
   ];
   return `${sections.join('\n\n')}\n`;
@@ -380,7 +461,7 @@ export class ProjectionManager implements ProjectionWriter {
     const records = recordsFromEvents(events);
     const memos = memoRecordsFromEvents(events);
     const notes = noteRecordsFromEvents(events);
-    const todos = todoRecordsFromEvents(events);
+    const tasks = taskRecordsFromEvents(events);
     const rebuiltAt = events.at(-1)?.createdAt ?? new Date(0).toISOString();
     const generated: string[] = [];
 
@@ -394,12 +475,12 @@ export class ProjectionManager implements ProjectionWriter {
       const inboxDirectory = join(agentDirectory, 'inbox');
       const kudosInboxDirectory = join(inboxDirectory, 'kudos');
       const memoInboxDirectory = join(inboxDirectory, 'memos');
-      const todoInboxDirectory = join(inboxDirectory, 'todos');
+      const taskInboxDirectory = join(inboxDirectory, 'tasks');
       assertNoSymlinkEscape(this.storage.home, inboxDirectory);
       ensureDirectory(inboxDirectory);
       ensureDirectory(kudosInboxDirectory);
       ensureDirectory(memoInboxDirectory);
-      ensureDirectory(todoInboxDirectory);
+      ensureDirectory(taskInboxDirectory);
 
       atomicWriteDerivedFile(
         profilePath,
@@ -424,11 +505,11 @@ export class ProjectionManager implements ProjectionWriter {
         atomicWriteDerivedFile(memoryPath, memoryMarkdown(profile, agentNotes, rebuiltAt));
         generated.push(manifestPath(this.storage.home, memoryPath));
       }
-      const agentTodos = todos.filter((record) => record.event.assigneeAgentId === profile.id);
-      if (this.storage.config.projection.writeTodosMarkdown) {
-        const todosPath = join(agentDirectory, 'TODOS.md');
-        atomicWriteDerivedFile(todosPath, todosMarkdown(profile, agentTodos, rebuiltAt));
-        generated.push(manifestPath(this.storage.home, todosPath));
+      const agentTasks = tasks.filter((record) => record.event.assigneeAgentId === profile.id);
+      if (this.storage.config.projection.writeTasksMarkdown) {
+        const tasksPath = join(agentDirectory, 'TODOS.md');
+        atomicWriteDerivedFile(tasksPath, tasksMarkdown(profile, agentTasks, rebuiltAt));
+        generated.push(manifestPath(this.storage.home, tasksPath));
       }
       if (this.storage.config.projection.writeInboxEntries) {
         for (const record of agentRecords.filter(
@@ -445,11 +526,11 @@ export class ProjectionManager implements ProjectionWriter {
           atomicWriteDerivedFile(inboxPath, memoInboxMarkdown(record));
           generated.push(manifestPath(this.storage.home, inboxPath));
         }
-        for (const record of agentTodos.filter(
+        for (const record of agentTasks.filter(
           (item) => item.status === 'open' || item.status === 'assigned',
         )) {
-          const inboxPath = join(todoInboxDirectory, `${record.event.id}.md`);
-          atomicWriteDerivedFile(inboxPath, todoInboxMarkdown(record));
+          const inboxPath = join(taskInboxDirectory, `${record.event.id}.md`);
+          atomicWriteDerivedFile(inboxPath, taskInboxMarkdown(record));
           generated.push(manifestPath(this.storage.home, inboxPath));
         }
       }
@@ -487,7 +568,7 @@ export class ProjectionManager implements ProjectionWriter {
     const notes = noteRecordsFromEvents(events).filter(
       (record) => record.event.ownerAgentId === profile.id,
     );
-    const todos = todoRecordsFromEvents(events).filter(
+    const tasks = taskRecordsFromEvents(events).filter(
       (record) => record.event.assigneeAgentId === profile.id,
     );
     const rebuiltAt = events.at(-1)?.createdAt ?? new Date(0).toISOString();
@@ -495,14 +576,14 @@ export class ProjectionManager implements ProjectionWriter {
     const inboxDirectory = join(agentDirectory, 'inbox');
     const kudosInboxDirectory = join(inboxDirectory, 'kudos');
     const memoInboxDirectory = join(inboxDirectory, 'memos');
-    const todoInboxDirectory = join(inboxDirectory, 'todos');
+    const taskInboxDirectory = join(inboxDirectory, 'tasks');
     assertNoSymlinkEscape(this.storage.home, agentDirectory);
     assertNoSymlinkEscape(this.storage.home, inboxDirectory);
     ensureDirectory(agentDirectory);
     ensureDirectory(inboxDirectory);
     ensureDirectory(kudosInboxDirectory);
     ensureDirectory(memoInboxDirectory);
-    ensureDirectory(todoInboxDirectory);
+    ensureDirectory(taskInboxDirectory);
 
     const generated: string[] = [];
     const profilePath = join(agentDirectory, 'profile.json');
@@ -532,10 +613,10 @@ export class ProjectionManager implements ProjectionWriter {
       generated.push(manifestPath(this.storage.home, memoryPath));
     }
 
-    if (this.storage.config.projection.writeTodosMarkdown) {
-      const todosPath = join(agentDirectory, 'TODOS.md');
-      atomicWriteDerivedFile(todosPath, todosMarkdown(profile, todos, rebuiltAt));
-      generated.push(manifestPath(this.storage.home, todosPath));
+    if (this.storage.config.projection.writeTasksMarkdown) {
+      const tasksPath = join(agentDirectory, 'TODOS.md');
+      atomicWriteDerivedFile(tasksPath, tasksMarkdown(profile, tasks, rebuiltAt));
+      generated.push(manifestPath(this.storage.home, tasksPath));
     }
 
     if (this.storage.config.projection.writeInboxEntries) {
@@ -553,12 +634,12 @@ export class ProjectionManager implements ProjectionWriter {
         if (!existsSync(inboxPath)) atomicWriteDerivedFile(inboxPath, memoInboxMarkdown(record));
         generated.push(relativePath);
       }
-      for (const record of todos.filter(
+      for (const record of tasks.filter(
         (item) => item.status === 'open' || item.status === 'assigned',
       )) {
-        const inboxPath = join(todoInboxDirectory, `${record.event.id}.md`);
+        const inboxPath = join(taskInboxDirectory, `${record.event.id}.md`);
         const relativePath = manifestPath(this.storage.home, inboxPath);
-        if (!existsSync(inboxPath)) atomicWriteDerivedFile(inboxPath, todoInboxMarkdown(record));
+        if (!existsSync(inboxPath)) atomicWriteDerivedFile(inboxPath, taskInboxMarkdown(record));
         generated.push(relativePath);
       }
     }
@@ -589,13 +670,13 @@ export class ProjectionManager implements ProjectionWriter {
     const events = this.storage.getReadableEvents();
     const records = recordsFromEvents(events);
     const memos = memoRecordsFromEvents(events);
-    const todos = todoRecordsFromEvents(events);
+    const tasks = taskRecordsFromEvents(events);
     const paths: string[] = [];
     for (const profile of profiles) {
       paths.push(`${profile.id}/profile.json`);
       if (this.storage.config.projection.writeWinsMarkdown) paths.push(`${profile.id}/WINS.md`);
       if (this.storage.config.projection.writeMemoryMarkdown) paths.push(`${profile.id}/MEMORY.md`);
-      if (this.storage.config.projection.writeTodosMarkdown) paths.push(`${profile.id}/TODOS.md`);
+      if (this.storage.config.projection.writeTasksMarkdown) paths.push(`${profile.id}/TODOS.md`);
       if (this.storage.config.projection.writeInboxEntries) {
         for (const record of records.filter(
           (item) =>
@@ -610,12 +691,12 @@ export class ProjectionManager implements ProjectionWriter {
         )) {
           paths.push(`${profile.id}/inbox/memos/${record.event.id}.md`);
         }
-        for (const record of todos.filter(
+        for (const record of tasks.filter(
           (item) =>
             item.event.assigneeAgentId === profile.id &&
             (item.status === 'open' || item.status === 'assigned'),
         )) {
-          paths.push(`${profile.id}/inbox/todos/${record.event.id}.md`);
+          paths.push(`${profile.id}/inbox/tasks/${record.event.id}.md`);
         }
       }
     }

@@ -19,7 +19,7 @@ version.
 
 ## Action
 
-“Assign Codex a todo to review the migration by September 15” maps to `synomem_todo_create` with a
+“Assign Codex a task to review the migration by September 15” maps to `synomem_task_create` with a
 date-only due value. Do not invent a time of day.
 
 ## Inbox and retries

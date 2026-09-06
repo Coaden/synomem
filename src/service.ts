@@ -6,8 +6,8 @@ import type {
   CreateAgentInput,
   CreateNoteInput,
   CreateNoteResult,
-  CreateTodoInput,
-  CreateTodoResult,
+  CreateTaskInput,
+  CreateTaskResult,
   DoctorResult,
   GiveKudosInput,
   GiveKudosResult,
@@ -27,9 +27,9 @@ import type {
   ReviseNoteInput,
   SendMemoInput,
   SendMemoResult,
-  TodoRecord,
+  TaskRecord,
   UpdateAgentInput,
-  UpdateTodoInput,
+  UpdateTaskInput,
 } from './types.js';
 
 export interface SynomemServiceCapabilities {
@@ -45,7 +45,7 @@ export interface SynomemServiceCapabilities {
   projections: {
     writeWinsMarkdown: boolean;
     writeMemoryMarkdown: boolean;
-    writeTodosMarkdown: boolean;
+    writeTasksMarkdown: boolean;
     writeInboxEntries: boolean;
   };
 }
@@ -93,28 +93,28 @@ export interface SynomemDomainService {
     revise(input: ReviseNoteInput): Promise<NoteRecord>;
     archive(input: { noteId: string; idempotencyKey?: string }): Promise<NoteRecord>;
   };
-  readonly todos: {
-    create(input: CreateTodoInput): Promise<CreateTodoResult>;
+  readonly tasks: {
+    create(input: CreateTaskInput): Promise<CreateTaskResult>;
     list(input?: Omit<ItemListInput, 'kinds'>): Promise<Page<ItemSummary>>;
-    get(id: string): Promise<TodoRecord>;
-    update(input: UpdateTodoInput): Promise<TodoRecord>;
-    accept(input: { todoId: string; idempotencyKey?: string }): Promise<TodoRecord>;
+    get(id: string): Promise<TaskRecord>;
+    update(input: UpdateTaskInput): Promise<TaskRecord>;
+    accept(input: { taskId: string; idempotencyKey?: string }): Promise<TaskRecord>;
     reject(input: {
-      todoId: string;
+      taskId: string;
       reason?: string;
       idempotencyKey?: string;
-    }): Promise<TodoRecord>;
+    }): Promise<TaskRecord>;
     complete(input: {
-      todoId: string;
+      taskId: string;
       note?: string;
       idempotencyKey?: string;
-    }): Promise<TodoRecord>;
-    reopen(input: { todoId: string; idempotencyKey?: string }): Promise<TodoRecord>;
+    }): Promise<TaskRecord>;
+    reopen(input: { taskId: string; idempotencyKey?: string }): Promise<TaskRecord>;
     cancel(input: {
-      todoId: string;
+      taskId: string;
       reason?: string;
       idempotencyKey?: string;
-    }): Promise<TodoRecord>;
+    }): Promise<TaskRecord>;
   };
   readonly items: {
     list(input?: ItemListInput): Promise<Page<ItemSummary>>;

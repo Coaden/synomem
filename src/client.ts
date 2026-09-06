@@ -10,6 +10,7 @@ import {
   noteRecordsFromEvents,
   ProjectionManager,
   recordsFromEvents,
+  taskRecordsFromEvents,
   todoRecordsFromEvents,
 } from './projections.js';
 import {
@@ -17,6 +18,7 @@ import {
   agentIdSchema,
   createAgentSchema,
   createNoteSchema,
+  createTaskSchema,
   createTodoSchema,
   changesInputSchema,
   giveKudosSchema,
@@ -24,6 +26,7 @@ import {
   listInputSchema,
   reviseNoteSchema,
   sendMemoSchema,
+  updateTaskSchema,
   updateTodoSchema,
   updateAgentSchema,
 } from './schemas.js';
@@ -52,9 +55,13 @@ import type {
   CreateNoteResult,
   ReviseNoteInput,
   NoteRecord,
+  CreateTaskInput,
   CreateTodoInput,
   CreateTodoResult,
+  CreateTaskResult,
+  UpdateTaskInput,
   UpdateTodoInput,
+  TaskRecord,
   TodoRecord,
   ItemListInput,
   ItemRecord,
@@ -131,20 +138,39 @@ export class SynomemCore implements SynomemDomainService {
     archive: (input: { noteId: string; idempotencyKey?: string }) => this.archiveNote(input),
   };
 
+  readonly tasks = {
+    create: (input: CreateTaskInput) => this.createTask(input),
+    list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
+      this.listItems({ ...input, kinds: ['task'] }),
+    get: (id: string) => this.getTask(id),
+    update: (input: UpdateTaskInput) => this.updateTask(input),
+    // A response is optional when accepting and required when rejecting: a
+    // refusal without a reason leaves the assigner unable to act on it.
+    accept: (input: { taskId: string; response?: string; idempotencyKey?: string }) =>
+      this.acceptTask(input),
+    reject: (input: { taskId: string; response: string; idempotencyKey?: string }) =>
+      this.rejectTask(input),
+    complete: (input: { taskId: string; note?: string; idempotencyKey?: string }) =>
+      this.completeTask(input),
+    reopen: (input: { taskId: string; idempotencyKey?: string }) => this.reopenTask(input),
+    cancel: (input: { taskId: string; reason?: string; idempotencyKey?: string }) =>
+      this.cancelTask(input),
+  };
+
   readonly todos = {
     create: (input: CreateTodoInput) => this.createTodo(input),
     list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
       this.listItems({ ...input, kinds: ['todo'] }),
     get: (id: string) => this.getTodo(id),
     update: (input: UpdateTodoInput) => this.updateTodo(input),
-    accept: (input: { todoId: string; idempotencyKey?: string }) => this.acceptTodo(input),
-    reject: (input: { todoId: string; reason?: string; idempotencyKey?: string }) =>
-      this.rejectTodo(input),
     complete: (input: { todoId: string; note?: string; idempotencyKey?: string }) =>
-      this.completeTodo(input),
-    reopen: (input: { todoId: string; idempotencyKey?: string }) => this.reopenTodo(input),
+      this.todoTransition(input, 'todo.completed'),
+    reopen: (input: { todoId: string; idempotencyKey?: string }) =>
+      this.todoTransition(input, 'todo.reopened'),
     cancel: (input: { todoId: string; reason?: string; idempotencyKey?: string }) =>
-      this.cancelTodo(input),
+      this.todoTransition(input, 'todo.canceled'),
+    archive: (input: { todoId: string; idempotencyKey?: string }) =>
+      this.todoTransition(input, 'todo.archived'),
   };
 
   readonly items = {
@@ -493,7 +519,7 @@ export class SynomemCore implements SynomemDomainService {
           ? 'MEMO_NOT_FOUND'
           : kind === 'note'
             ? 'NOTE_NOT_FOUND'
-            : kind === 'todo'
+            : kind === 'task'
               ? 'TODO_NOT_FOUND'
               : 'KUDOS_NOT_FOUND';
       throw new SynomemError(code, `Unknown ${kind}: ${id}`);
@@ -744,21 +770,21 @@ export class SynomemCore implements SynomemDomainService {
     return await this.getNoteRecord(input.noteId);
   }
 
-  private async getTodoRecord(id: string): Promise<TodoRecord> {
-    await this.requireVisibleItem(id, 'todo');
-    const record = todoRecordsFromEvents(await this.repository.getReadableItemEvents(id))[0];
-    if (!record) throw new SynomemError('TODO_NOT_FOUND', `Unknown todo: ${id}`);
+  private async getTaskRecord(id: string): Promise<TaskRecord> {
+    await this.requireVisibleItem(id, 'task');
+    const record = taskRecordsFromEvents(await this.repository.getReadableItemEvents(id))[0];
+    if (!record) throw new SynomemError('TODO_NOT_FOUND', `Unknown task: ${id}`);
     return record;
   }
-  private async getTodo(id: string): Promise<TodoRecord> {
+  private async getTask(id: string): Promise<TaskRecord> {
     this.checkAbort();
-    return await this.getTodoRecord(id);
+    return await this.getTaskRecord(id);
   }
 
-  private async createTodo(input: CreateTodoInput): Promise<CreateTodoResult> {
+  private async createTask(input: CreateTaskInput): Promise<CreateTaskResult> {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
-    const parsed = this.validate(() => createTodoSchema.parse(input));
+    const parsed = this.validate(() => createTaskSchema.parse(input));
     const assigneeId =
       parsed.assigneeAgentId ?? (this.actor.kind === 'agent' ? this.actor.id : undefined);
     if (!assigneeId)
@@ -768,21 +794,21 @@ export class SynomemCore implements SynomemDomainService {
       );
     const assignee = await this.repository.getAgent(assigneeId);
     if (!assignee)
-      throw new SynomemError('AGENT_NOT_FOUND', `Unknown todo assignee: ${assigneeId}`);
+      throw new SynomemError('AGENT_NOT_FOUND', `Unknown task assignee: ${assigneeId}`);
     if (
       this.actor.kind === 'agent' &&
       this.actor.id !== assignee.id &&
-      !this.repository.config.allowCrossAgentTodos
+      !this.repository.config.allowCrossAgentTasks
     )
-      throw new SynomemError('POLICY_FORBIDDEN', 'Cross-agent todo assignment is disabled.');
+      throw new SynomemError('POLICY_FORBIDDEN', 'Cross-agent task assignment is disabled.');
     const outcome = await this.repository.transaction(async () => {
-      const prior = await this.priorMutation(parsed.idempotencyKey, 'todo.created');
-      if (prior?.type === 'todo.created') return { id: prior.id, created: false };
+      const prior = await this.priorMutation(parsed.idempotencyKey, 'task.created');
+      if (prior?.type === 'task.created') return { id: prior.id, created: false };
       const id = this.nextId();
       const requiresAcceptance = this.actor.kind !== 'agent' || this.actor.id !== assignee.id;
       const event: SynomemEvent = {
         ...this.eventBase(id, 1, id),
-        type: 'todo.created',
+        type: 'task.created',
         assigneeAgentId: assignee.id,
         assigneeDisplayName: assignee.displayName,
         title: parsed.title,
@@ -801,13 +827,13 @@ export class SynomemCore implements SynomemDomainService {
     });
     if (outcome.created) await this.projectionWriter.syncAgent(assignee.id);
     return {
-      record: await this.getTodoRecord(outcome.id),
+      record: await this.getTaskRecord(outcome.id),
       created: outcome.created,
       deduplicated: !outcome.created,
     };
   }
 
-  private assertTodoParticipant(record: TodoRecord): void {
+  private assertTaskParticipant(record: TaskRecord): void {
     const isCreator =
       record.event.actor.kind === this.actor.kind && record.event.actor.id === this.actor.id;
     const isAssignee =
@@ -815,35 +841,35 @@ export class SynomemCore implements SynomemDomainService {
     if (!this.administrative && !isCreator && !isAssignee)
       throw new SynomemError(
         'MUTATION_FORBIDDEN',
-        'Only the todo creator, assignee, or a human administrator may change it.',
+        'Only the task creator, assignee, or a human administrator may change it.',
       );
   }
 
-  private assertTodoAssignee(record: TodoRecord): void {
+  private assertTaskAssignee(record: TaskRecord): void {
     if (
       !this.administrative &&
       !(this.actor.kind === 'agent' && this.actor.id === record.event.assigneeAgentId)
     ) {
       throw new SynomemError(
         'MUTATION_FORBIDDEN',
-        'Only the assigned agent or a human administrator may accept or reject this todo.',
+        'Only the assigned agent or a human administrator may accept or reject this task.',
       );
     }
   }
 
-  private async updateTodo(input: UpdateTodoInput): Promise<TodoRecord> {
-    const parsed = this.validate(() => updateTodoSchema.parse(input));
-    const record = await this.getTodoRecord(parsed.todoId);
-    this.assertTodoParticipant(record);
+  private async updateTask(input: UpdateTaskInput): Promise<TaskRecord> {
+    const parsed = this.validate(() => updateTaskSchema.parse(input));
+    const record = await this.getTaskRecord(parsed.taskId);
+    this.assertTaskParticipant(record);
     if (record.status !== 'open')
-      throw new SynomemError('INVALID_INPUT', 'Only open todos can be updated.');
+      throw new SynomemError('INVALID_INPUT', 'Only open tasks can be updated.');
     if (parsed.expectedVersion !== record.current.version)
       throw new SynomemError(
         'REVISION_CONFLICT',
-        `Expected todo version ${parsed.expectedVersion}; current version is ${record.current.version}.`,
+        `Expected task version ${parsed.expectedVersion}; current version is ${record.current.version}.`,
       );
     await this.repository.transaction(async () => {
-      const prior = await this.priorMutation(parsed.idempotencyKey, 'todo.updated');
+      const prior = await this.priorMutation(parsed.idempotencyKey, 'task.updated');
       if (prior) return;
       if (
         (await this.repository.nextAggregateVersion(record.event.id)) !==
@@ -851,13 +877,13 @@ export class SynomemCore implements SynomemDomainService {
       )
         throw new SynomemError(
           'REVISION_CONFLICT',
-          'The todo changed before this update was stored.',
+          'The task changed before this update was stored.',
         );
       const due = parsed.due === null ? undefined : (parsed.due ?? record.current.due);
       const event: SynomemEvent = {
         ...this.eventBase(record.event.id, parsed.expectedVersion + 1),
-        type: 'todo.updated',
-        todoId: record.event.id,
+        type: 'task.updated',
+        taskId: record.event.id,
         title: parsed.title ?? record.current.title,
         ...(parsed.description !== undefined
           ? { description: parsed.description }
@@ -875,36 +901,212 @@ export class SynomemCore implements SynomemDomainService {
       await this.repository.insertEvent(event);
     });
     await this.projectionWriter.syncAgent(record.event.assigneeAgentId);
+    return await this.getTaskRecord(parsed.taskId);
+  }
+
+  private async taskTransition(
+    input: {
+      taskId: string;
+      idempotencyKey?: string;
+      note?: string;
+      reason?: string;
+      response?: string;
+    },
+    type: 'task.accepted' | 'task.rejected' | 'task.completed' | 'task.reopened' | 'task.canceled',
+  ): Promise<TaskRecord> {
+    const record = await this.getTaskRecord(input.taskId);
+    // A rejection must say why. Enforced here as well as in the schema so the
+    // failure names the missing thing rather than surfacing as a parse error.
+    if (type === 'task.rejected' && !input.response?.trim()) {
+      throw new SynomemError(
+        'INVALID_INPUT',
+        'Rejecting a task requires a response explaining why, so the assigner knows whether to reassign it, wait, or change the request.',
+      );
+    }
+    if (type === 'task.accepted' || type === 'task.rejected') this.assertTaskAssignee(record);
+    else this.assertTaskParticipant(record);
+    if ((type === 'task.accepted' || type === 'task.rejected') && record.status !== 'assigned') {
+      if (type === 'task.accepted' && record.status === 'open') return record;
+      if (type === 'task.rejected' && record.status === 'rejected') return record;
+      throw new SynomemError('INVALID_INPUT', 'Only assigned tasks may be accepted or rejected.');
+    }
+    if (type === 'task.completed' && record.status !== 'open') {
+      if (record.status === 'completed') return record;
+      throw new SynomemError(
+        'INVALID_INPUT',
+        'Only accepted or self-created open tasks may be completed.',
+      );
+    }
+    if (type === 'task.reopened' && record.status !== 'completed' && record.status !== 'canceled') {
+      if (record.status === 'open') return record;
+      throw new SynomemError('INVALID_INPUT', 'Only completed or canceled tasks may be reopened.');
+    }
+    if (type === 'task.canceled' && record.status !== 'assigned' && record.status !== 'open') {
+      if (record.status === 'canceled') return record;
+      throw new SynomemError('INVALID_INPUT', 'Only assigned or open tasks may be canceled.');
+    }
+    await this.repository.transaction(async () => {
+      const prior = await this.priorMutation(input.idempotencyKey, type);
+      if (prior) return;
+      const base = {
+        ...this.eventBase(
+          record.event.id,
+          await this.repository.nextAggregateVersion(record.event.id),
+        ),
+        taskId: record.event.id,
+        ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+      };
+      const event: SynomemEvent =
+        type === 'task.completed'
+          ? { ...base, type, ...(input.note ? { note: input.note.trim() } : {}) }
+          : type === 'task.rejected'
+            ? { ...base, type, response: input.response!.trim() }
+            : type === 'task.accepted'
+              ? {
+                  ...base,
+                  type,
+                  ...(input.response ? { response: input.response.trim() } : {}),
+                }
+              : type === 'task.canceled'
+                ? { ...base, type, ...(input.reason ? { reason: input.reason.trim() } : {}) }
+                : { ...base, type };
+      await this.repository.insertEvent(event);
+    });
+    await this.projectionWriter.syncAgent(record.event.assigneeAgentId);
+    return await this.getTaskRecord(input.taskId);
+  }
+  private completeTask(input: { taskId: string; note?: string; idempotencyKey?: string }) {
+    return this.taskTransition(input, 'task.completed');
+  }
+  private acceptTask(input: { taskId: string; response?: string; idempotencyKey?: string }) {
+    return this.taskTransition(input, 'task.accepted');
+  }
+  private rejectTask(input: { taskId: string; response: string; idempotencyKey?: string }) {
+    return this.taskTransition(input, 'task.rejected');
+  }
+  private reopenTask(input: { taskId: string; idempotencyKey?: string }) {
+    return this.taskTransition(input, 'task.reopened');
+  }
+  private cancelTask(input: { taskId: string; reason?: string; idempotencyKey?: string }) {
+    return this.taskTransition(input, 'task.canceled');
+  }
+
+  /* ----------------------------------------------------------------- todos *
+   * A Todo is a private reminder an agent creates for itself. There is no
+   * assignee, no acceptance, and no visibility choice: it belongs to its author
+   * and only its author reads it. Every method below asserts that ownership
+   * rather than relying on a visibility filter, so a Todo cannot be reached by
+   * guessing its id.
+   */
+
+  private async createTodo(input: CreateTodoInput): Promise<CreateTodoResult> {
+    this.checkAbort();
+    await this.repository.assertEventCompatibility();
+    const parsed = this.validate(() => createTodoSchema.parse(input));
+    const outcome = await this.repository.transaction(async () => {
+      const prior = await this.priorMutation(parsed.idempotencyKey, 'todo.created');
+      if (prior?.type === 'todo.created') return { id: prior.id, created: false };
+      const id = this.nextId();
+      const event: SynomemEvent = {
+        ...this.eventBase(id, 1, id),
+        type: 'todo.created',
+        title: parsed.title,
+        ...(parsed.details !== undefined ? { details: parsed.details } : {}),
+        priority: parsed.priority ?? 3,
+        ...(parsed.due ? { due: parsed.due } : {}),
+        tags: [...new Set(parsed.tags ?? [])].sort(),
+        ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
+        ...(parsed.source ? { source: parsed.source } : {}),
+        ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
+      };
+      await this.repository.insertEvent(event);
+      return { id, created: true };
+    });
+    return {
+      record: await this.getTodoRecord(outcome.id),
+      created: outcome.created,
+      deduplicated: !outcome.created,
+    };
+  }
+
+  private async getTodoRecord(id: string): Promise<TodoRecord> {
+    const record = todoRecordsFromEvents(await this.repository.getReadableItemEvents(id))[0];
+    if (!record) throw new SynomemError('ITEM_NOT_FOUND', `Unknown todo: ${id}`);
+    this.assertTodoOwner(record);
+    return record;
+  }
+
+  /**
+   * Todos are owner-only. No role, however broad, reads another actor's
+   * private reminders — that is a named administrative capability this release
+   * does not have, not something a permission check quietly allows.
+   */
+  private assertTodoOwner(record: TodoRecord): void {
+    const owner = record.event.actor;
+    if (owner.kind !== this.actor.kind || owner.id !== this.actor.id) {
+      throw new SynomemError(
+        'MUTATION_FORBIDDEN',
+        'A todo is private to the actor who created it.',
+      );
+    }
+  }
+
+  private async getTodo(id: string): Promise<TodoRecord> {
+    this.checkAbort();
+    return await this.getTodoRecord(id);
+  }
+
+  private async updateTodo(input: UpdateTodoInput): Promise<TodoRecord> {
+    this.checkAbort();
+    const parsed = this.validate(() => updateTodoSchema.parse(input));
+    const record = await this.getTodoRecord(parsed.todoId);
+    if (record.current.version !== parsed.expectedVersion) {
+      throw new SynomemError(
+        'REVISION_CONFLICT',
+        `Todo ${parsed.todoId} is at version ${record.current.version}.`,
+      );
+    }
+    const due = parsed.due === null ? undefined : (parsed.due ?? record.current.due);
+    await this.repository.transaction(async () => {
+      const prior = await this.priorMutation(parsed.idempotencyKey, 'todo.updated');
+      if (prior) return;
+      const event: SynomemEvent = {
+        ...this.eventBase(
+          record.event.id,
+          await this.repository.nextAggregateVersion(record.event.id),
+        ),
+        type: 'todo.updated',
+        todoId: record.event.id,
+        title: parsed.title ?? record.current.title,
+        ...((parsed.details ?? record.current.details)
+          ? { details: parsed.details ?? record.current.details }
+          : {}),
+        priority: parsed.priority ?? record.current.priority,
+        ...(due ? { due } : {}),
+        tags: [...new Set<string>(parsed.tags ?? record.current.tags)].sort(),
+        ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
+      };
+      await this.repository.insertEvent(event);
+    });
     return await this.getTodoRecord(parsed.todoId);
   }
 
   private async todoTransition(
     input: { todoId: string; idempotencyKey?: string; note?: string; reason?: string },
-    type: 'todo.accepted' | 'todo.rejected' | 'todo.completed' | 'todo.reopened' | 'todo.canceled',
+    type: 'todo.completed' | 'todo.reopened' | 'todo.canceled' | 'todo.archived',
   ): Promise<TodoRecord> {
     const record = await this.getTodoRecord(input.todoId);
-    if (type === 'todo.accepted' || type === 'todo.rejected') this.assertTodoAssignee(record);
-    else this.assertTodoParticipant(record);
-    if ((type === 'todo.accepted' || type === 'todo.rejected') && record.status !== 'assigned') {
-      if (type === 'todo.accepted' && record.status === 'open') return record;
-      if (type === 'todo.rejected' && record.status === 'rejected') return record;
-      throw new SynomemError('INVALID_INPUT', 'Only assigned todos may be accepted or rejected.');
-    }
     if (type === 'todo.completed' && record.status !== 'open') {
       if (record.status === 'completed') return record;
-      throw new SynomemError(
-        'INVALID_INPUT',
-        'Only accepted or self-created open todos may be completed.',
-      );
+      throw new SynomemError('INVALID_INPUT', 'Only an open todo may be completed.');
     }
-    if (type === 'todo.reopened' && record.status !== 'completed' && record.status !== 'canceled') {
-      if (record.status === 'open') return record;
-      throw new SynomemError('INVALID_INPUT', 'Only completed or canceled todos may be reopened.');
-    }
-    if (type === 'todo.canceled' && record.status !== 'assigned' && record.status !== 'open') {
+    if (type === 'todo.reopened' && record.status === 'open') return record;
+    if (type === 'todo.canceled' && record.status !== 'open') {
       if (record.status === 'canceled') return record;
-      throw new SynomemError('INVALID_INPUT', 'Only assigned or open todos may be canceled.');
+      throw new SynomemError('INVALID_INPUT', 'Only an open todo may be canceled.');
     }
+    if (type === 'todo.archived' && record.status === 'archived') return record;
+
     await this.repository.transaction(async () => {
       const prior = await this.priorMutation(input.idempotencyKey, type);
       if (prior) return;
@@ -919,28 +1121,12 @@ export class SynomemCore implements SynomemDomainService {
       const event: SynomemEvent =
         type === 'todo.completed'
           ? { ...base, type, ...(input.note ? { note: input.note.trim() } : {}) }
-          : type === 'todo.canceled' || type === 'todo.rejected'
+          : type === 'todo.canceled'
             ? { ...base, type, ...(input.reason ? { reason: input.reason.trim() } : {}) }
             : { ...base, type };
       await this.repository.insertEvent(event);
     });
-    await this.projectionWriter.syncAgent(record.event.assigneeAgentId);
     return await this.getTodoRecord(input.todoId);
-  }
-  private completeTodo(input: { todoId: string; note?: string; idempotencyKey?: string }) {
-    return this.todoTransition(input, 'todo.completed');
-  }
-  private acceptTodo(input: { todoId: string; idempotencyKey?: string }) {
-    return this.todoTransition(input, 'todo.accepted');
-  }
-  private rejectTodo(input: { todoId: string; reason?: string; idempotencyKey?: string }) {
-    return this.todoTransition(input, 'todo.rejected');
-  }
-  private reopenTodo(input: { todoId: string; idempotencyKey?: string }) {
-    return this.todoTransition(input, 'todo.reopened');
-  }
-  private cancelTodo(input: { todoId: string; reason?: string; idempotencyKey?: string }) {
-    return this.todoTransition(input, 'todo.canceled');
   }
 
   private async listItems(input: ItemListInput): Promise<Page<ItemSummary>> {
@@ -976,7 +1162,7 @@ export class SynomemCore implements SynomemDomainService {
     if (summary.kind === 'kudos') return this.getKudos(id);
     if (summary.kind === 'memo') return this.getMemo(id);
     if (summary.kind === 'note') return this.getNote(id);
-    return this.getTodo(id);
+    return this.getTask(id);
   }
 
   async stats(input: KudosListInput = {}): Promise<KudosStats> {
@@ -1201,7 +1387,7 @@ export class SynomemClient extends SynomemCore implements SynomemService {
     const records = recordsFromEvents(events);
     const memos = memoRecordsFromEvents(events);
     const notes = noteRecordsFromEvents(events);
-    const todos = todoRecordsFromEvents(events);
+    const tasks = taskRecordsFromEvents(events);
     const warning = scan.invalid.length
       ? `> Warning: ${scan.invalid.length} unsupported or malformed event(s) omitted from this Markdown view: ${scan.invalid.map((item) => item.id).join(', ')}\n\n`
       : '';
@@ -1218,9 +1404,9 @@ export class SynomemClient extends SynomemCore implements SynomemService {
         (record) =>
           `## Note: ${escapeMarkdown(record.current.title)}\n\n${escapeMarkdown(record.current.body)}\n\nStatus: ${record.status}; version ${record.current.version}\n\nID: \`${record.event.id}\``,
       ),
-      ...todos.map(
+      ...tasks.map(
         (record) =>
-          `## Todo: ${escapeMarkdown(record.current.title)}\n\n${record.current.description ? `${escapeMarkdown(record.current.description)}\n\n` : ''}Status: ${record.status}; priority ${record.current.priority}\n\nID: \`${record.event.id}\``,
+          `## Task: ${escapeMarkdown(record.current.title)}\n\n${record.current.description ? `${escapeMarkdown(record.current.description)}\n\n` : ''}Status: ${record.status}; priority ${record.current.priority}\n\nID: \`${record.event.id}\``,
       ),
     ];
     return `${warning}${sections.join('\n\n')}\n`;

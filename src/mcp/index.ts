@@ -9,13 +9,13 @@ import {
   agentIdSchema,
   changesInputSchema,
   createNoteSchema,
-  createTodoSchema,
+  createTaskSchema,
   giveKudosMcpSchema,
   itemListInputSchema,
   listInputSchema,
   reviseNoteSchema,
   sendMemoSchema,
-  updateTodoSchema,
+  updateTaskSchema,
 } from '../schemas.js';
 import { packageVersion } from '../version.js';
 import type { SynomemService, SynomemServiceFactory } from '../service.js';
@@ -93,7 +93,7 @@ export async function createSynomemMcpServer(
     { name: 'synomem', version: packageVersion() },
     {
       instructions:
-        'Use Synomem for durable kudos, memos, notes, and todos. Store only necessary, factual content; never secrets or raw sensitive tool output. The server binds every write to its configured actor.',
+        'Use Synomem for durable kudos, memos, notes, and tasks. Store only necessary, factual content; never secrets or raw sensitive tool output. The server binds every write to its configured actor.',
     },
   );
 
@@ -377,7 +377,7 @@ export async function createSynomemMcpServer(
     {
       title: 'List Synomem items',
       description:
-        'Discover a bounded page of compact kudos, memo, note, and todo summaries. Full bodies, reasons, evidence, descriptions, source, and metadata are omitted; use synomem_get for one selected item.',
+        'Discover a bounded page of compact kudos, memo, note, and task summaries. Full bodies, reasons, evidence, descriptions, source, and metadata are omitted; use synomem_get for one selected item.',
       inputSchema: itemListInputSchema,
       outputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
@@ -401,7 +401,7 @@ export async function createSynomemMcpServer(
     {
       title: 'Get one Synomem item',
       description:
-        'Read the full authorized record for one explicitly selected kudos, memo, note, or todo ID.',
+        'Read the full authorized record for one explicitly selected kudos, memo, note, or task ID.',
       inputSchema: z.object({ itemId: z.string().length(26) }),
       outputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
@@ -445,7 +445,7 @@ export async function createSynomemMcpServer(
     {
       title: 'Review an agent inbox',
       description:
-        'Return compact pending kudos, unread memos, and open todos for the configured agent. An agent may inspect only its own private items.',
+        'Return compact pending kudos, unread memos, and open tasks for the configured agent. An agent may inspect only its own private items.',
       inputSchema: z.object({
         limit: z.number().int().min(1).max(50).default(10),
         cursor: z.string().max(500).optional(),
@@ -586,21 +586,21 @@ export async function createSynomemMcpServer(
   );
 
   server.registerTool(
-    'synomem_todo_create',
+    'synomem_task_create',
     {
-      title: 'Create a todo',
+      title: 'Create a task',
       description:
-        'Create a concrete actionable todo assigned to an agent, optionally with a date-only or timezone-aware deadline. Do not use as a substitute for a memo when no action is required.',
-      inputSchema: createTodoSchema,
+        'Create a concrete actionable task assigned to an agent, optionally with a date-only or timezone-aware deadline. Do not use as a substitute for a memo when no action is required.',
+      inputSchema: createTaskSchema,
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
     async (input) => {
       try {
-        const result = await client.todos.create(input);
+        const result = await client.tasks.create(input);
         return success(
           actor,
-          `${result.deduplicated ? 'Returned existing' : 'Created'} todo “${result.record.current.title}” for ${result.record.event.assigneeDisplayName} (ID ${result.record.event.id}).`,
+          `${result.deduplicated ? 'Returned existing' : 'Created'} task “${result.record.current.title}” for ${result.record.event.assigneeDisplayName} (ID ${result.record.event.id}).`,
           result,
         );
       } catch (error) {
@@ -609,21 +609,21 @@ export async function createSynomemMcpServer(
     },
   );
   server.registerTool(
-    'synomem_todo_update',
+    'synomem_task_update',
     {
-      title: 'Update a todo',
+      title: 'Update a task',
       description:
-        'Append an update to an open todo using the version last read. Stale versions fail rather than overwriting concurrent work.',
-      inputSchema: updateTodoSchema,
+        'Append an update to an open task using the version last read. Stale versions fail rather than overwriting concurrent work.',
+      inputSchema: updateTaskSchema,
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
     async (input) => {
       try {
-        const record = await client.todos.update(input);
+        const record = await client.tasks.update(input);
         return success(
           actor,
-          `Updated todo ${record.event.id} to version ${record.current.version}.`,
+          `Updated task ${record.event.id} to version ${record.current.version}.`,
           { record },
         );
       } catch (error) {
@@ -633,16 +633,16 @@ export async function createSynomemMcpServer(
   );
   for (const operation of ['accept', 'reject', 'complete', 'reopen', 'cancel'] as const) {
     const inputSchema = z.object({
-      todoId: z.string().length(26),
+      taskId: z.string().length(26),
       note: z.string().trim().min(1).max(2000).optional(),
       reason: z.string().trim().min(1).max(2000).optional(),
       idempotencyKey: z.string().max(200).optional(),
     });
     server.registerTool(
-      `synomem_todo_${operation}`,
+      `synomem_task_${operation}`,
       {
-        title: `${operation[0]!.toUpperCase()}${operation.slice(1)} a todo`,
-        description: `${operation[0]!.toUpperCase()}${operation.slice(1)} an authorized todo by appending a lifecycle event; history is never deleted.`,
+        title: `${operation[0]!.toUpperCase()}${operation.slice(1)} a task`,
+        description: `${operation[0]!.toUpperCase()}${operation.slice(1)} an authorized task by appending a lifecycle event; history is never deleted.`,
         inputSchema,
         outputSchema,
         annotations: {
@@ -655,33 +655,33 @@ export async function createSynomemMcpServer(
         try {
           const record =
             operation === 'accept'
-              ? await client.todos.accept({
-                  todoId: input.todoId,
+              ? await client.tasks.accept({
+                  taskId: input.taskId,
                   ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
                 })
               : operation === 'reject'
-                ? await client.todos.reject({
-                    todoId: input.todoId,
+                ? await client.tasks.reject({
+                    taskId: input.taskId,
                     ...(input.reason ? { reason: input.reason } : {}),
                     ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
                   })
                 : operation === 'complete'
-                  ? await client.todos.complete({
-                      todoId: input.todoId,
+                  ? await client.tasks.complete({
+                      taskId: input.taskId,
                       ...(input.note ? { note: input.note } : {}),
                       ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
                     })
                   : operation === 'cancel'
-                    ? await client.todos.cancel({
-                        todoId: input.todoId,
+                    ? await client.tasks.cancel({
+                        taskId: input.taskId,
                         ...(input.reason ? { reason: input.reason } : {}),
                         ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
                       })
-                    : await client.todos.reopen({
-                        todoId: input.todoId,
+                    : await client.tasks.reopen({
+                        taskId: input.taskId,
                         ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
                       });
-          return success(actor, `Todo ${record.event.id} is ${record.status}.`, { record });
+          return success(actor, `Task ${record.event.id} is ${record.status}.`, { record });
         } catch (error) {
           return failure(actor, error);
         }
@@ -758,7 +758,7 @@ export async function createSynomemMcpServer(
     new ResourceTemplate('synomem://agents/{agentId}/inbox', { list: undefined }),
     {
       title: 'Agent inbox',
-      description: 'Ten recent visible pending kudos, memos, and todos for one agent',
+      description: 'Ten recent visible pending kudos, memos, and tasks for one agent',
       mimeType: 'application/json',
     },
     async (uri, { agentId }) => {
@@ -932,9 +932,9 @@ export async function createSynomemMcpServer(
   );
 
   server.registerPrompt(
-    'synomem_create_actionable_todo',
+    'synomem_create_actionable_task',
     {
-      title: 'Create an actionable todo',
+      title: 'Create an actionable task',
       description:
         'Turn requested work into a concrete assigned action without inventing deadlines.',
       argsSchema: { assignee: agentIdSchema, action: z.string() },
@@ -945,7 +945,7 @@ export async function createSynomemMcpServer(
           role: 'user',
           content: {
             type: 'text',
-            text: `Prepare a concrete todo assigned to ${assignee}: ${action}. Preserve a date-only deadline as a date, require timezone data for a timed deadline, and do not invent missing timing.`,
+            text: `Prepare a concrete task assigned to ${assignee}: ${action}. Preserve a date-only deadline as a date, require timezone data for a timed deadline, and do not invent missing timing.`,
           },
         },
       ],

@@ -218,7 +218,7 @@ const noteArchivedSchema = baseEventSchema.extend({
   noteId: z.string().length(26),
 });
 
-const todoDueSchema = z.discriminatedUnion('kind', [
+const taskDueSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('date'),
     date: z
@@ -247,7 +247,7 @@ const todoDueSchema = z.discriminatedUnion('kind', [
       }, 'Use a valid IANA time-zone identifier'),
   }),
 ]);
-const todoFields = {
+const taskFields = {
   title: z
     .string()
     .trim()
@@ -256,15 +256,64 @@ const todoFields = {
     .regex(/^[^\r\n]+$/),
   description: z.string().trim().max(16_000).optional(),
   priority: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
-  due: todoDueSchema.optional(),
+  due: taskDueSchema.optional(),
   tags: z.array(kudosTagSchema).max(20).optional(),
   visibility: z.enum(['private', 'workspace', 'public']),
 };
-const todoCreatedSchema = baseEventSchema.extend({
-  type: z.literal('todo.created'),
+const taskCreatedSchema = baseEventSchema.extend({
+  type: z.literal('task.created'),
   assigneeAgentId: agentIdSchema,
   assigneeDisplayName: z.string().trim().min(1).max(200),
   requiresAcceptance: z.boolean(),
+  ...taskFields,
+});
+const taskUpdatedSchema = baseEventSchema.extend({
+  type: z.literal('task.updated'),
+  taskId: z.string().length(26),
+  ...taskFields,
+});
+const taskCompletedSchema = baseEventSchema.extend({
+  type: z.literal('task.completed'),
+  taskId: z.string().length(26),
+  note: z.string().trim().min(1).max(2000).optional(),
+});
+const taskReopenedSchema = baseEventSchema.extend({
+  type: z.literal('task.reopened'),
+  taskId: z.string().length(26),
+});
+const taskAcceptedSchema = baseEventSchema.extend({
+  type: z.literal('task.accepted'),
+  taskId: z.string().length(26),
+  // Optional: accepting without comment is a complete answer on its own.
+  response: z.string().trim().min(1).max(2000).optional(),
+});
+const taskRejectedSchema = baseEventSchema.extend({
+  type: z.literal('task.rejected'),
+  taskId: z.string().length(26),
+  // Required. A refusal with no reason tells the assigner only that the work
+  // will not happen, not whether to reassign it, wait, or change the request.
+  response: z.string().trim().min(1).max(2000),
+});
+const taskCanceledSchema = baseEventSchema.extend({
+  type: z.literal('task.canceled'),
+  taskId: z.string().length(26),
+  reason: z.string().trim().min(1).max(2000).optional(),
+});
+
+/**
+ * A Todo is owner-only, so it carries no assignee and no acceptance lifecycle.
+ * `details` rather than `description` keeps it lexically distinct from a Task in
+ * every payload, which makes a mix-up visible in a log rather than silent.
+ */
+const todoFields = {
+  title: z.string().trim().min(1).max(200),
+  details: z.string().trim().min(1).max(4000).optional(),
+  priority: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
+  due: taskDueSchema.optional(),
+  tags: z.array(kudosTagSchema).max(20).optional(),
+};
+const todoCreatedSchema = baseEventSchema.extend({
+  type: z.literal('todo.created'),
   ...todoFields,
 });
 const todoUpdatedSchema = baseEventSchema.extend({
@@ -281,19 +330,14 @@ const todoReopenedSchema = baseEventSchema.extend({
   type: z.literal('todo.reopened'),
   todoId: z.string().length(26),
 });
-const todoAcceptedSchema = baseEventSchema.extend({
-  type: z.literal('todo.accepted'),
-  todoId: z.string().length(26),
-});
-const todoRejectedSchema = baseEventSchema.extend({
-  type: z.literal('todo.rejected'),
-  todoId: z.string().length(26),
-  reason: z.string().trim().min(1).max(2000).optional(),
-});
 const todoCanceledSchema = baseEventSchema.extend({
   type: z.literal('todo.canceled'),
   todoId: z.string().length(26),
   reason: z.string().trim().min(1).max(2000).optional(),
+});
+const todoArchivedSchema = baseEventSchema.extend({
+  type: z.literal('todo.archived'),
+  todoId: z.string().length(26),
 });
 
 export const eventSchema = z.discriminatedUnion('type', [
@@ -308,13 +352,19 @@ export const eventSchema = z.discriminatedUnion('type', [
   noteCreatedSchema,
   noteRevisedSchema,
   noteArchivedSchema,
+  taskCreatedSchema,
+  taskUpdatedSchema,
+  taskCompletedSchema,
+  taskReopenedSchema,
+  taskAcceptedSchema,
+  taskRejectedSchema,
+  taskCanceledSchema,
   todoCreatedSchema,
   todoUpdatedSchema,
   todoCompletedSchema,
   todoReopenedSchema,
-  todoAcceptedSchema,
-  todoRejectedSchema,
   todoCanceledSchema,
+  todoArchivedSchema,
 ]);
 
 const giveKudosInputSchema = kudosGivenSchema
@@ -407,15 +457,44 @@ export const reviseNoteSchema = z
     ...mutationMetadata,
   })
   .strict();
-export const createTodoSchema = z
+export const createTaskSchema = z
   .object({
     assigneeAgentId: agentIdSchema.optional(),
-    title: todoCreatedSchema.shape.title,
-    description: todoCreatedSchema.shape.description,
-    priority: todoCreatedSchema.shape.priority.optional(),
-    due: todoDueSchema.optional(),
+    title: taskCreatedSchema.shape.title,
+    description: taskCreatedSchema.shape.description,
+    priority: taskCreatedSchema.shape.priority.optional(),
+    due: taskDueSchema.optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
     visibility: z.enum(['private', 'workspace', 'public']).optional(),
+    ...mutationMetadata,
+  })
+  .strict();
+export const updateTaskSchema = z
+  .object({
+    taskId: z.string().length(26),
+    expectedVersion: z.number().int().min(1),
+    title: taskCreatedSchema.shape.title.optional(),
+    description: taskCreatedSchema.shape.description,
+    priority: taskCreatedSchema.shape.priority.optional(),
+    due: taskDueSchema.nullable().optional(),
+    tags: z.array(kudosTagSchema).max(20).optional(),
+    visibility: z.enum(['private', 'workspace', 'public']).optional(),
+    ...mutationMetadata,
+  })
+  .strict();
+/**
+ * A Todo takes no assignee and no visibility: it belongs to its author and is
+ * always private. Omitting those fields from the input — rather than accepting
+ * and ignoring them — means an attempt to assign a Todo fails loudly instead of
+ * silently producing a private reminder nobody else can see.
+ */
+export const createTodoSchema = z
+  .object({
+    title: todoCreatedSchema.shape.title,
+    details: todoCreatedSchema.shape.details,
+    priority: todoCreatedSchema.shape.priority.optional(),
+    due: taskDueSchema.optional(),
+    tags: z.array(kudosTagSchema).max(20).optional(),
     ...mutationMetadata,
   })
   .strict();
@@ -424,19 +503,19 @@ export const updateTodoSchema = z
     todoId: z.string().length(26),
     expectedVersion: z.number().int().min(1),
     title: todoCreatedSchema.shape.title.optional(),
-    description: todoCreatedSchema.shape.description,
+    details: todoCreatedSchema.shape.details,
     priority: todoCreatedSchema.shape.priority.optional(),
-    due: todoDueSchema.nullable().optional(),
+    due: taskDueSchema.nullable().optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
-    visibility: z.enum(['private', 'workspace', 'public']).optional(),
     ...mutationMetadata,
   })
   .strict();
+
 export const itemListInputSchema = z
   .object({
     kinds: z
-      .array(z.enum(['kudos', 'memo', 'note', 'todo']))
-      .max(4)
+      .array(z.enum(['kudos', 'memo', 'note', 'task', 'todo']))
+      .max(5)
       .optional(),
     participantAgentId: agentIdSchema.optional(),
     actorId: agentIdSchema.optional(),

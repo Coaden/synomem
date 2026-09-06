@@ -3,7 +3,7 @@ export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue
 
 export type ActorKind = 'human' | 'agent' | 'system';
 export type Visibility = 'private' | 'workspace' | 'public';
-export type RecordKind = 'kudos' | 'memo' | 'note' | 'todo';
+export type RecordKind = 'kudos' | 'memo' | 'note' | 'task' | 'todo';
 
 export interface ActorIdentity {
   kind: ActorKind;
@@ -115,30 +115,95 @@ export interface NoteArchivedEvent extends BaseEvent {
   noteId: string;
 }
 
-export type TodoPriority = 1 | 2 | 3 | 4;
-export type TodoDue =
+export type TaskPriority = 1 | 2 | 3 | 4;
+export type TaskDue =
   { kind: 'date'; date: string } | { kind: 'datetime'; datetime: string; timeZone: string };
-export interface TodoCreatedEvent extends BaseEvent {
-  type: 'todo.created';
+export interface TaskCreatedEvent extends BaseEvent {
+  type: 'task.created';
   assigneeAgentId: string;
   assigneeDisplayName: string;
   title: string;
   description?: string;
-  priority: TodoPriority;
-  due?: TodoDue;
+  priority: TaskPriority;
+  due?: TaskDue;
   tags?: string[];
   visibility: Visibility;
   requiresAcceptance: boolean;
+}
+export interface TaskUpdatedEvent extends BaseEvent {
+  type: 'task.updated';
+  taskId: string;
+  title: string;
+  description?: string;
+  priority: TaskPriority;
+  due?: TaskDue;
+  tags?: string[];
+  visibility: Visibility;
+}
+export interface TaskCompletedEvent extends BaseEvent {
+  type: 'task.completed';
+  taskId: string;
+  note?: string;
+}
+export interface TaskReopenedEvent extends BaseEvent {
+  type: 'task.reopened';
+  taskId: string;
+}
+export interface TaskAcceptedEvent extends BaseEvent {
+  type: 'task.accepted';
+  taskId: string;
+  /**
+   * An optional note explaining conditions, timing, or partial capability.
+   * "Accepted; I can send email but do not have iMessage access."
+   */
+  response?: string;
+}
+export interface TaskRejectedEvent extends BaseEvent {
+  type: 'task.rejected';
+  taskId: string;
+  /**
+   * Required. A refusal without a reason is the least useful event the system
+   * can record: the assigner learns only that the work will not happen, not
+   * whether to reassign it, wait, or change the request.
+   * "Rejected; this Hermes profile has no outbound messaging connection."
+   */
+  response: string;
+}
+export interface TaskCanceledEvent extends BaseEvent {
+  type: 'task.canceled';
+  taskId: string;
+  reason?: string;
+}
+
+/**
+ * A Todo is a private reminder an agent creates for itself.
+ *
+ * The distinction from a Task is the whole point of having both:
+ *
+ *   Task — something another actor asks an agent to do
+ *   Todo — something an agent privately reminds itself to do
+ *
+ * So a Todo has no assignee separate from its owner, and no accept/reject
+ * lifecycle: there is nobody to negotiate with. It is visible only to its
+ * owner, and no ordinary role reads another actor's Todos.
+ */
+export interface TodoCreatedEvent extends BaseEvent {
+  type: 'todo.created';
+  title: string;
+  /** Private working detail. Never surfaced to another actor. */
+  details?: string;
+  priority: TaskPriority;
+  due?: TaskDue;
+  tags?: string[];
 }
 export interface TodoUpdatedEvent extends BaseEvent {
   type: 'todo.updated';
   todoId: string;
   title: string;
-  description?: string;
-  priority: TodoPriority;
-  due?: TodoDue;
+  details?: string;
+  priority: TaskPriority;
+  due?: TaskDue;
   tags?: string[];
-  visibility: Visibility;
 }
 export interface TodoCompletedEvent extends BaseEvent {
   type: 'todo.completed';
@@ -149,20 +214,49 @@ export interface TodoReopenedEvent extends BaseEvent {
   type: 'todo.reopened';
   todoId: string;
 }
-export interface TodoAcceptedEvent extends BaseEvent {
-  type: 'todo.accepted';
-  todoId: string;
-}
-export interface TodoRejectedEvent extends BaseEvent {
-  type: 'todo.rejected';
-  todoId: string;
-  reason?: string;
-}
 export interface TodoCanceledEvent extends BaseEvent {
   type: 'todo.canceled';
   todoId: string;
   reason?: string;
 }
+export interface TodoArchivedEvent extends BaseEvent {
+  type: 'todo.archived';
+  todoId: string;
+}
+
+export interface TodoRecord {
+  event: TodoCreatedEvent;
+  update?: TodoUpdatedEvent;
+  terminal?: TodoCompletedEvent | TodoCanceledEvent | TodoArchivedEvent;
+  reopened?: TodoReopenedEvent;
+  current: {
+    title: string;
+    details?: string;
+    priority: TaskPriority;
+    due?: TaskDue;
+    tags: string[];
+    version: number;
+  };
+  status: 'open' | 'completed' | 'canceled' | 'archived';
+}
+
+export interface CreateTodoInput extends MutationInput {
+  title: string;
+  details?: string;
+  priority?: TaskPriority;
+  due?: TaskDue;
+  tags?: string[];
+}
+export interface UpdateTodoInput extends MutationInput {
+  todoId: string;
+  expectedVersion: number;
+  title?: string;
+  details?: string;
+  priority?: TaskPriority;
+  due?: TaskDue | null;
+  tags?: string[];
+}
+export type CreateTodoResult = MutationResult<TodoRecord>;
 
 export interface AgentCreatedEvent extends BaseEvent {
   type: 'agent.created';
@@ -184,13 +278,19 @@ export type SynomemEvent =
   | NoteCreatedEvent
   | NoteRevisedEvent
   | NoteArchivedEvent
+  | TaskCreatedEvent
+  | TaskUpdatedEvent
+  | TaskCompletedEvent
+  | TaskReopenedEvent
+  | TaskAcceptedEvent
+  | TaskRejectedEvent
+  | TaskCanceledEvent
   | TodoCreatedEvent
   | TodoUpdatedEvent
   | TodoCompletedEvent
   | TodoReopenedEvent
-  | TodoAcceptedEvent
-  | TodoRejectedEvent
   | TodoCanceledEvent
+  | TodoArchivedEvent
   | AgentCreatedEvent
   | AgentUpdatedEvent;
 
@@ -216,23 +316,41 @@ export interface NoteRecord {
   current: { title: string; body: string; tags: string[]; visibility: Visibility; version: number };
   status: 'active' | 'archived';
 }
-export interface TodoRecord {
-  event: TodoCreatedEvent;
-  update?: TodoUpdatedEvent;
-  terminal?: TodoCompletedEvent | TodoRejectedEvent | TodoCanceledEvent;
-  reopened?: TodoReopenedEvent;
+/**
+ * One entry in a task's response history.
+ *
+ * The plan calls for response notes to be part of the task's durable event
+ * history rather than private Notes, and for reads to expose that history. It
+ * is a list rather than a single field because a task can be rejected, reopened
+ * and answered again — and because a later general `task.respond` event for
+ * progress updates should extend this without changing its shape.
+ */
+export interface TaskResponse {
+  kind: 'accepted' | 'rejected';
+  response?: string;
+  actor: ActorIdentity;
+  at: string;
+}
+
+export interface TaskRecord {
+  event: TaskCreatedEvent;
+  update?: TaskUpdatedEvent;
+  terminal?: TaskCompletedEvent | TaskRejectedEvent | TaskCanceledEvent;
+  reopened?: TaskReopenedEvent;
+  /** Every accept/reject answer, oldest first. */
+  responses: TaskResponse[];
   current: {
     title: string;
     description?: string;
-    priority: TodoPriority;
-    due?: TodoDue;
+    priority: TaskPriority;
+    due?: TaskDue;
     tags: string[];
     visibility: Visibility;
     version: number;
   };
   status: 'assigned' | 'open' | 'completed' | 'rejected' | 'canceled';
 }
-export type ItemRecord = KudosRecord | MemoRecord | NoteRecord | TodoRecord;
+export type ItemRecord = KudosRecord | MemoRecord | NoteRecord | TaskRecord | TodoRecord;
 
 export interface ItemSummary {
   id: string;
@@ -361,22 +479,22 @@ export interface ReviseNoteInput extends MutationInput {
   body?: string;
   tags?: string[];
 }
-export interface CreateTodoInput extends MutationInput {
+export interface CreateTaskInput extends MutationInput {
   assigneeAgentId?: string;
   title: string;
   description?: string;
-  priority?: TodoPriority;
-  due?: TodoDue;
+  priority?: TaskPriority;
+  due?: TaskDue;
   tags?: string[];
   visibility?: Visibility;
 }
-export interface UpdateTodoInput extends MutationInput {
-  todoId: string;
+export interface UpdateTaskInput extends MutationInput {
+  taskId: string;
   expectedVersion: number;
   title?: string;
   description?: string;
-  priority?: TodoPriority;
-  due?: TodoDue | null;
+  priority?: TaskPriority;
+  due?: TaskDue | null;
   tags?: string[];
   visibility?: Visibility;
 }
@@ -388,7 +506,7 @@ export interface MutationResult<T> {
 export type GiveKudosResult = MutationResult<KudosRecord>;
 export type SendMemoResult = MutationResult<MemoRecord>;
 export type CreateNoteResult = MutationResult<NoteRecord>;
-export type CreateTodoResult = MutationResult<TodoRecord>;
+export type CreateTaskResult = MutationResult<TaskRecord>;
 
 export interface CreateAgentInput {
   id: string;
@@ -432,14 +550,14 @@ export interface SynomemConfig {
   workspaceId: string;
   defaultVisibility: Visibility;
   allowSelfAwards: boolean;
-  allowCrossAgentTodos: boolean;
+  allowCrossAgentTasks: boolean;
   allowAgentCreationViaMcp: boolean;
   allowRebuildViaMcp: boolean;
   includePrivateInStats: boolean;
   projection: {
     writeWinsMarkdown: boolean;
     writeMemoryMarkdown: boolean;
-    writeTodosMarkdown: boolean;
+    writeTasksMarkdown: boolean;
     writeInboxEntries: boolean;
   };
 }

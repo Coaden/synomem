@@ -51,9 +51,9 @@ Purpose-specific writes:
 synomem_kudos_give       synomem_kudos_acknowledge   synomem_kudos_revoke
 synomem_memo_send        synomem_memo_read            synomem_memo_archive
 synomem_note_create      synomem_note_revise          synomem_note_archive
-synomem_todo_create      synomem_todo_update          synomem_todo_complete
-synomem_todo_accept      synomem_todo_reject          synomem_todo_reopen
-synomem_todo_cancel
+synomem_task_create      synomem_task_update          synomem_task_complete
+synomem_task_accept      synomem_task_reject          synomem_task_reopen
+synomem_task_cancel
 ```
 
 Focused kudos reads and administration remain available:
@@ -88,9 +88,9 @@ inbox resource. Canonical event resources authorize against their aggregate befo
 ## Policy
 
 Edit `<home>/synomem/config.json` while writers are stopped. Safe defaults deny self-kudos, MCP
-identity creation, and MCP rebuild. Notes are unconditionally owner-private in V1. Cross-agent todo assignment is enabled; ownership and
+identity creation, and MCP rebuild. Notes are unconditionally owner-private in V1. Cross-agent task assignment is enabled; ownership and
 participant rules still apply.
 
 Human actors have local administrative authority. Agent actors manage only their own note, recipient
-memo state, and todos they created or received. System actors have no implicit authority. The
+memo state, and tasks they created or received. System actors have no implicit authority. The
 filesystem owner remains the ultimate local authority.

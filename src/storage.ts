@@ -307,6 +307,7 @@ function eventKind(event: SynomemEvent): RecordKind | undefined {
   if (event.type.startsWith('kudos.')) return 'kudos';
   if (event.type.startsWith('memo.')) return 'memo';
   if (event.type.startsWith('note.')) return 'note';
+  if (event.type.startsWith('task.')) return 'task';
   if (event.type.startsWith('todo.')) return 'todo';
   return undefined;
 }
@@ -762,9 +763,9 @@ export class SynomemStorage implements SynomemRepository {
           event.aggregateId,
         );
     } else if (event.type === 'note.archived') updateStatus('archived');
-    else if (event.type === 'todo.created') {
+    else if (event.type === 'task.created') {
       insert({
-        kind: 'todo',
+        kind: 'task',
         title: event.title,
         tags: event.tags,
         visibility: event.visibility,
@@ -772,7 +773,7 @@ export class SynomemStorage implements SynomemRepository {
         assigneeAgentId: event.assigneeAgentId,
         assigneeDisplayName: event.assigneeDisplayName,
       });
-    } else if (event.type === 'todo.updated') {
+    } else if (event.type === 'task.updated') {
       this.db()
         .prepare(
           `UPDATE items_current SET title = ?, tags_json = ?, visibility = ?,
@@ -786,11 +787,41 @@ export class SynomemStorage implements SynomemRepository {
           event.createdAt,
           event.aggregateId,
         );
-    } else if (event.type === 'todo.accepted') updateStatus('open');
-    else if (event.type === 'todo.rejected') updateStatus('rejected');
-    else if (event.type === 'todo.completed') updateStatus('completed');
+    } else if (event.type === 'task.accepted') updateStatus('open');
+    else if (event.type === 'task.rejected') updateStatus('rejected');
+    else if (event.type === 'task.completed') updateStatus('completed');
+    else if (event.type === 'task.reopened') updateStatus('open');
+    else if (event.type === 'task.canceled') updateStatus('canceled');
+    else if (event.type === 'todo.created') {
+      // A Todo's owner IS its author, and it is always private. Recording the
+      // owner explicitly rather than inferring it from the actor keeps the
+      // owner-scoped read filters uniform across notes and todos.
+      insert({
+        kind: 'todo',
+        title: event.title,
+        tags: event.tags,
+        visibility: 'private',
+        status: 'open',
+        ownerAgentId: event.actor.id,
+        ...(event.actor.displayName ? { ownerDisplayName: event.actor.displayName } : {}),
+      });
+    } else if (event.type === 'todo.updated') {
+      this.db()
+        .prepare(
+          `UPDATE items_current SET title = ?, tags_json = ?,
+         updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
+        )
+        .run(
+          event.title,
+          JSON.stringify(event.tags ?? []),
+          sequence,
+          event.createdAt,
+          event.aggregateId,
+        );
+    } else if (event.type === 'todo.completed') updateStatus('completed');
     else if (event.type === 'todo.reopened') updateStatus('open');
     else if (event.type === 'todo.canceled') updateStatus('canceled');
+    else if (event.type === 'todo.archived') updateStatus('archived');
   }
 
   rebuildItemsCurrentIndex(): void {
@@ -1037,7 +1068,7 @@ export class SynomemStorage implements SynomemRepository {
     if (input.pending) {
       add(`((kind = 'kudos' AND status = 'unacknowledged') OR
         (kind = 'memo' AND status = 'unread') OR
-        (kind = 'todo' AND status IN ('assigned', 'open')))`);
+        (kind = 'task' AND status IN ('assigned', 'open')))`);
     }
     if (input.visibility) add('visibility = ?', input.visibility);
     if (input.from) add('created_at >= ?', input.from);
@@ -1259,7 +1290,7 @@ export class SynomemStorage implements SynomemRepository {
         this.db()
           .prepare(
             `SELECT COUNT(*) AS count FROM events WHERE type IN
-       ('kudos.given', 'memo.sent', 'note.created', 'todo.created')`,
+       ('kudos.given', 'memo.sent', 'note.created', 'task.created')`,
           )
           .get() as { count: number }
       ).count,
@@ -1412,13 +1443,19 @@ export class SynomemStorage implements SynomemRepository {
           'note.created',
           'note.revised',
           'note.archived',
+          'task.created',
+          'task.updated',
+          'task.completed',
+          'task.reopened',
+          'task.accepted',
+          'task.rejected',
+          'task.canceled',
           'todo.created',
           'todo.updated',
           'todo.completed',
           'todo.reopened',
-          'todo.accepted',
-          'todo.rejected',
           'todo.canceled',
+          'todo.archived',
         ]);
         if (
           (typeof candidate.schemaVersion === 'number' && candidate.schemaVersion > 1) ||
@@ -1436,7 +1473,7 @@ export class SynomemStorage implements SynomemRepository {
             legacy.kudosId ??
             legacy.memoId ??
             legacy.noteId ??
-            legacy.todoId ??
+            legacy.taskId ??
             (typeof legacy.agentId === 'string' ? legacy.agentId : undefined) ??
             (typeof legacy.agent === 'object' && legacy.agent !== null
               ? (legacy.agent as { id?: unknown }).id

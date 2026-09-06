@@ -34,7 +34,7 @@ import type {
   KudosSummary,
   ItemListInput,
   ItemSummary,
-  TodoDue,
+  TaskDue,
 } from './types.js';
 import { packageVersion } from './version.js';
 import type { SynomemService, SynomemServiceFactory } from './service.js';
@@ -125,11 +125,11 @@ function defaultActor(
   return actor(env.SYNOMEM_ACTOR_KIND?.trim() || fallbackKind, id, env.SYNOMEM_ACTOR_NAME?.trim());
 }
 
-function todoDue(options: {
+function taskDue(options: {
   dueDate?: string;
   dueAt?: string;
   timeZone?: string;
-}): TodoDue | undefined {
+}): TaskDue | undefined {
   if (options.dueDate && options.dueAt)
     throw new SynomemError('INVALID_INPUT', 'Use due-date or due-at, not both.');
   if (options.dueDate) return { kind: 'date', date: options.dueDate };
@@ -819,7 +819,7 @@ export function createCli(
 
   program
     .command('inbox [agent]')
-    .description('Show pending kudos, memos, and todos for an agent')
+    .description('Show pending kudos, memos, and tasks for an agent')
     .option('--as <agent-id>', 'defaults to the positional agent')
     .option('--limit <number>', 'maximum results (default 10, maximum 50)', '10')
     .option('--cursor <cursor>', 'opaque cursor returned by the previous page')
@@ -876,7 +876,7 @@ export function createCli(
   program
     .command('list')
     .description('List compact summaries across all record types')
-    .option('--kind <kind>', 'kudos, memo, note, or todo (repeatable)', collect, [])
+    .option('--kind <kind>', 'kudos, memo, note, or task (repeatable)', collect, [])
     .option('--participant <agent>')
     .option('--actor <id>')
     .option('--tag <tag>')
@@ -1194,8 +1194,8 @@ export function createCli(
       },
     );
 
-  const todoCommand = program.command('todo').description('Create and manage agent todos');
-  todoCommand
+  const taskCommand = program.command('task').description('Create and manage agent tasks');
+  taskCommand
     .command('create <assignee>')
     .requiredOption('--from <actor-id>')
     .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
@@ -1231,12 +1231,12 @@ export function createCli(
           global.home,
           actor(options.actorKind, options.from),
           (client) =>
-            client.todos.create({
+            client.tasks.create({
               assigneeAgentId: assignee,
               title: options.title,
               ...(options.description ? { description: options.description } : {}),
               priority: Number(options.priority) as 1 | 2 | 3 | 4,
-              ...((due) => (due ? { due } : {}))(todoDue(options)),
+              ...((due) => (due ? { due } : {}))(taskDue(options)),
               ...(options.tag.length ? { tags: options.tag } : {}),
               visibility: options.visibility,
               ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
@@ -1246,11 +1246,11 @@ export function createCli(
           io,
           global.json,
           result,
-          `${result.deduplicated ? 'Found existing' : 'Created'} todo for ${result.record.event.assigneeDisplayName}\nTitle: ${result.record.current.title}\nID: ${result.record.event.id}`,
+          `${result.deduplicated ? 'Found existing' : 'Created'} task for ${result.record.event.assigneeDisplayName}\nTitle: ${result.record.current.title}\nID: ${result.record.event.id}`,
         );
       },
     );
-  todoCommand
+  taskCommand
     .command('list')
     .option('--assignee <agent>')
     .option('--status <status>')
@@ -1262,21 +1262,21 @@ export function createCli(
           global.home,
           defaultActor(env, 'human', 'local-cli'),
           (client) =>
-            client.todos.list({
+            client.tasks.list({
               ...(options.assignee ? { participantAgentId: options.assignee } : {}),
               ...(options.status ? { status: options.status } : {}),
               limit: Number(options.limit),
             }),
         );
-        output(io, global.json, page, page.items.map(lineForItem).join('\n') || 'No todos found.');
+        output(io, global.json, page, page.items.map(lineForItem).join('\n') || 'No tasks found.');
       },
     );
-  todoCommand.command('show <todo-id>').action(async (id: string, _options, command: Command) => {
+  taskCommand.command('show <task-id>').action(async (id: string, _options, command: Command) => {
     const global = globals(command);
     const record = await withClient(
       global.home,
       defaultActor(env, 'human', 'local-cli'),
-      (client) => client.todos.get(id),
+      (client) => client.tasks.get(id),
     );
     output(
       io,
@@ -1285,8 +1285,8 @@ export function createCli(
       `${record.current.title}\nID: ${record.event.id}\nStatus: ${record.status}\nVersion: ${record.current.version}`,
     );
   });
-  todoCommand
-    .command('update <todo-id>')
+  taskCommand
+    .command('update <task-id>')
     .requiredOption('--as <actor-id>')
     .option('--actor-kind <kind>', 'agent or human', 'agent')
     .requiredOption('--expected-version <number>')
@@ -1319,13 +1319,13 @@ export function createCli(
         command: Command,
       ) => {
         const global = globals(command);
-        const parsedDue = todoDue(options);
+        const parsedDue = taskDue(options);
         const record = await withClient(
           global.home,
           actor(options.actorKind, options.as),
           (client) =>
-            client.todos.update({
-              todoId: id,
+            client.tasks.update({
+              taskId: id,
               expectedVersion: Number(options.expectedVersion),
               ...(options.title ? { title: options.title } : {}),
               ...(options.description !== undefined ? { description: options.description } : {}),
@@ -1335,12 +1335,12 @@ export function createCli(
               ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
             }),
         );
-        output(io, global.json, record, `Updated todo ${id} to version ${record.current.version}.`);
+        output(io, global.json, record, `Updated task ${id} to version ${record.current.version}.`);
       },
     );
   for (const operation of ['accept', 'reject', 'complete', 'reopen', 'cancel'] as const) {
-    todoCommand
-      .command(`${operation} <todo-id>`)
+    taskCommand
+      .command(`${operation} <task-id>`)
       .requiredOption('--as <actor-id>')
       .option('--actor-kind <kind>', 'agent or human', 'agent')
       .option('--note <text>')
@@ -1364,40 +1364,40 @@ export function createCli(
             actor(options.actorKind, options.as),
             (client) =>
               operation === 'accept'
-                ? client.todos.accept({
-                    todoId: id,
+                ? client.tasks.accept({
+                    taskId: id,
                     ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
                   })
                 : operation === 'reject'
-                  ? client.todos.reject({
-                      todoId: id,
+                  ? client.tasks.reject({
+                      taskId: id,
                       ...(options.reason ? { reason: options.reason } : {}),
                       ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
                     })
                   : operation === 'complete'
-                    ? client.todos.complete({
-                        todoId: id,
+                    ? client.tasks.complete({
+                        taskId: id,
                         ...(options.note ? { note: options.note } : {}),
                         ...(options.idempotencyKey
                           ? { idempotencyKey: options.idempotencyKey }
                           : {}),
                       })
                     : operation === 'cancel'
-                      ? client.todos.cancel({
-                          todoId: id,
+                      ? client.tasks.cancel({
+                          taskId: id,
                           ...(options.reason ? { reason: options.reason } : {}),
                           ...(options.idempotencyKey
                             ? { idempotencyKey: options.idempotencyKey }
                             : {}),
                         })
-                      : client.todos.reopen({
-                          todoId: id,
+                      : client.tasks.reopen({
+                          taskId: id,
                           ...(options.idempotencyKey
                             ? { idempotencyKey: options.idempotencyKey }
                             : {}),
                         }),
           );
-          output(io, global.json, record, `Todo ${id} is ${record.status}.`);
+          output(io, global.json, record, `Task ${id} is ${record.status}.`);
         },
       );
   }

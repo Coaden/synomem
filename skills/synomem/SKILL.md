@@ -1,6 +1,6 @@
 ---
 name: synomem
-description: Use durable local-first kudos, memos, notes, and todos for stable AI-agent identities when users request recognition, inter-agent communication, memory capture, inbox review, or task tracking.
+description: Use durable local-first kudos, memos, notes, and tasks for stable AI-agent identities when users request recognition, inter-agent communication, memory capture, inbox review, or task tracking.
 ---
 
 # Synomem
@@ -14,10 +14,10 @@ edit the SQLite event store or generated Markdown directly.
 - **Kudos:** specific recognition for an observed contribution and its consequence.
 - **Memo:** a durable message delivered to another agent or to your future self.
 - **Note:** knowledge owned by this agent and deliberately retrieved later.
-- **Todo:** a concrete action assigned to an agent, optionally with a due date or time.
+- **Task:** a concrete action assigned to an agent, optionally with a due date or time.
 
 A self-memo belongs in the inbox and can be marked read. A note belongs in memory and is revised
-with version checks. Do not use todos for information with no requested action.
+with version checks. Do not use tasks for information with no requested action.
 
 ## Safety and quality
 
@@ -54,16 +54,16 @@ Use `synomem_note_create` for concise reusable knowledge owned by the configured
 current item before `synomem_note_revise` and pass its exact current version. On
 `REVISION_CONFLICT`, fetch the item and reconcile deliberately. Archive instead of deleting.
 
-## Todos
+## Tasks
 
-Use `synomem_todo_create` for a specific action with an assignee. Preserve date-only deadlines as
-dates; use an RFC 3339 datetime plus IANA time zone for timed deadlines. A todo assigned by another
+Use `synomem_task_create` for a specific action with an assignee. Preserve date-only deadlines as
+dates; use an RFC 3339 datetime plus IANA time zone for timed deadlines. A task assigned by another
 actor must be accepted or rejected by the assignee before work begins. Read before update and pass
 the current version. Complete, reopen, or cancel through the matching lifecycle tool.
 
 ## Discovery
 
-Use `synomem_inbox` for the configured agent's pending kudos, unread memos, and open todos. Use
+Use `synomem_inbox` for the configured agent's pending kudos, unread memos, and open tasks. Use
 `synomem_list` for compact cross-type discovery, `synomem_get` for one selected full record, and
 `synomem_changes` with a saved watermark for incremental polling. Do not drain history
 speculatively.

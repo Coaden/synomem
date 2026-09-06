@@ -15,7 +15,7 @@ tags:
   - name: kudos
   - name: memos
   - name: notes
-  - name: todos
+  - name: tasks
   - name: items
   - name: administration
 paths:
@@ -259,30 +259,30 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/Success' }
         default: { $ref: '#/components/responses/Error' }
-  /v1/workspaces/{workspaceId}/todos:
+  /v1/workspaces/{workspaceId}/tasks:
     parameters: [{ $ref: '#/components/parameters/WorkspaceId' }]
     get:
-      tags: [todos]
-      operationId: listTodos
+      tags: [tasks]
+      operationId: listTasks
       parameters:
         [{ $ref: '#/components/parameters/ListLimit' }, { $ref: '#/components/parameters/Cursor' }]
       responses:
         '200': { $ref: '#/components/responses/Success' }
         default: { $ref: '#/components/responses/Error' }
     post:
-      tags: [todos]
-      operationId: createTodo
+      tags: [tasks]
+      operationId: createTask
       parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
       requestBody:
         required: true
-        content: { application/json: { schema: { $ref: '#/components/schemas/CreateTodo' } } }
+        content: { application/json: { schema: { $ref: '#/components/schemas/CreateTask' } } }
       responses:
         '200': { $ref: '#/components/responses/Success' }
         default: { $ref: '#/components/responses/Error' }
-  /v1/workspaces/{workspaceId}/todos/{itemId}:
+  /v1/workspaces/{workspaceId}/tasks/{itemId}:
     get:
-      tags: [todos]
-      operationId: getTodo
+      tags: [tasks]
+      operationId: getTask
       parameters:
         [
           { $ref: '#/components/parameters/WorkspaceId' },
@@ -291,24 +291,24 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/Success' }
         default: { $ref: '#/components/responses/Error' }
-  /v1/workspaces/{workspaceId}/todos/{itemId}/revisions:
+  /v1/workspaces/{workspaceId}/tasks/{itemId}/revisions:
     post:
-      tags: [todos]
-      operationId: updateTodo
+      tags: [tasks]
+      operationId: updateTask
       parameters:
         - { $ref: '#/components/parameters/WorkspaceId' }
         - { $ref: '#/components/parameters/ItemId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }
       requestBody:
         required: true
-        content: { application/json: { schema: { $ref: '#/components/schemas/UpdateTodo' } } }
+        content: { application/json: { schema: { $ref: '#/components/schemas/UpdateTask' } } }
       responses:
         '200': { $ref: '#/components/responses/Success' }
         default: { $ref: '#/components/responses/Error' }
-  /v1/workspaces/{workspaceId}/todos/{itemId}/{transition}:
+  /v1/workspaces/{workspaceId}/tasks/{itemId}/{transition}:
     post:
-      tags: [todos]
-      operationId: transitionTodo
+      tags: [tasks]
+      operationId: transitionTask
       parameters:
         - { $ref: '#/components/parameters/WorkspaceId' }
         - { $ref: '#/components/parameters/ItemId' }
@@ -318,7 +318,7 @@ paths:
           schema: { type: string, enum: [accept, reject, complete, reopen, cancel] }
         - { $ref: '#/components/parameters/IdempotencyKey' }
       requestBody:
-        content: { application/json: { schema: { $ref: '#/components/schemas/TodoTransition' } } }
+        content: { application/json: { schema: { $ref: '#/components/schemas/TaskTransition' } } }
       responses:
         '200': { $ref: '#/components/responses/Success' }
         default: { $ref: '#/components/responses/Error' }
@@ -622,7 +622,7 @@ components:
         tags: { $ref: '#/components/schemas/Tags' }
         source: { type: object }
         metadata: { type: object }
-    TodoDue:
+    TaskDue:
       oneOf:
         - type: object
           additionalProperties: false
@@ -637,7 +637,7 @@ components:
             kind: { const: datetime }
             datetime: { type: string, format: date-time }
             timeZone: { type: string }
-    CreateTodo:
+    CreateTask:
       type: object
       additionalProperties: false
       required: [title]
@@ -646,12 +646,12 @@ components:
         title: { type: string }
         description: { type: string }
         priority: { type: integer, minimum: 1, maximum: 4 }
-        due: { $ref: '#/components/schemas/TodoDue' }
+        due: { $ref: '#/components/schemas/TaskDue' }
         tags: { $ref: '#/components/schemas/Tags' }
         visibility: { $ref: '#/components/schemas/Visibility' }
         source: { type: object }
         metadata: { type: object }
-    UpdateTodo:
+    UpdateTask:
       type: object
       additionalProperties: false
       required: [expectedVersion]
@@ -661,12 +661,12 @@ components:
         description: { type: string }
         priority: { type: integer, minimum: 1, maximum: 4 }
         due:
-          oneOf: [{ $ref: '#/components/schemas/TodoDue' }, { type: 'null' }]
+          oneOf: [{ $ref: '#/components/schemas/TaskDue' }, { type: 'null' }]
         tags: { $ref: '#/components/schemas/Tags' }
         visibility: { $ref: '#/components/schemas/Visibility' }
         source: { type: object }
         metadata: { type: object }
-    TodoTransition:
+    TaskTransition:
       type: object
       additionalProperties: false
       properties:

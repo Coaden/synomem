@@ -10,14 +10,14 @@ export const defaultConfig: SynomemConfig = {
   workspaceId: 'workspace',
   defaultVisibility: 'workspace',
   allowSelfAwards: false,
-  allowCrossAgentTodos: true,
+  allowCrossAgentTasks: true,
   allowAgentCreationViaMcp: false,
   allowRebuildViaMcp: false,
   includePrivateInStats: false,
   projection: {
     writeWinsMarkdown: true,
     writeMemoryMarkdown: true,
-    writeTodosMarkdown: true,
+    writeTasksMarkdown: true,
     writeInboxEntries: true,
   },
 };
@@ -53,14 +53,14 @@ const policySchema = z.object({
   workspaceId: z.string().trim().min(1).max(100),
   defaultVisibility: z.enum(['private', 'workspace', 'public']),
   allowSelfAwards: z.boolean(),
-  allowCrossAgentTodos: z.boolean(),
+  allowCrossAgentTasks: z.boolean(),
   allowAgentCreationViaMcp: z.boolean(),
   allowRebuildViaMcp: z.boolean(),
   includePrivateInStats: z.boolean(),
   projection: z.object({
     writeWinsMarkdown: z.boolean(),
     writeMemoryMarkdown: z.boolean(),
-    writeTodosMarkdown: z.boolean(),
+    writeTasksMarkdown: z.boolean(),
     writeInboxEntries: z.boolean(),
   }),
 });
@@ -144,24 +144,24 @@ function environmentConfig(env: NodeJS.ProcessEnv): SynomemConfigOverrides {
 
   const writeWinsMarkdown = optionalBoolean(env, 'SYNOMEM_WRITE_WINS_MARKDOWN');
   const writeMemoryMarkdown = optionalBoolean(env, 'SYNOMEM_WRITE_MEMORY_MARKDOWN');
-  const writeTodosMarkdown = optionalBoolean(env, 'SYNOMEM_WRITE_TODOS_MARKDOWN');
+  const writeTasksMarkdown = optionalBoolean(env, 'SYNOMEM_WRITE_TODOS_MARKDOWN');
   const writeInboxEntries = optionalBoolean(env, 'SYNOMEM_WRITE_INBOX_ENTRIES');
   const allowSelfAwards = optionalBoolean(env, 'SYNOMEM_ALLOW_SELF_AWARDS');
-  const allowCrossAgentTodos = optionalBoolean(env, 'SYNOMEM_ALLOW_CROSS_AGENT_TODOS');
+  const allowCrossAgentTasks = optionalBoolean(env, 'SYNOMEM_ALLOW_CROSS_AGENT_TODOS');
   const allowAgentCreationViaMcp = optionalBoolean(env, 'SYNOMEM_ALLOW_AGENT_CREATION_VIA_MCP');
   const allowRebuildViaMcp = optionalBoolean(env, 'SYNOMEM_ALLOW_REBUILD_VIA_MCP');
   const includePrivateInStats = optionalBoolean(env, 'SYNOMEM_INCLUDE_PRIVATE_IN_STATS');
   const projection = {
     ...(writeWinsMarkdown !== undefined ? { writeWinsMarkdown } : {}),
     ...(writeMemoryMarkdown !== undefined ? { writeMemoryMarkdown } : {}),
-    ...(writeTodosMarkdown !== undefined ? { writeTodosMarkdown } : {}),
+    ...(writeTasksMarkdown !== undefined ? { writeTasksMarkdown } : {}),
     ...(writeInboxEntries !== undefined ? { writeInboxEntries } : {}),
   };
 
   return {
     ...(visibility ? { defaultVisibility: visibility as SynomemConfig['defaultVisibility'] } : {}),
     ...(allowSelfAwards !== undefined ? { allowSelfAwards } : {}),
-    ...(allowCrossAgentTodos !== undefined ? { allowCrossAgentTodos } : {}),
+    ...(allowCrossAgentTasks !== undefined ? { allowCrossAgentTasks } : {}),
     ...(allowAgentCreationViaMcp !== undefined ? { allowAgentCreationViaMcp } : {}),
     ...(allowRebuildViaMcp !== undefined ? { allowRebuildViaMcp } : {}),
     ...(includePrivateInStats !== undefined ? { includePrivateInStats } : {}),

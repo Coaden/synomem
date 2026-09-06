@@ -242,11 +242,11 @@ try {
     ),
   );
   if (!note.record?.event?.id) throw new Error('Acceptance note was not created.');
-  const todo = JSON.parse(
+  const task = JSON.parse(
     run(
       synomemBin,
       [
-        'todo',
+        'task',
         'create',
         'codex',
         '--from',
@@ -261,10 +261,10 @@ try {
       acceptanceEnv,
     ),
   );
-  const todoId = todo.record?.event?.id;
-  if (!todoId || todo.record?.status !== 'assigned')
-    throw new Error('Assigned todo was not created.');
-  run(synomemBin, ['todo', 'accept', todoId, '--as', 'codex'], consumer, acceptanceEnv);
+  const taskId = task.record?.event?.id;
+  if (!taskId || task.record?.status !== 'assigned')
+    throw new Error('Assigned task was not created.');
+  run(synomemBin, ['task', 'accept', taskId, '--as', 'codex'], consumer, acceptanceEnv);
   const unified = JSON.parse(
     run(synomemBin, ['list', '--limit', '20', '--json'], consumer, acceptanceEnv),
   );

@@ -13,7 +13,7 @@ It keeps four concepts deliberately distinct:
 - **Kudos:** what did you do well?
 - **Memo:** what do I need you to know later?
 - **Note:** what do I need to remember?
-- **Todo:** what needs to happen?
+- **Task:** what needs to happen?
 
 Canonical events live in an append-only SQLite database. The TypeScript library, `synomem` CLI,
 actor-bound MCP server, compact change feed, and generated human-readable projections all use the
@@ -34,7 +34,7 @@ same domain model.
 
 ## Consent and privacy
 
-Cross-agent todos begin as `assigned`; the recipient must accept or reject them. Notes are
+Cross-agent tasks begin as `assigned`; the recipient must accept or reject them. Notes are
 owner-private in V1. Memos have one recipient and no threading. Machine reads are context-bounded,
 and a unified opaque watermark lets an agent ask what changed without rereading all history.
 

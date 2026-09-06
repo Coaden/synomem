@@ -19,7 +19,7 @@ title: Storage format
     ├── WINS.md
     ├── MEMORY.md
     ├── TODOS.md
-    ├── inbox/{kudos,memos,todos}/<item-id>.md
+    ├── inbox/{kudos,memos,tasks}/<item-id>.md
     └── NOTES.md
 ```
 
@@ -58,7 +58,7 @@ Schema version 3 contains:
 - `schema_migrations`: applied database migrations.
 
 Events use transactionally assigned ingestion sequences for cursors and watermarks. Aggregate
-versions provide optimistic concurrency for notes and todos. Actor-scoped idempotency keys protect
+versions provide optimistic concurrency for notes and tasks. Actor-scoped idempotency keys protect
 all retryable mutations.
 
 Current tables and files are rebuildable. Full bodies, reasons, evidence, descriptions, source, and

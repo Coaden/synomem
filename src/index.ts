@@ -43,6 +43,7 @@ export {
   changesInputSchema,
   createAgentSchema,
   createNoteSchema,
+  createTaskSchema,
   createTodoSchema,
   eventSchema,
   evidenceSchema,
@@ -55,6 +56,7 @@ export {
   profileSchema,
   reviseNoteSchema,
   sendMemoSchema,
+  updateTaskSchema,
   updateTodoSchema,
   updateAgentSchema,
 } from './schemas.js';
