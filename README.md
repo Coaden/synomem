@@ -38,9 +38,9 @@ Synomem gives humans and AI agents durable ways to coordinate beyond a disappear
 Traditional AI memory layers resemble an isolated file cabinet for one model. Synomem turns memory
 into a shared, transactional canvas: independently operating agents can retain private knowledge,
 deliver durable context, delegate work with consent, track commitments, and recognize good
-collaboration through one auditable protocol. V1 provides that substrate locally; its interfaces are
-designed so the same agent identities and semantics can later cross machines through an explicitly
-configured service.
+collaboration through one auditable protocol. The same agent identities and semantics work on one
+machine or across many: the local backend keeps everything on disk, and Synomem Cloud keeps it in a
+hosted workspace reached over HTTPS.
 
 One append-only event store powers the TypeScript library, `synomem` CLI, actor-bound stdio MCP
 server, compact change feeds, and readable Markdown projections. On the local backend that store is
@@ -85,7 +85,7 @@ Everything below works the same on both backends.
 
 ```bash
 export SYNOMEM_HOME="$(mktemp -d)/.synomem"
-synomem init
+synomem config init --backend local --yes
 synomem agent create codex --name "Codex"
 synomem agent create gracie --name "Gracie"
 
@@ -243,23 +243,42 @@ are `claude`, `codex`, `hermes`, `openclaw`, `cursor`, and `grok`; `grokbot` ali
 
 ## Storage
 
+This is the local backend. On Synomem Cloud the canonical store is a hosted Postgres workspace and
+nothing below is written to this machine.
+
 ```text
 ~/.synomem/
-├── synomem/
-│   ├── config.json
-│   └── synomem.sqlite3
-└── <agent-id>/
+├── config.json
+├── synomem.sqlite3
+├── credentials/
+│   └── installation.json   # only when an access key is stored in a file
+└── <handle>/               # one directory per agent, named by handle
     ├── profile.json
     ├── WINS.md
     ├── MEMORY.md
     ├── TASKS.md
-    ├── inbox/{kudos,memos,tasks}/
-    └── NOTES.md
+    ├── NOTES.md
+    └── inbox/{kudos,memos,tasks}/<record-id>.md
 ```
 
+The home IS the storage directory: `config.json` and the database sit directly in it, with no
+nested `synomem/` level.
+
+Agent directories are named by HANDLE, because they exist to be read. The canonical agent ID is
+what stored events reference, so renaming an agent leaves its history untouched.
+
+Renaming does move the projections: the next rebuild writes them under the new handle and deletes
+the generated files under the old one. It will not delete `NOTES.md`, which is yours rather than
+Synomem's, so after a rename your hand-written notes stay behind under the previous handle. Move
+that file yourself if you want it alongside the rest; the empty directory can then be removed.
+
 SQLite events are canonical and append-only. Markdown and current-state tables are rebuildable
-projections. `NOTES.md` is human-owned and is never overwritten; canonical agent notes project to
-`MEMORY.md`.
+projections — run `synomem rebuild` to regenerate them, and `synomem projection status` to see
+whether they currently match the events. Posts and todos project no files: a post belongs to the
+whole workspace rather than to one agent's directory, and a todo is private to its owner.
+
+`NOTES.md` is human-owned and is never overwritten; canonical agent notes project to `MEMORY.md`.
+Each projection can be turned off individually, in which case its file is not written at all.
 
 Override the root with `SYNOMEM_HOME`, `--home`, or the library's `home` option. Use
 `synomem backup` for a consistent snapshot and JSON or JSONL export for recovery. Never synchronize
