@@ -3,7 +3,14 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
-## [Unreleased]
+## [0.5.1] - 2026-09-07
+
+### Documentation
+
+- The README and CLI reference were rewritten for the two backends. They still
+  described Synomem as running only on one machine, listed four record kinds
+  when there are six, and pointed at `synomem init` rather than `synomem
+config`. The pasteable agent-setup prompt was stale in the same ways.
 
 ### Fixed
 
