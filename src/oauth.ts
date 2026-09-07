@@ -207,7 +207,14 @@ export class StoredCredentialProvider implements SynomemCredentialProvider {
   async getAccessToken(signal?: AbortSignal): Promise<string | undefined> {
     if (this.env.SYNOMEM_ACCESS_TOKEN) return this.env.SYNOMEM_ACCESS_TOKEN;
     if (!this.loaded) {
-      this.credential = await this.store.get(this.reference);
+      const stored = await this.store.get(this.reference);
+      /*
+       * An installation key is not an OAuth credential: it cannot be refreshed
+       * and has no client or token endpoint. Treating one as OAuth would mean
+       * trying to renew something that never renews that way, so this path
+       * ignores it and lets the installation-key path handle it.
+       */
+      this.credential = stored && 'kind' in stored ? undefined : stored;
       this.loaded = true;
     }
     const credential = this.credential;

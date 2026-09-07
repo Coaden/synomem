@@ -7,29 +7,29 @@ describe('agent identity and discovery', () => {
   it('resolves aliases without regard to case', async () => {
     const client = await testClient(tempHome());
     await client.agents.create({
-      id: 'mycroft',
+      handle: 'mycroft',
       displayName: 'Mycroft',
       aliases: ['mike', 'holmes'],
     });
 
     for (const query of ['mycroft', 'Mycroft', 'MYCROFT', 'Mike', 'mike', 'HoLmEs']) {
       const resolution = await client.agents.resolve(query);
-      expect(resolution.match?.id, query).toBe('mycroft');
+      expect(resolution.match?.handle, query).toBe('mycroft');
     }
     await client.close();
   });
 
   it('refuses an alias that another agent already answers to', async () => {
     const client = await testClient(tempHome());
-    await client.agents.create({ id: 'mycroft', displayName: 'Mycroft', aliases: ['mike'] });
+    await client.agents.create({ handle: 'mycroft', displayName: 'Mycroft', aliases: ['mike'] });
 
     // Differing case must not sneak a second claim past the check.
     await expect(
-      client.agents.create({ id: 'mnemosyne', displayName: 'Mnemosyne', aliases: ['Mike'] }),
+      client.agents.create({ handle: 'mnemosyne', displayName: 'Mnemosyne', aliases: ['Mike'] }),
     ).rejects.toMatchObject({ code: 'ALIAS_CONFLICT' });
 
     // Nor may an alias shadow a different agent's canonical ID.
-    await client.agents.create({ id: 'atlas', displayName: 'Atlas' });
+    await client.agents.create({ handle: 'atlas', displayName: 'Atlas' });
     await expect(client.agents.update('mycroft', { aliases: ['Atlas'] })).rejects.toMatchObject({
       code: 'ALIAS_CONFLICT',
     });
@@ -39,7 +39,7 @@ describe('agent identity and discovery', () => {
 
   it('reports an unknown name as no candidates rather than an error', async () => {
     const client = await testClient(tempHome());
-    await client.agents.create({ id: 'mycroft', displayName: 'Mycroft' });
+    await client.agents.create({ handle: 'mycroft', displayName: 'Mycroft' });
     const resolution = await client.agents.resolve('nobody');
     expect(resolution.match).toBeUndefined();
     expect(resolution.candidates).toEqual([]);
@@ -48,26 +48,31 @@ describe('agent identity and discovery', () => {
 
   it('keeps an agent reachable under a renamed alias set', async () => {
     const client = await testClient(tempHome());
-    await client.agents.create({ id: 'mycroft', displayName: 'Mycroft', aliases: ['mike'] });
+    await client.agents.create({ handle: 'mycroft', displayName: 'Mycroft', aliases: ['mike'] });
     await client.agents.update('mycroft', { aliases: ['mike', 'brother'] });
-    expect((await client.agents.resolve('Brother')).match?.id).toBe('mycroft');
+    expect((await client.agents.resolve('Brother')).match?.handle).toBe('mycroft');
 
     await client.agents.update('mycroft', { aliases: [] });
     expect((await client.agents.resolve('mike')).match).toBeUndefined();
-    expect((await client.agents.resolve('mycroft')).match?.id).toBe('mycroft');
+    expect((await client.agents.resolve('mycroft')).match?.handle).toBe('mycroft');
     await client.close();
   });
 
   it('records runtime bindings idempotently and lists them in the directory', async () => {
     const client = await testClient(tempHome());
-    await client.agents.create({ id: 'mycroft', displayName: 'Mycroft', aliases: ['mike'] });
+    const mycroft = await client.agents.create({
+      handle: 'mycroft',
+      displayName: 'Mycroft',
+      aliases: ['mike'],
+    });
 
     const first = await client.agents.bindRuntime({
       agentId: 'Mike',
       runtime: 'claude-code',
       capabilities: { tools: ['synomem'] },
     });
-    expect(first.agentId).toBe('mycroft');
+    // An alias resolves to the canonical ID, which is what the binding stores.
+    expect(first.agentId).toBe(mycroft.id);
     expect(first.lastSeenAt).toBeUndefined();
 
     // Reinstalling the same runtime is the same agent in the same place.
@@ -85,7 +90,7 @@ describe('agent identity and discovery', () => {
 
     const directory = await client.agents.directory();
     expect(directory).toHaveLength(1);
-    expect(directory[0]?.profile.id).toBe('mycroft');
+    expect(directory[0]?.profile.handle).toBe('mycroft');
     expect(directory[0]?.runtimeBindings.map((binding) => binding.runtime)).toEqual([
       'claude-code',
       'claude-code',
@@ -110,11 +115,7 @@ describe('agent-bound MCP registration', () => {
   it('reads the display name from the profile rather than the command line', async () => {
     const home = tempHome();
     const client = await testClient(home);
-    await client.agents.create({
-      id: 'mycroft',
-      displayName: 'Mycroft',
-      aliases: ['mike'],
-    });
+    await client.agents.create({ handle: 'mycroft', displayName: 'Mycroft', aliases: ['mike'] });
     await client.close();
 
     const server = spawn(
@@ -142,7 +143,17 @@ describe('agent-bound MCP registration', () => {
         })}\n`,
       );
     });
-    server.kill();
+    /*
+     * Waited for, not just signalled. `kill` returns before the child has gone,
+     * and the child still holds the SQLite file -- so reopening the database
+     * below races it. Windows enforces that lock and fails the read with a disk
+     * I/O error; POSIX quietly tolerates it, which is what let this survive.
+     */
+    await new Promise<void>((resolveExit) => {
+      if (server.exitCode !== null || server.signalCode !== null) return resolveExit();
+      server.once('exit', () => resolveExit());
+      server.kill();
+    });
     expect(stdout).toContain('"result"');
 
     // The alias resolved to the canonical agent, and nothing on the command
@@ -171,5 +182,95 @@ describe('agent-bound MCP registration', () => {
     });
     expect(exit.code).not.toBe(0);
     expect(exit.stderr).toContain('Unknown agent');
+  });
+});
+
+describe('opaque canonical identity', () => {
+  it('generates an opaque id and keeps it through a rename', async () => {
+    const client = await testClient(tempHome());
+    const created = await client.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+
+    // The ID is generated, not the handle. That is the whole point: a handle
+    // carries meaning and meaning changes.
+    expect(created.id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+    expect(created.id).not.toBe('gracie');
+    expect(created.handle).toBe('gracie');
+
+    const renamed = await client.agents.update('gracie', { handle: 'grace' });
+    expect(renamed.handle).toBe('grace');
+    expect(renamed.id).toBe(created.id);
+
+    // Reachable under the new handle and no longer under the old one, while the
+    // canonical ID keeps working either way.
+    expect((await client.agents.resolve('grace')).match?.id).toBe(created.id);
+    expect((await client.agents.resolve('gracie')).match).toBeUndefined();
+    expect((await client.agents.get(created.id)).handle).toBe('grace');
+    await client.close();
+  });
+
+  it('keeps records attached to an agent across a rename', async () => {
+    // This is what the opaque ID buys. Under handle-as-ID a rename would
+    // orphan every event written under the old name.
+    const home = tempHome();
+    const operator = await testClient(home);
+    const gracie = await operator.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await operator.kudos.give({
+      recipientAgentId: 'gracie',
+      title: 'Caught a real bug',
+      reason: 'Found the collision before it reached anybody.',
+    });
+
+    await operator.agents.update('gracie', { handle: 'grace' });
+    const page = await operator.kudos.list({ recipientAgentId: 'grace' });
+    expect(page.items).toHaveLength(1);
+    expect(page.items[0]?.recipientAgentId).toBe(gracie.id);
+    await operator.close();
+  });
+
+  it('refuses a handle another agent already answers to', async () => {
+    const client = await testClient(tempHome());
+    await client.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await client.agents.create({ handle: 'atlas', displayName: 'Atlas' });
+    await expect(client.agents.update('atlas', { handle: 'gracie' })).rejects.toMatchObject({
+      code: 'ALIAS_CONFLICT',
+    });
+    await client.close();
+  });
+
+  it('archives without erasing, and restores', async () => {
+    const client = await testClient(tempHome());
+    const gracie = await client.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await client.kudos.give({
+      recipientAgentId: 'gracie',
+      title: 'Before archiving',
+      reason: 'History must survive the agent being stood down.',
+    });
+
+    const archived = await client.agents.archive('gracie');
+    expect(archived.status).toBe('archived');
+    // Still resolvable and its records still there: events reference the actor
+    // permanently, so deletion would leave history pointing at nothing.
+    expect((await client.agents.get(gracie.id)).status).toBe('archived');
+    expect((await client.kudos.list({ recipientAgentId: 'gracie' })).items).toHaveLength(1);
+
+    expect((await client.agents.restore('gracie')).status).toBe('active');
+    await client.close();
+  });
+
+  it('adds and removes aliases without replacing the set', async () => {
+    const client = await testClient(tempHome());
+    await client.agents.create({ handle: 'mycroft', displayName: 'Mycroft', aliases: ['mike'] });
+
+    expect((await client.agents.addAliases('mycroft', ['holmes', 'm'])).aliases).toEqual([
+      'holmes',
+      'm',
+      'mike',
+    ]);
+    expect((await client.agents.removeAliases('mycroft', ['Mike'])).aliases).toEqual([
+      'holmes',
+      'm',
+    ]);
+    expect((await client.agents.resolve('HOLMES')).match?.handle).toBe('mycroft');
+    await client.close();
   });
 });

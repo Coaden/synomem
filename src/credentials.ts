@@ -6,6 +6,21 @@ import type { ActorIdentity } from './types.js';
 const serviceName = 'ai.synomem.credentials';
 const maximumOutputBytes = 128 * 1024;
 
+/**
+ * An installation access key.
+ *
+ * Not an OAuth credential: it has no refresh, no token endpoint and no client,
+ * and it authorizes a MACHINE rather than a person. Keeping it a distinct shape
+ * stops code treating it as refreshable, which would mean silently failing to
+ * renew something that never expires that way.
+ */
+export interface StoredInstallationKey {
+  kind: 'installation-key';
+  accessToken: string;
+}
+
+export type StoredCredential = StoredOAuthCredential | StoredInstallationKey;
+
 export interface StoredOAuthCredential {
   accessToken: string;
   refreshToken?: string;
@@ -17,8 +32,8 @@ export interface StoredOAuthCredential {
 }
 
 export interface CredentialStore {
-  get(reference: string): Promise<StoredOAuthCredential | undefined>;
-  set(reference: string, credential: StoredOAuthCredential): Promise<void>;
+  get(reference: string): Promise<StoredCredential | undefined>;
+  set(reference: string, credential: StoredCredential): Promise<void>;
   delete(reference: string): Promise<boolean>;
 }
 
@@ -185,10 +200,18 @@ export class OsCredentialStore implements CredentialStore {
     return result.code === 0;
   }
 
+  /*
+   * Windows Credential Manager is not implemented yet. `cmdkey` can write a
+   * generic credential but deliberately will not read the secret back, so a
+   * store built on it would accept a credential and then never return it --
+   * worse than saying so plainly.
+   */
   private unsupported(): never {
     throw new SynomemError(
       'CONFIG_INVALID',
-      'Interactive credential storage is currently supported on macOS and Linux with secret-tool.',
+      this.platform === 'win32'
+        ? 'Windows Credential Manager storage is not supported yet. Run `synomem config init` and choose the restricted-file store, or set SYNOMEM_ACCESS_TOKEN.'
+        : 'Operating-system credential storage needs the macOS Keychain, or secret-tool on Linux. Run `synomem config init` and choose the restricted-file store, or set SYNOMEM_ACCESS_TOKEN.',
     );
   }
 }

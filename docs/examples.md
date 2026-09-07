@@ -10,7 +10,7 @@ All examples use fictional identities and an isolated temporary home.
 ## Initialize identities
 
 ```bash
-export SYNOMEM_HOME="$(mktemp -d)/.agents"
+export SYNOMEM_HOME="$(mktemp -d)/.synomem"
 
 synomem init
 synomem agent create atlas --name "Atlas"

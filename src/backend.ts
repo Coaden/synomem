@@ -26,9 +26,15 @@ function configLocation(explicitHome?: string): {
   storageDirectory: string;
   configPath: string;
 } {
+  /*
+   * The home IS the storage directory. It used to be `<home>/synomem`, which
+   * made sense while the default home was `~/.agents` and Synomem was one
+   * tenant inside it. Now that the home is `~/.synomem`, that nesting produces
+   * `~/.synomem/synomem` — a path the layout explicitly rules out, and one that
+   * makes every documented path wrong by a level.
+   */
   const home = resolveHome(explicitHome);
-  const storageDirectory = join(home, 'synomem');
-  return { home, storageDirectory, configPath: join(storageDirectory, 'config.json') };
+  return { home, storageDirectory: home, configPath: join(home, 'config.json') };
 }
 
 export function readSynomemConfig(

@@ -3,6 +3,7 @@ import {
   credentialReference,
   OsCredentialStore,
   type CredentialStore,
+  type StoredCredential,
   type StoredOAuthCredential,
 } from '../src/credentials.js';
 import { loginWithOAuth, StoredCredentialProvider } from '../src/oauth.js';
@@ -105,7 +106,7 @@ describe('remote credential storage', () => {
       await new Promise<void>((resolve, reject) =>
         probe.close((error) => (error ? reject(error) : resolve())),
       );
-      const values = new Map<string, StoredOAuthCredential>();
+      const values = new Map<string, StoredCredential>();
       const store: CredentialStore = {
         async get(reference) {
           return values.get(reference);

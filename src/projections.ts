@@ -550,7 +550,7 @@ export class ProjectionManager implements ProjectionWriter {
     const generated: string[] = [];
 
     for (const profile of profiles) {
-      const agentDirectory = join(this.storage.home, profile.id);
+      const agentDirectory = join(this.storage.home, profile.handle);
       assertNoSymlinkEscape(this.storage.home, agentDirectory);
       ensureDirectory(agentDirectory);
       const profilePath = join(agentDirectory, 'profile.json');
@@ -656,7 +656,7 @@ export class ProjectionManager implements ProjectionWriter {
       (record) => record.event.assigneeAgentId === profile.id,
     );
     const rebuiltAt = events.at(-1)?.createdAt ?? new Date(0).toISOString();
-    const agentDirectory = join(this.storage.home, profile.id);
+    const agentDirectory = join(this.storage.home, profile.handle);
     const inboxDirectory = join(agentDirectory, 'inbox');
     const kudosInboxDirectory = join(inboxDirectory, 'kudos');
     const memoInboxDirectory = join(inboxDirectory, 'memos');
@@ -729,7 +729,7 @@ export class ProjectionManager implements ProjectionWriter {
     }
 
     const keep = new Set(generated);
-    const prefixes = [`${profile.id}/`, `${profile.id}\\`];
+    const prefixes = [`${profile.handle}/`, `${profile.handle}\\`];
     const removed: string[] = [];
     for (const stale of this.storage
       .projectionManifest()
@@ -745,10 +745,18 @@ export class ProjectionManager implements ProjectionWriter {
       unlinkSync(path);
       removed.push(stale);
     }
-    this.storage.replaceAgentProjectionManifest(profile.id, generated, rebuiltAt);
+    this.storage.replaceAgentProjectionManifest(profile.handle, generated, rebuiltAt);
     return { generated: generated.sort(), removed: removed.sort() };
   }
 
+  /*
+   * The paths a rebuild would produce, for comparison against the manifest.
+   *
+   * Directories are named by HANDLE, matching what the writers above create,
+   * while the record filters match on the canonical agent ID, which is what
+   * stored events carry. Mixing the two up makes the comparison never agree,
+   * and `doctor` then reports every workspace's projections as stale forever.
+   */
   expectedPaths(): string[] {
     const profiles = this.storage.listAgents();
     const events = this.storage.getReadableEvents();
@@ -757,10 +765,12 @@ export class ProjectionManager implements ProjectionWriter {
     const tasks = taskRecordsFromEvents(events);
     const paths: string[] = [];
     for (const profile of profiles) {
-      paths.push(`${profile.id}/profile.json`);
-      if (this.storage.config.projection.writeWinsMarkdown) paths.push(`${profile.id}/WINS.md`);
-      if (this.storage.config.projection.writeMemoryMarkdown) paths.push(`${profile.id}/MEMORY.md`);
-      if (this.storage.config.projection.writeTasksMarkdown) paths.push(`${profile.id}/TASKS.md`);
+      paths.push(`${profile.handle}/profile.json`);
+      if (this.storage.config.projection.writeWinsMarkdown) paths.push(`${profile.handle}/WINS.md`);
+      if (this.storage.config.projection.writeMemoryMarkdown)
+        paths.push(`${profile.handle}/MEMORY.md`);
+      if (this.storage.config.projection.writeTasksMarkdown)
+        paths.push(`${profile.handle}/TASKS.md`);
       if (this.storage.config.projection.writeInboxEntries) {
         for (const record of records.filter(
           (item) =>
@@ -768,19 +778,19 @@ export class ProjectionManager implements ProjectionWriter {
             item.status === 'unacknowledged' &&
             item.revocationStatus === 'active',
         )) {
-          paths.push(`${profile.id}/inbox/kudos/${record.event.id}.md`);
+          paths.push(`${profile.handle}/inbox/kudos/${record.event.id}.md`);
         }
         for (const record of memos.filter(
           (item) => item.event.recipientAgentId === profile.id && item.status === 'unread',
         )) {
-          paths.push(`${profile.id}/inbox/memos/${record.event.id}.md`);
+          paths.push(`${profile.handle}/inbox/memos/${record.event.id}.md`);
         }
         for (const record of tasks.filter(
           (item) =>
             item.event.assigneeAgentId === profile.id &&
             (item.status === 'open' || item.status === 'assigned'),
         )) {
-          paths.push(`${profile.id}/inbox/tasks/${record.event.id}.md`);
+          paths.push(`${profile.handle}/inbox/tasks/${record.event.id}.md`);
         }
       }
     }

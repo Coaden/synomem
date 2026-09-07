@@ -255,6 +255,21 @@ CREATE TABLE post_acknowledgments (
 CREATE INDEX post_acknowledgments_post ON post_acknowledgments(post_id);
 `;
 
+const migrationV7 = `
+-- Opaque canonical IDs, with the handle as a separate mutable name.
+--
+-- Existing agents keep their name-shaped ID and take it as their handle too.
+-- Rewriting the actor ID inside stored events to tidy the format would be
+-- exactly the rewrite an append-only log exists to prevent, so history stays
+-- as written and only NEW agents get a generated opaque ID.
+ALTER TABLE agents ADD COLUMN handle TEXT;
+UPDATE agents SET handle = id WHERE handle IS NULL;
+CREATE UNIQUE INDEX agents_handle ON agents(handle);
+
+-- Archived agents keep their records and stop being able to act.
+ALTER TABLE agents ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+`;
+
 const migrationV3 = `
 DROP TRIGGER IF EXISTS events_append_only_update;
 DROP TRIGGER IF EXISTS events_append_only_delete;
@@ -430,7 +445,8 @@ export class SynomemStorage implements SynomemRepository {
 
   constructor(options: StorageOptions) {
     this.home = resolve(options.home);
-    this.storageDirectory = join(this.home, 'synomem');
+    // The home is the storage directory; see configLocation in backend.ts.
+    this.storageDirectory = this.home;
     this.databasePath = join(this.storageDirectory, 'synomem.sqlite3');
     this.configPath = join(this.storageDirectory, 'config.json');
     this.readOnly = options.readOnly;
@@ -518,7 +534,7 @@ export class SynomemStorage implements SynomemRepository {
     const version = Number(
       (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
     );
-    if (version > 6) {
+    if (version > 7) {
       throw new SynomemError(
         'UNSUPPORTED_SCHEMA',
         `Database schema version ${version} is newer than this package supports.`,
@@ -598,14 +614,26 @@ export class SynomemStorage implements SynomemRepository {
         db.exec('PRAGMA user_version = 6');
       });
     }
+    const afterV6 = Number(
+      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    );
+    if (afterV6 === 6) {
+      this.transactionSync(() => {
+        db.exec(migrationV7);
+        db.prepare(
+          'INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        ).run(7, new Date().toISOString());
+        db.exec('PRAGMA user_version = 7');
+      });
+    }
   }
 
   private assertSchemaSupported(): void {
     const version = Number(
       (this.db().prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
     );
-    if (version !== 6) {
-      if (version >= 1 && version <= 5) {
+    if (version !== 7) {
+      if (version >= 1 && version <= 6) {
         throw new SynomemError(
           'UNSUPPORTED_SCHEMA',
           `Database schema version ${version} requires migration. Open this home once with readOnly: false, then retry the read-only client.`,
@@ -1530,12 +1558,23 @@ export class SynomemStorage implements SynomemRepository {
     return { schemaVersion, appliedVersions };
   }
 
+  /**
+   * Aliases that also name an agent directly.
+   *
+   * Matches against the HANDLE as well as the canonical ID. With opaque IDs an
+   * alias can no longer accidentally equal one, but it can easily equal another
+   * agent's handle — which is the collision that actually makes a lookup
+   * ambiguous now.
+   */
   aliasIdentityConflicts(): Array<{ alias: string; agentId: string }> {
     return this.db()
       .prepare(
         `SELECT x.alias, x.agent_id AS agentId
-         FROM aliases x JOIN agents a ON a.id = x.alias
-         ORDER BY x.alias`,
+         FROM aliases x
+         JOIN agents a ON lower(a.id) = x.normalized_alias
+                       OR lower(a.handle) = x.normalized_alias
+        WHERE a.id != x.agent_id
+        ORDER BY x.alias`,
       )
       .all() as unknown as Array<{ alias: string; agentId: string }>;
   }
@@ -1727,10 +1766,13 @@ export class SynomemStorage implements SynomemRepository {
     const parsed = profileSchema.parse(profile);
     this.db()
       .prepare(
-        'INSERT INTO agents(id, display_name, profile_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+        `INSERT INTO agents(id, handle, status, display_name, profile_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         parsed.id,
+        parsed.handle,
+        parsed.status,
         parsed.displayName,
         JSON.stringify(parsed),
         parsed.createdAt,
@@ -1742,8 +1784,18 @@ export class SynomemStorage implements SynomemRepository {
   updateAgent(profile: AgentProfile, updatedAt: string): void {
     const parsed = profileSchema.parse(profile);
     this.db()
-      .prepare('UPDATE agents SET display_name = ?, profile_json = ?, updated_at = ? WHERE id = ?')
-      .run(parsed.displayName, JSON.stringify(parsed), updatedAt, parsed.id);
+      .prepare(
+        `UPDATE agents SET handle = ?, status = ?, display_name = ?, profile_json = ?,
+           updated_at = ? WHERE id = ?`,
+      )
+      .run(
+        parsed.handle,
+        parsed.status,
+        parsed.displayName,
+        JSON.stringify(parsed),
+        updatedAt,
+        parsed.id,
+      );
     this.db().prepare('DELETE FROM aliases WHERE agent_id = ?').run(parsed.id);
     this.insertAliases(parsed.id, parsed.aliases ?? []);
   }
@@ -1770,10 +1822,10 @@ export class SynomemStorage implements SynomemRepository {
         `SELECT DISTINCT a.profile_json
            FROM agents a
            LEFT JOIN aliases x ON x.agent_id = a.id
-          WHERE lower(a.id) = ? OR x.normalized_alias = ?
+          WHERE lower(a.id) = ? OR lower(a.handle) = ? OR x.normalized_alias = ?
           ORDER BY a.id ASC`,
       )
-      .all(normalized, normalized) as unknown as ProfileRow[];
+      .all(normalized, normalized, normalized) as unknown as ProfileRow[];
     const candidates = rows.map((row) => profileSchema.parse(JSON.parse(row.profile_json)));
     return candidates.length === 1 ? { match: candidates[0]!, candidates } : { candidates };
   }
@@ -1964,11 +2016,16 @@ export class SynomemStorage implements SynomemRepository {
     });
   }
 
-  replaceAgentProjectionManifest(agentId: string, paths: string[], generatedAt: string): void {
+  /**
+   * @param directory the agent's projection directory name, which is its
+   * handle rather than its canonical ID: these rows are keyed by the path on
+   * disk, and projections are named for people to read.
+   */
+  replaceAgentProjectionManifest(directory: string, paths: string[], generatedAt: string): void {
     this.transactionSync(() => {
       this.db()
         .prepare('DELETE FROM projection_manifest WHERE path LIKE ? OR path LIKE ?')
-        .run(`${agentId}/%`, `${agentId}\\%`);
+        .run(`${directory}/%`, `${directory}\\%`);
       const insert = this.db().prepare(
         'INSERT INTO projection_manifest(path, generated_at) VALUES (?, ?)',
       );
@@ -1982,6 +2039,15 @@ export class SynomemStorage implements SynomemRepository {
         path: string;
       }[]
     ).map((row) => row.path);
+  }
+
+  /** The manifest with the time each path was written, newest first. */
+  projectionManifestEntries(): { path: string; generatedAt: string }[] {
+    return (
+      this.db()
+        .prepare('SELECT path, generated_at FROM projection_manifest ORDER BY generated_at DESC')
+        .all() as unknown as { path: string; generated_at: string }[]
+    ).map((row) => ({ path: row.path, generatedAt: row.generated_at }));
   }
 
   integrityCheck(): string[] {

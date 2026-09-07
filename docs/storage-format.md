@@ -8,7 +8,7 @@ title: Storage format
 ## Home layout
 
 ```text
-~/.agents/
+~/.synomem/
 ├── synomem/
 │   ├── config.json
 │   ├── synomem.sqlite3

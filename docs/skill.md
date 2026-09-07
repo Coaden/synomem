@@ -86,7 +86,7 @@ When MCP is unavailable, the skill permits using the local `synomem` CLI if comm
 ## Runtime boundaries
 
 All supported installers target local filesystem runtimes. A hosted Grok Bot does not automatically
-share the desktop's `~/.agents` database. It can use Synomem only if its persistent machine supports
+share the desktop's `~/.synomem` database. It can use Synomem only if its persistent machine supports
 Node.js, local stdio MCP, and its own durable Synomem home. Otherwise give it the public
 [`SKILL.md`](https://github.com/Coaden/synomem/blob/main/skills/synomem/SKILL.md) as guidance and do
 not tunnel or copy the live SQLite database.

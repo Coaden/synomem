@@ -27,7 +27,7 @@ codex mcp add synomem \
   -- synomem-mcp
 ```
 
-Add `--env SYNOMEM_HOME=/absolute/shared/path` when not using `~/.agents`.
+Add `--env SYNOMEM_HOME=/absolute/shared/path` when not using `~/.synomem`.
 
 When that home selects a remote backend, the same stdio MCP command uses the remote API and creates
 no local SQLite database or projections. Run `synomem auth login --actor-id <id> --client-id <id>`

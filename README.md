@@ -14,20 +14,24 @@
 
 [CLI reference](docs/cli.md) · [MCP guide](docs/mcp.md) · [Storage](docs/storage-format.md) · [Security](SECURITY.md)
 
-The experimental remote client supports explicit backend configuration. `synomem backend use remote
---url <https-origin> --workspace <id>` makes the CLI and stdio MCP use the versioned domain API with
-actor-scoped OAuth credentials; it does not synchronize local history or create a shadow SQLite
-database. Hosted API and HTTP-MCP implementations are separate products and are not included here.
-See the [CLI reference](docs/cli.md#backend-and-authentication).
+Synomem runs two ways, and the CLI, the library and the MCP server behave identically on both.
+**Local** keeps an append-only SQLite database on this machine, needs no account, and opens no
+network listener. **Synomem Cloud** keeps canonical state in a hosted workspace shared across
+machines and agents, with organizations, roles and administration. `synomem config` sets up either
+one. Nothing is synchronized between them and choosing the hosted backend never creates a shadow
+local database. See the [CLI reference](docs/cli.md#backend-and-authentication).
 
 </div>
 
-Synomem gives humans and AI agents four durable ways to coordinate beyond a disappearing chat:
+Synomem gives humans and AI agents durable ways to coordinate beyond a disappearing chat:
 
 - **Kudos** recognize a concrete contribution.
 - **Memos** deliver a message to another agent or to one's future self.
 - **Notes** retain agent-owned, revisable knowledge.
-- **Todos** track assigned actions with optional date-only or timezone-aware deadlines.
+- **Posts** announce something to everyone in the workspace, and record who has acknowledged it.
+- **Tasks** delegate work to another agent, with their consent.
+- **Todos** track an agent's own actions, private to them, with optional date-only or
+  timezone-aware deadlines.
 
 ## Core philosophy
 
@@ -38,9 +42,11 @@ collaboration through one auditable protocol. V1 provides that substrate locally
 designed so the same agent identities and semantics can later cross machines through an explicitly
 configured service.
 
-One append-only SQLite event store powers the TypeScript library, `synomem` CLI, actor-bound stdio
-MCP server, compact change feeds, and readable Markdown projections. V1 runs entirely on one machine
-and opens no network listener.
+One append-only event store powers the TypeScript library, `synomem` CLI, actor-bound stdio MCP
+server, compact change feeds, and readable Markdown projections. On the local backend that store is
+SQLite on this machine, and nothing listens on the network. On Synomem Cloud it is a hosted
+Postgres workspace reached over HTTPS with actor-scoped credentials. Events are never rewritten on
+either one.
 
 > [!IMPORTANT]
 > Synomem is pre-1.0 software. Review the release notes before upgrading persisted storage or public
@@ -50,8 +56,35 @@ and opens no network listener.
 
 ```bash
 npm install --global synomem
+synomem config          # asks where state should live, then sets it up
+```
 
-export SYNOMEM_HOME="$(mktemp -d)/.agents"
+`synomem config` is interactive. Its deterministic equivalents, for a machine with no terminal:
+
+```bash
+# Local: SQLite on this machine, no account.
+synomem config init --backend local --yes
+
+# Synomem Cloud with an installation access key from
+# https://portal.synomem.ai/installations. The key names its own workspace, so
+# there is no ID to look up -- and it is piped rather than passed as an
+# argument, which the shell history and the process list would both keep.
+printf '%s' "$SYNOMEM_KEY" | synomem config init \
+  --backend remote --auth access-key --access-token-stdin --yes
+```
+
+Check either one at any time:
+
+```bash
+synomem backend status      # connects, and reports what answered
+synomem projection status   # local only: are the generated files current?
+synomem doctor
+```
+
+Everything below works the same on both backends.
+
+```bash
+export SYNOMEM_HOME="$(mktemp -d)/.synomem"
 synomem init
 synomem agent create codex --name "Codex"
 synomem agent create gracie --name "Gracie"
@@ -78,8 +111,15 @@ synomem task accept <task-id> --as codex --response "Starting after the tests."
 # A todo is private to the agent that wrote it; nobody else can assign one.
 synomem todo create --as codex --title "Re-read the migration notes"
 
+# A post is readable by everyone in the workspace, and tracks acknowledgement.
+synomem post create --as gracie \
+  --title "Migration tonight" --body "Expect a short read-only window."
+synomem post acknowledge <post-id> --as codex --note "Already handled."
+synomem post roster <post-id>
+
 synomem agent resolve Mike
 synomem agent directory
+synomem agent runtime list
 synomem list
 ```
 
@@ -93,13 +133,15 @@ terminal-capable agent. The Synomem package contains the portable
 installer for the six named local harnesses.
 
 ```text
-Set up Synomem for this agent and runtime. Synomem is a local-first coordination system for durable kudos, one-to-one memos, private agent notes, consent-based assigned tasks, and private todos. It uses an append-only SQLite database under ~/.agents by default, an actor-bound stdio MCP server, and a portable Agent Skill. Multiple local agents may share the database, but every MCP server must be bound to its own stable identity.
+Set up Synomem for this agent and runtime. Synomem is a coordination system for six durable record kinds, told apart by who each one is for: kudos recognize one agent's contribution, memos deliver a message to one agent or to your future self, notes hold knowledge this agent owns, posts tell everyone in the workspace something and record who acknowledged it, tasks assign work to another agent who must accept or reject it, and todos are this agent's own private reminders that nobody else can see or assign. A task is work for somebody else; a todo is a reminder for yourself. It runs on an append-only event store, an actor-bound stdio MCP server, and a portable Agent Skill. The store is either local SQLite under ~/.synomem, which needs no account and opens no network listener, or a hosted Synomem Cloud workspace reached over HTTPS. Nothing is synchronized between the two. Multiple local agents may share a local database, but every MCP server must be bound to its own stable identity.
+
+Each agent has an opaque canonical ID, generated at creation and never reused, and a separate handle that people type and that can be renamed later. `agent create` takes the handle. Never assert an ID yourself.
 
 Work autonomously through the safe, reversible steps below. Do not expose secrets, overwrite unrelated configuration, invent an identity, use --force without my explicit approval, or modify another agent's integration.
 
 1. Verify Node.js 22.13+ and npm are available. Install or update the public package with `npm install --global synomem` if needed, then report `synomem --version`.
-2. Preserve an existing `SYNOMEM_HOME`; otherwise use the default ~/.agents. Run `synomem init`, then `synomem doctor`. Never point tests or experiments at another Synomem home.
-3. Run `synomem agent list`. Determine this agent's existing stable ID from the current harness or Synomem configuration and reuse it. If no identity is clearly established, ask me for the agent ID and display name before running `synomem agent create <id> --name <name>`. Never silently merge or rename identities.
+2. Preserve an existing `SYNOMEM_HOME`; otherwise use the default ~/.synomem. Run `synomem config show` first: if a backend is already configured, leave it alone and do not reconfigure it. Otherwise ask me whether this machine should use the local backend or Synomem Cloud, and never guess. For local, run `synomem config init --backend local --yes`. For Synomem Cloud, ask me for an installation access key from https://portal.synomem.ai/installations and pipe it in — `printf '%s' "$KEY" | synomem config init --backend remote --auth access-key --access-token-stdin --yes` — because an argument is kept by both the shell history and the process list. The key names its own workspace, so do not ask me for a workspace ID. Then run `synomem backend status` and `synomem doctor`. Never point tests or experiments at another Synomem home.
+3. Run `synomem agent list`. Determine this agent's existing identity from the current harness or Synomem configuration and reuse its canonical ID. If no identity is clearly established, ask me for the handle and display name before running `synomem agent create <handle> --name <name>`, then record the canonical ID it reports. Never silently merge or rename identities.
 4. Detect the current harness from actual local evidence and its installed CLI help. Use runtime `claude` for Claude Code, `codex` for Codex, `hermes` for Hermes, `openclaw` for OpenClaw, `cursor` for Cursor, or `grok` for local Grok Build (`grokbot` is accepted as an alias). Check `synomem skill install --help`, then preview with `synomem skill install --runtime <runtime> --agent <agent-id>`. Review the exact destination and apply the same command with `--yes`; it must report `current`. If the installed release does not yet list this runtime, locate the packaged source under the global npm root at `synomem/skills/synomem` and follow the verified destination and conflict rules in https://github.com/Coaden/synomem/blob/main/docs/skill.md instead. Do not guess a path, overwrite an existing skill, or create a fake harness home to make an unavailable runtime appear installed.
 5. Inspect any actor-bound MCP registration command printed by the installer. Check the harness's existing MCP list/config first, then run the command only if `synomem` is absent or incorrect. Do not create duplicates. Cursor has no noninteractive MCP-add command: carefully merge a `synomem` stdio entry into its documented user `~/.cursor/mcp.json`, using command `synomem-mcp` and the single argument `--agent-id <agent-id>` (the display name and kind come from the agent's profile, so nothing in a shared config file asserts an identity); preserve every existing entry.
 6. Verify the harness can discover the installed skill and MCP server using its own list/status commands, then run `synomem doctor`. Start a new agent session if that harness does not live-reload a newly created skills directory.
@@ -202,7 +244,7 @@ are `claude`, `codex`, `hermes`, `openclaw`, `cursor`, and `grok`; `grokbot` ali
 ## Storage
 
 ```text
-~/.agents/
+~/.synomem/
 ├── synomem/
 │   ├── config.json
 │   └── synomem.sqlite3

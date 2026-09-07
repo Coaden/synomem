@@ -11,7 +11,12 @@ export {
 export { RemoteSynomemService, environmentCredentialProvider } from './remote.js';
 export type { SynomemCredentialProvider, RemoteSynomemOptions } from './remote.js';
 export { credentialReference, OsCredentialStore } from './credentials.js';
-export type { CredentialStore, StoredOAuthCredential } from './credentials.js';
+export type {
+  CredentialStore,
+  StoredCredential,
+  StoredInstallationKey,
+  StoredOAuthCredential,
+} from './credentials.js';
 export { loginWithOAuth, StoredCredentialProvider } from './oauth.js';
 export type { OAuthLoginOptions } from './oauth.js';
 export {
@@ -35,6 +40,9 @@ export type {
   ProjectionRebuildResult,
 } from './service.js';
 export { defaultConfig, resolveHome } from './config.js';
+export { cloudApiUrl, SYNOMEM_CLOUD_API_URL } from './cloud.js';
+export { discoverBoundWorkspace, discoverOrganizations, workspaceChoices } from './discover.js';
+export type { DiscoveredOrganization, DiscoveredWorkspace, DiscoveryOptions } from './discover.js';
 export { asSynomemError, errorCodes, SynomemError } from './errors.js';
 export {
   dueInstant,

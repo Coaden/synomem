@@ -19,6 +19,7 @@ import type {
   CreateTodoResult,
   CreateTaskResult,
   DoctorResult,
+  ProjectionStatus,
   GiveKudosInput,
   GiveKudosResult,
   ItemListInput,
@@ -79,6 +80,10 @@ export interface SynomemDomainService {
     get(idOrAlias: string): Promise<AgentProfile>;
     list(): Promise<AgentProfile[]>;
     resolve(query: string): Promise<AgentResolution>;
+    archive(idOrAlias: string): Promise<AgentProfile>;
+    restore(idOrAlias: string): Promise<AgentProfile>;
+    addAliases(idOrAlias: string, aliases: string[]): Promise<AgentProfile>;
+    removeAliases(idOrAlias: string, aliases: string[]): Promise<AgentProfile>;
     directory(): Promise<AgentDirectoryEntry[]>;
     bindings(idOrAlias: string): Promise<AgentRuntimeBinding[]>;
     bindRuntime(input: BindRuntimeInput): Promise<AgentRuntimeBinding>;
@@ -209,6 +214,13 @@ export interface SynomemService extends SynomemDomainService {
   doctor(): Promise<DoctorResult>;
   export(format: 'json' | 'jsonl' | 'markdown'): Promise<string>;
   backup?(destination: string): Promise<string>;
+  /*
+   * Optional, because only a backend that writes projected files can report on
+   * them. The remote backend keeps no filesystem projections at all, and
+   * inventing an empty answer there would read as "nothing is stale" rather
+   * than "there is nothing to be stale".
+   */
+  projectionStatus?(): Promise<ProjectionStatus>;
   rebuild(): Promise<ProjectionRebuildResult>;
   capabilities(): Promise<SynomemServiceCapabilities>;
   info(): Promise<SynomemServiceInfo>;

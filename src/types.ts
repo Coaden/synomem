@@ -28,10 +28,22 @@ export interface EvidenceReference {
 }
 
 export interface AgentProfile {
+  /**
+   * Canonical, opaque, immutable. Every event references this, so it can never
+   * change — which is exactly why the handle exists separately.
+   */
   id: string;
+  /** The human-friendly name, unique in the workspace and safe to rename. */
+  handle: string;
   displayName: string;
   aliases?: string[];
   description?: string;
+  /**
+   * Archived agents keep their history and stop being able to act. Events
+   * reference the actor permanently, so deletion would leave history pointing
+   * at nothing.
+   */
+  status: 'active' | 'archived';
   createdAt: string;
   metadata?: Record<string, JsonValue>;
 }
@@ -684,13 +696,15 @@ export interface BindRuntimeInput {
 }
 
 export interface CreateAgentInput {
-  id: string;
+  /** The handle. The canonical ID is generated, never supplied. */
+  handle: string;
   displayName: string;
   aliases?: string[];
   description?: string;
   metadata?: Record<string, JsonValue>;
 }
 export interface UpdateAgentInput {
+  handle?: string;
   displayName?: string;
   aliases?: string[];
   description?: string;
@@ -706,7 +720,15 @@ export interface KudosStats {
   byTag: Record<string, number>;
 }
 export interface Diagnostic {
-  level: 'ok' | 'warning' | 'error';
+  /**
+   * `skipped` is not a failure.
+   *
+   * A check the caller lacks permission to run says so and leaves the overall
+   * result healthy. Failing the whole diagnostic because an ordinary agent
+   * cannot read workspace administration would make `doctor` useless to the
+   * callers who need it most.
+   */
+  level: 'ok' | 'warning' | 'error' | 'skipped';
   code: string;
   message: string;
   path?: string;
@@ -714,6 +736,27 @@ export interface Diagnostic {
 export interface DoctorResult {
   healthy: boolean;
   diagnostics: Diagnostic[];
+}
+/**
+ * What the projected files on disk look like next to what they should be.
+ *
+ * Projections are derived, never canonical, so this reports drift rather than
+ * damage: `missing` and `unexpected` are both repaired by a rebuild, and
+ * neither means an event was lost.
+ */
+export interface ProjectionStatus {
+  /** Where projected files live. Absent on a backend that projects nothing. */
+  directory?: string;
+  settings: SynomemConfig['projection'];
+  /** True when the manifest matches what a rebuild would produce. */
+  current: boolean;
+  /** Recorded by the manifest, not the filesystem; absent before any rebuild. */
+  lastRebuiltAt?: string;
+  counts: { expected: number; manifest: number; missing: number; unexpected: number };
+  /** Expected but not on disk. Capped, because a large workspace has many. */
+  missing: string[];
+  /** On disk and in the manifest, but no longer expected. Capped likewise. */
+  unexpected: string[];
 }
 
 export type SynomemBackendConfig =

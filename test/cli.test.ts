@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import { existsSync } from 'node:fs';
+import { existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { SynomemClient } from '../src/client.js';
 import { runCli, type CliIo } from '../src/cli.js';
 import type { SynomemServiceFactory } from '../src/service.js';
 import { tempHome } from './helpers.js';
-import type { CredentialStore, StoredOAuthCredential } from '../src/credentials.js';
+import type { CredentialStore, StoredCredential } from '../src/credentials.js';
 import type { OAuthLoginOptions } from '../src/oauth.js';
 import { createLocalImportBundle } from '../src/import.js';
 
@@ -84,7 +84,7 @@ describe('CLI', () => {
     const sourceHome = tempHome();
     const source = new SynomemClient({ home: sourceHome });
     await source.init();
-    await source.agents.create({ id: 'codex', displayName: 'Codex' });
+    await source.agents.create({ handle: 'codex', displayName: 'Codex' });
     await source.close();
     const targetHome = tempHome();
     let captured = capture();
@@ -162,7 +162,7 @@ describe('CLI', () => {
 
   it('logs in, reports, and removes an OS-stored actor credential without printing it', async () => {
     const home = tempHome();
-    const values = new Map<string, StoredOAuthCredential>();
+    const values = new Map<string, StoredCredential>();
     const store: CredentialStore = {
       async get(reference) {
         return values.get(reference);
@@ -311,7 +311,7 @@ describe('CLI', () => {
       ),
     ).toBe(0);
     expect(JSON.parse(captured.stdout.join(''))).toMatchObject({
-      id: 'codex',
+      handle: 'codex',
       displayName: 'Codex',
     });
 
@@ -359,7 +359,7 @@ describe('CLI', () => {
     const home = tempHome();
     const client = new SynomemClient({ home, actor: { kind: 'human', id: 'troy' } });
     await client.init();
-    await client.agents.create({ id: 'codex', displayName: 'Codex' });
+    await client.agents.create({ handle: 'codex', displayName: 'Codex' });
     client.storage
       .db()
       .prepare(
@@ -389,7 +389,7 @@ describe('CLI', () => {
       config: { projection: { writeWinsMarkdown: false } },
     });
     await client.init();
-    await client.agents.create({ id: 'codex', displayName: 'Codex' });
+    await client.agents.create({ handle: 'codex', displayName: 'Codex' });
     await client.close();
 
     const captured = capture();
@@ -401,6 +401,65 @@ describe('CLI', () => {
     ).toBe(2);
     expect(captured.stderr.join('')).toContain('Enable projection.writeWinsMarkdown');
     expect(captured.stderr.join('')).not.toContain(`${home}/codex/WINS.md`);
+  });
+
+  /*
+   * The three status commands, which exist to answer "is this actually
+   * working?" -- so each one has to reach the thing it reports on rather than
+   * reprinting configuration back at the caller.
+   */
+  it('reports backend, projection, and runtime status from live state', async () => {
+    const home = tempHome();
+    const client = new SynomemClient({ home, actor: { kind: 'human', id: 'troy' } });
+    await client.init();
+    const codex = await client.agents.create({ handle: 'codex', displayName: 'Codex' });
+    await client.agents.bindRuntime({ agentId: codex.id, runtime: 'claude-code' });
+    await client.close();
+
+    const invoke = async (args: string[]) => {
+      const captured = capture();
+      const code = await runCli(['node', 'synomem', '--home', home, ...args], captured.io);
+      return { code, stdout: captured.stdout.join(''), stderr: captured.stderr.join('') };
+    };
+
+    const backend = await invoke(['backend', 'status', '--json']);
+    expect(backend.code).toBe(0);
+    expect(JSON.parse(backend.stdout)).toMatchObject({
+      reachable: true,
+      info: { backend: 'local', home },
+      capabilities: { backend: 'local' },
+    });
+
+    // A rebuild just ran as part of every write above, so nothing is stale.
+    const projection = await invoke(['projection', 'status', '--json']);
+    expect(projection.code).toBe(0);
+    expect(JSON.parse(projection.stdout)).toMatchObject({
+      directory: home,
+      current: true,
+      counts: { missing: 0, unexpected: 0 },
+    });
+    expect((JSON.parse(projection.stdout) as { lastRebuiltAt?: string }).lastRebuiltAt).toBeTypeOf(
+      'string',
+    );
+
+    // Deleting a generated file is drift, and naming it is the whole point.
+    rmSync(join(home, 'codex', 'WINS.md'));
+    const stale = await invoke(['projection', 'status', '--json']);
+    expect(JSON.parse(stale.stdout)).toMatchObject({
+      current: false,
+      counts: { missing: 1 },
+      missing: ['codex/WINS.md'],
+    });
+    expect((await invoke(['projection', 'status'])).stdout).toContain('synomem rebuild');
+
+    // Without an agent named, every agent that runs anywhere.
+    const runtimes = await invoke(['agent', 'runtime', 'list', '--json']);
+    expect(runtimes.code).toBe(0);
+    const listed = JSON.parse(runtimes.stdout) as { agents: unknown[] };
+    expect(listed.agents).toMatchObject([
+      { profile: { handle: 'codex', id: codex.id }, runtimeBindings: [{ runtime: 'claude-code' }] },
+    ]);
+    expect((await invoke(['agent', 'runtime', 'list'])).stdout).toContain('codex');
   });
 
   it('exercises the complete local administration and recognition workflow', async () => {

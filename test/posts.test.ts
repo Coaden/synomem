@@ -4,11 +4,14 @@ import { tempHome, testClient } from './helpers.js';
 async function workspace() {
   const home = tempHome();
   const operator = await testClient(home);
-  await operator.agents.create({ id: 'mycroft', displayName: 'Mycroft' });
-  await operator.agents.create({ id: 'atlas', displayName: 'Atlas' });
+  const mycroftProfile = await operator.agents.create({
+    handle: 'mycroft',
+    displayName: 'Mycroft',
+  });
+  const atlasProfile = await operator.agents.create({ handle: 'atlas', displayName: 'Atlas' });
   const mycroft = await testClient(home, { kind: 'agent', id: 'mycroft', displayName: 'Mycroft' });
   const atlas = await testClient(home, { kind: 'agent', id: 'atlas', displayName: 'Atlas' });
-  return { home, operator, mycroft, atlas };
+  return { home, operator, mycroft, atlas, mycroftId: mycroftProfile.id, atlasId: atlasProfile.id };
 }
 
 describe('posts', () => {
@@ -38,14 +41,14 @@ describe('posts', () => {
   });
 
   it('records an acknowledgement per actor, and only for that actor', async () => {
-    const { operator, mycroft, atlas } = await workspace();
+    const { operator, mycroft, atlas, atlasId } = await workspace();
     const post = await mycroft.posts.create({ title: 'Read me', body: 'Please acknowledge.' });
     const id = post.record.event.id;
 
     await atlas.posts.acknowledge({ postId: id, note: 'Already handled in the other workspace.' });
     const seen = await mycroft.posts.get(id);
     expect(seen.acknowledgments).toHaveLength(1);
-    expect(seen.acknowledgments[0]?.actor.id).toBe('atlas');
+    expect(seen.acknowledgments[0]?.actor.id).toBe(atlasId);
     expect(seen.acknowledgments[0]?.note).toContain('Already handled');
 
     // Acknowledging twice is the same statement, not a second one.
@@ -74,17 +77,17 @@ describe('posts', () => {
   });
 
   it('does not count agents that did not exist when the post was written', async () => {
-    const { home, operator, mycroft, atlas } = await workspace();
+    const { home, operator, mycroft, atlas, mycroftId, atlasId } = await workspace();
     const post = await mycroft.posts.create({ title: 'Before', body: 'Written first.' });
     await atlas.posts.acknowledge({ postId: post.record.event.id });
 
     // A newcomer is neither acknowledged nor outstanding: it was not there, and
     // saying otherwise accuses it of ignoring something it never saw.
-    await operator.agents.create({ id: 'newcomer', displayName: 'Newcomer' });
+    await operator.agents.create({ handle: 'newcomer', displayName: 'Newcomer' });
     const roster = await mycroft.posts.roster(post.record.event.id);
 
-    expect(roster.acknowledged.map((entry) => entry.actor.id)).toEqual(['atlas']);
-    expect(roster.outstanding.map((entry) => entry.id)).toEqual(['mycroft']);
+    expect(roster.acknowledged.map((entry) => entry.actor.id)).toEqual([atlasId]);
+    expect(roster.outstanding.map((entry) => entry.id)).toEqual([mycroftId]);
     expect(roster.joinedSince).toBe(1);
 
     const newcomer = await testClient(home, { kind: 'agent', id: 'newcomer' });
@@ -137,8 +140,8 @@ describe('post acknowledgement concurrency', () => {
     // acknowledging would produce a conflict with nothing to reconcile.
     const home = tempHome();
     const operator = await testClient(home);
-    await operator.agents.create({ id: 'mycroft', displayName: 'Mycroft' });
-    await operator.agents.create({ id: 'atlas', displayName: 'Atlas' });
+    await operator.agents.create({ handle: 'mycroft', displayName: 'Mycroft' });
+    await operator.agents.create({ handle: 'atlas', displayName: 'Atlas' });
     const mycroft = await testClient(home, { kind: 'agent', id: 'mycroft' });
     const atlas = await testClient(home, { kind: 'agent', id: 'atlas' });
 
@@ -160,8 +163,9 @@ describe('post acknowledgement concurrency', () => {
   it('accepts acknowledgements from several actors on one post', async () => {
     const home = tempHome();
     const operator = await testClient(home);
-    for (const id of ['one', 'two', 'three']) {
-      await operator.agents.create({ id, displayName: id });
+    const ids: Record<string, string> = {};
+    for (const handle of ['one', 'two', 'three']) {
+      ids[handle] = (await operator.agents.create({ handle, displayName: handle })).id;
     }
     const author = await testClient(home, { kind: 'agent', id: 'one' });
     const post = await author.posts.create({ title: 'Many', body: 'Everyone read this.' });
@@ -173,8 +177,10 @@ describe('post acknowledgement concurrency', () => {
     }
 
     const roster = await author.posts.roster(post.record.event.id);
-    expect(roster.acknowledged.map((e) => e.actor.id).sort()).toEqual(['three', 'two']);
-    expect(roster.outstanding.map((e) => e.id)).toEqual(['one']);
+    expect(roster.acknowledged.map((e) => e.actor.id).sort()).toEqual(
+      [ids.two!, ids.three!].sort(),
+    );
+    expect(roster.outstanding.map((e) => e.id)).toEqual([ids.one]);
     await Promise.all([operator.close(), author.close()]);
   });
 });

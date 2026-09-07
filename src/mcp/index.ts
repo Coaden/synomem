@@ -6,6 +6,7 @@ import { configuredServiceFactory } from '../backend.js';
 import { SynomemError, asSynomemError } from '../errors.js';
 import {
   actorSchema,
+  agentHandleSchema,
   agentIdSchema,
   changesInputSchema,
   createNoteSchema,
@@ -88,14 +89,23 @@ export async function createSynomemMcpServer(
   options: SynomemMcpOptions,
   serviceFactory: SynomemServiceFactory = configuredServiceFactory,
 ): Promise<SynomemMcpRuntime> {
-  const actor = actorSchema.parse(options.actor);
-  const client = serviceFactory({ ...options, actor });
+  const requested = actorSchema.parse(options.actor);
+  const client = serviceFactory({ ...options, actor: requested });
   await client.init();
+  /*
+   * Every tool reports the CANONICAL actor, not the one that was asked for.
+   *
+   * A harness registers with a handle because that is what a person typed, but
+   * init resolves it against stored state — so the identity echoed back is the
+   * one the events will actually carry. Reporting the requested name would let
+   * a misconfigured runtime appear to be acting as somebody it is not.
+   */
+  const actor = client.actor;
   const server = new McpServer(
     { name: 'synomem', version: packageVersion() },
     {
       instructions:
-        'Use Synomem for durable kudos, memos, notes, and tasks. Store only necessary, factual content; never secrets or raw sensitive tool output. The server binds every write to its configured actor.',
+        'Use Synomem for durable kudos, memos, notes, posts, tasks, and todos. Pick by who the record is for: a task is work assigned to another agent, which they must accept; a todo is your own private reminder that nobody else can see or assign; a post tells everyone in the workspace something and records who acknowledged it. Store only necessary, factual content; never secrets or raw sensitive tool output. The server binds every write to its configured actor.',
     },
   );
 
@@ -282,9 +292,9 @@ export async function createSynomemMcpServer(
       description:
         'Administrative tool for creating a stable agent identity. Disabled by default so runtime agents cannot silently create identities.',
       inputSchema: z.object({
-        id: agentIdSchema,
+        handle: agentHandleSchema,
         displayName: z.string().trim().min(1).max(200),
-        aliases: z.array(agentIdSchema).max(50).optional(),
+        aliases: z.array(agentHandleSchema).max(50).optional(),
         description: z.string().trim().max(2000).optional(),
       }),
       outputSchema,
@@ -300,7 +310,11 @@ export async function createSynomemMcpServer(
           );
         }
         const profile = await client.agents.create(input);
-        return success(actor, `Created agent ${profile.displayName} (${profile.id}).`, { profile });
+        return success(
+          actor,
+          `Created agent ${profile.displayName}: handle ${profile.handle}, ID ${profile.id}.`,
+          { profile },
+        );
       } catch (error) {
         return failure(actor, error);
       }
@@ -502,7 +516,7 @@ export async function createSynomemMcpServer(
     {
       title: 'List Synomem items',
       description:
-        'Discover a bounded page of compact kudos, memo, note, and task summaries. Full bodies, reasons, evidence, descriptions, source, and metadata are omitted; use synomem_get for one selected item.',
+        'Discover a bounded page of compact kudos, memo, note, post, task, and todo summaries. Pass kinds to narrow it: posts and todos are reachable only this way, because synomem_inbox holds only what another actor is waiting on. Full bodies, reasons, evidence, descriptions, source, and metadata are omitted; use synomem_get for one selected item.',
       inputSchema: itemListInputSchema,
       outputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
@@ -526,7 +540,7 @@ export async function createSynomemMcpServer(
     {
       title: 'Get one Synomem item',
       description:
-        'Read the full authorized record for one explicitly selected kudos, memo, note, or task ID.',
+        'Read the full authorized record for one explicitly selected kudos, memo, note, post, task, or todo ID.',
       inputSchema: z.object({ itemId: z.string().length(26) }),
       outputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
@@ -570,7 +584,7 @@ export async function createSynomemMcpServer(
     {
       title: 'Review an agent inbox',
       description:
-        'Return compact pending kudos, unread memos, and open tasks for the configured agent. An agent may inspect only its own private items.',
+        'Return compact pending kudos, unread memos, and open tasks for the configured agent -- what another actor is waiting on it for, and nothing else. Notes, posts, and todos are never here, because nobody is waiting: reach those through synomem_list with kinds. An agent may inspect only its own private items.',
       inputSchema: z.object({
         limit: z.number().int().min(1).max(50).default(10),
         cursor: z.string().max(500).optional(),

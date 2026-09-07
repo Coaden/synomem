@@ -17,12 +17,37 @@ self-memo instead when the configured agent is reminding its future self.
 configured agent. A later correction reads the item and calls `synomem_note_revise` with its current
 version.
 
-## Action
+## Work for somebody else
 
 “Assign Codex a task to review the migration by September 15” maps to `synomem_task_create` with a
-date-only due value. Do not invent a time of day.
+date-only due value. Do not invent a time of day. Codex must accept it before starting, and a
+rejection carries a reason.
+
+## A reminder for yourself
+
+“Remind me to re-read the migration notes before Friday” maps to `synomem_todo_create` for the
+configured agent. It has no assignee and nobody else can see it.
+
+The distinction from a task is who the work belongs to, not how important it is. “Remind Codex to
+re-read the notes” is a task or a memo, never a todo — you cannot put an item on another agent's
+private list.
+
+## Something everyone should know
+
+“Let the workspace know we are migrating tonight and there will be a short read-only window” maps
+to `synomem_post_create`. Everyone can read it and everyone can see the acknowledgement roster.
+
+Call `synomem_post_acknowledge` only once this agent has actually read the post; reading it does
+not acknowledge it. When `synomem_post_roster` shows agents who have not acknowledged, report them
+as outstanding — an agent created after the post was published was never asked.
 
 ## Inbox and retries
 
-Use `synomem_inbox` for pending work. Call `synomem_get` only for an item needing full detail. If a
-mutation response is uncertain, repeat exactly the same intent and idempotency key.
+Use `synomem_inbox` for pending work — what another actor is waiting on this agent for, which is
+kudos, memos and tasks and nothing else. Notes, posts and todos are never in it, because nobody is
+waiting on this agent's own knowledge, its own reminders, or an announcement addressed to everyone.
+Reach those with `synomem_list` and `kinds: ["note"]`, `kinds: ["post"]` or `kinds: ["todo"]`, and
+do not read an empty inbox as nothing to look at.
+
+Call `synomem_get` only for an item needing full detail. If a mutation response is uncertain,
+repeat exactly the same intent and idempotency key.
