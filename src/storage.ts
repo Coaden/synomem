@@ -2041,6 +2041,34 @@ export class SynomemStorage implements SynomemRepository {
     ).map((row) => row.path);
   }
 
+  /**
+   * Re-point manifest paths from one agent directory to another.
+   *
+   * The manifest records what Synomem generated and is what the stale-file
+   * cleanup consults. After a directory moves, entries still naming the old
+   * handle describe files that are no longer there, and the moved ones would
+   * look unaccounted for.
+   *
+   * Rewritten row by row rather than with a LIKE update: a manifest is small,
+   * and comparing an exact path prefix needs no thought about what characters
+   * a pattern would treat specially.
+   */
+  renameProjectionManifestPrefix(previousHandle: string, nextHandle: string): void {
+    const prefixes = [`${previousHandle}/`, `${previousHandle}\\`];
+    const rows = this.projectionManifestEntries().filter((entry) =>
+      prefixes.some((prefix) => entry.path.startsWith(prefix)),
+    );
+    if (!rows.length) return;
+    const remove = this.db().prepare('DELETE FROM projection_manifest WHERE path = ?');
+    const insert = this.db().prepare(
+      'INSERT OR REPLACE INTO projection_manifest(path, generated_at) VALUES (?, ?)',
+    );
+    for (const row of rows) {
+      remove.run(row.path);
+      insert.run(`${nextHandle}${row.path.slice(previousHandle.length)}`, row.generatedAt);
+    }
+  }
+
   /** The manifest with the time each path was written, newest first. */
   projectionManifestEntries(): { path: string; generatedAt: string }[] {
     return (

@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, unlinkSync } from 'node:fs';
+import { existsSync, lstatSync, renameSync, unlinkSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { SynomemError } from './errors.js';
 import {
@@ -636,6 +636,43 @@ export class ProjectionManager implements ProjectionWriter {
     }
     this.storage.replaceProjectionManifest(generated, rebuiltAt);
     return { generated: generated.sort(), removed: removed.sort() };
+  }
+
+  /**
+   * Move an agent's directory when its handle changes.
+   *
+   * Without this a rename left the old directory behind, and with it `NOTES.md`
+   * -- the one file in there that is the reader's rather than Synomem's, and so
+   * the one file a rebuild will never delete. The generated files moved to the
+   * new handle and the hand-written notes stayed at the old one.
+   *
+   * Moving rather than copy-and-delete, and moving rather than letting the
+   * rebuild sort it out, because a rename is a known identity change: the
+   * destination is new, so nothing is overwritten, and the human file arrives
+   * intact instead of being stranded.
+   */
+  renameAgentDirectory(previousHandle: string, nextHandle: string): void {
+    if (previousHandle === nextHandle) return;
+    this.storage.assertWritable();
+    const from = join(this.storage.home, previousHandle);
+    const to = join(this.storage.home, nextHandle);
+    assertNoSymlinkEscape(this.storage.home, from);
+    assertNoSymlinkEscape(this.storage.home, to);
+    if (!existsSync(from)) return;
+    // A directory already at the destination means the handle is in use, which
+    // the caller checks before reaching here. Refuse rather than merge.
+    if (existsSync(to)) {
+      throw new SynomemError(
+        'UNSAFE_PATH',
+        `Refusing to rename over an existing directory: ${nextHandle}`,
+      );
+    }
+    const stat = lstatSync(from);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new SynomemError('UNSAFE_PATH', `Agent directory is not a plain directory: ${from}`);
+    }
+    renameSync(from, to);
+    this.storage.renameProjectionManifestPrefix(previousHandle, nextHandle);
   }
 
   syncAgent(agentId: string): { generated: string[]; removed: string[] } {

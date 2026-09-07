@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { tempHome, testClient } from './helpers.js';
@@ -186,6 +187,38 @@ describe('agent-bound MCP registration', () => {
 });
 
 describe('opaque canonical identity', () => {
+  /*
+   * Projections are named by handle, so a rename has to take the directory with
+   * it. The file that matters here is NOTES.md: it belongs to the reader, so a
+   * rebuild will never delete it, which meant a rename moved the generated
+   * files to the new handle and stranded the hand-written notes at the old one.
+   */
+  it('moves the projected directory when a handle changes, notes included', async () => {
+    const home = tempHome();
+    const client = await testClient(home);
+    const agent = await client.agents.create({ handle: 'mycroft', displayName: 'Mycroft' });
+
+    // NOTES.md is created for every agent and never regenerated, so a line
+    // added here proves the file was carried rather than rebuilt.
+    const notes = join(home, 'mycroft', 'NOTES.md');
+    appendFileSync(notes, 'A line somebody typed.\n');
+
+    await client.agents.update('mycroft', { handle: 'holmes' });
+
+    expect(existsSync(join(home, 'mycroft'))).toBe(false);
+    expect(readFileSync(join(home, 'holmes', 'NOTES.md'), 'utf8')).toContain(
+      'A line somebody typed.',
+    );
+    expect(existsSync(join(home, 'holmes', 'MEMORY.md'))).toBe(true);
+    // The canonical ID is untouched, which is the whole reason a rename is safe.
+    expect((await client.agents.get('holmes')).id).toBe(agent.id);
+
+    // And the manifest followed, so nothing looks stale straight after a rename.
+    const status = await client.projectionStatus();
+    expect(status).toMatchObject({ current: true, counts: { missing: 0, unexpected: 0 } });
+    await client.close();
+  });
+
   it('generates an opaque id and keeps it through a rename', async () => {
     const client = await testClient(tempHome());
     const created = await client.agents.create({ handle: 'gracie', displayName: 'Gracie' });

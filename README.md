@@ -267,10 +267,9 @@ nested `synomem/` level.
 Agent directories are named by HANDLE, because they exist to be read. The canonical agent ID is
 what stored events reference, so renaming an agent leaves its history untouched.
 
-Renaming does move the projections: the next rebuild writes them under the new handle and deletes
-the generated files under the old one. It will not delete `NOTES.md`, which is yours rather than
-Synomem's, so after a rename your hand-written notes stay behind under the previous handle. Move
-that file yourself if you want it alongside the rest; the empty directory can then be removed.
+Renaming moves the whole directory, `NOTES.md` included. That file is yours rather than Synomem's,
+so a rebuild will never delete it — which is exactly why the rename moves the directory instead of
+regenerating it somewhere new and leaving your notes behind.
 
 SQLite events are canonical and append-only. Markdown and current-state tables are rebuildable
 projections — run `synomem rebuild` to regenerate them, and `synomem projection status` to see

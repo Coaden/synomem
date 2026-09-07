@@ -435,6 +435,15 @@ export class SynomemCore implements SynomemDomainService {
       await this.repository.updateAgent(updated, event.createdAt);
       await this.repository.insertEvent(event);
     });
+    /*
+     * Projections are named by handle, so a rename has to move the directory
+     * before it is regenerated. Otherwise the generated files appear under the
+     * new handle and `NOTES.md` -- which belongs to the reader and is never
+     * deleted -- is left stranded under the old one.
+     */
+    if (existing.handle !== updated.handle && this.projectionWriter.renameAgentDirectory) {
+      await this.projectionWriter.renameAgentDirectory(existing.handle, updated.handle);
+    }
     await this.projectionWriter.syncAgent(updated.id);
     return updated;
   }
