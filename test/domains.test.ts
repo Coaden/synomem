@@ -308,6 +308,67 @@ describe('task responses', () => {
   });
 });
 
+/*
+ * The inbox contract, pinned because the Skill and the MCP tool descriptions
+ * both state it and neither can check it.
+ *
+ * The inbox answers one question -- what is another actor waiting on this agent
+ * for -- so it holds kudos, memos and tasks and nothing else. Notes, posts and
+ * todos are deliberately absent: nobody waits on an agent's own knowledge, its
+ * own reminders, or an announcement addressed to everyone. Adding a kind here
+ * without meaning to would make the documented advice wrong.
+ */
+describe('inbox contents', () => {
+  it('holds only what another actor is waiting on, and nothing an agent owns itself', async () => {
+    const home = tempHome();
+    const admin = await testClient(home, { kind: 'human', id: 'troy' });
+    const codex = await admin.agents.create({ handle: 'codex', displayName: 'Codex' });
+    const gracie = await admin.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await admin.close();
+
+    const sender = await testClient(home, { kind: 'agent', id: gracie.id });
+    await sender.kudos.give({
+      recipientAgentId: codex.id,
+      title: 'Caught the migration gap',
+      reason: 'Found the missing rollback path before the window opened.',
+    });
+    await sender.memos.send({
+      recipientAgentId: codex.id,
+      subject: 'Review follow-up',
+      body: 'Please recheck after the tests pass.',
+    });
+    await sender.tasks.create({ assigneeAgentId: codex.id, title: 'Review the migration' });
+    await sender.posts.create({ title: 'Migration tonight', body: 'Short read-only window.' });
+    await sender.close();
+
+    const client = await testClient(home, { kind: 'agent', id: codex.id });
+    await client.notes.create({ title: 'Release invariant', body: 'Never publish unattended.' });
+    await client.todos.create({ title: 'Re-read the migration notes' });
+
+    const inbox = await client.items.list({
+      participantAgentId: codex.id,
+      pending: true,
+      limit: 50,
+    });
+    expect([...new Set(inbox.items.map((item) => item.kind))].sort()).toEqual([
+      'kudos',
+      'memo',
+      'task',
+    ]);
+
+    // Each absent kind is reachable, so the advice to use `kinds` holds. An
+    // empty inbox must not be read as nothing to look at.
+    for (const kind of ['note', 'post', 'todo'] as const) {
+      const page = await client.items.list({ kinds: [kind], limit: 50 });
+      expect(
+        page.items.map((item) => item.kind),
+        kind,
+      ).toEqual([kind]);
+    }
+    await client.close();
+  });
+});
+
 describe('private todos', () => {
   it('is owned by its author and readable by nobody else', async () => {
     const home = tempHome();

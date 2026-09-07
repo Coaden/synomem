@@ -3,6 +3,27 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
+## [0.5.3] - 2026-09-07
+
+### Documentation
+
+- 0.5.2 said the inbox "does not include posts or todos", which implied notes
+  were in it. They are not. The inbox holds kudos, memos and tasks and nothing
+  else, because it answers one question -- what is another actor waiting on
+  this agent for -- and nobody waits on an agent's own knowledge, its own
+  reminders, or an announcement addressed to everyone. The Skill, the examples
+  and the `synomem_inbox` description now say what it contains rather than
+  listing exclusions and getting the list wrong.
+- `synomem_list` and `synomem_get` still described four record kinds out of
+  six. `synomem_list` now also says that posts and todos are reachable only
+  through it, and that an empty inbox is not the same as nothing to look at.
+
+### Tests
+
+- The inbox contract is pinned by a test, since the Skill and the MCP tool
+  descriptions both state it and neither can check it. Confirmed to fail when a
+  kind is added to the `pending` filter.
+
 ## [0.5.2] - 2026-09-07
 
 ### Documentation

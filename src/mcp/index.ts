@@ -516,7 +516,7 @@ export async function createSynomemMcpServer(
     {
       title: 'List Synomem items',
       description:
-        'Discover a bounded page of compact kudos, memo, note, and task summaries. Full bodies, reasons, evidence, descriptions, source, and metadata are omitted; use synomem_get for one selected item.',
+        'Discover a bounded page of compact kudos, memo, note, post, task, and todo summaries. Pass kinds to narrow it: posts and todos are reachable only this way, because synomem_inbox holds only what another actor is waiting on. Full bodies, reasons, evidence, descriptions, source, and metadata are omitted; use synomem_get for one selected item.',
       inputSchema: itemListInputSchema,
       outputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
@@ -540,7 +540,7 @@ export async function createSynomemMcpServer(
     {
       title: 'Get one Synomem item',
       description:
-        'Read the full authorized record for one explicitly selected kudos, memo, note, or task ID.',
+        'Read the full authorized record for one explicitly selected kudos, memo, note, post, task, or todo ID.',
       inputSchema: z.object({ itemId: z.string().length(26) }),
       outputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
@@ -584,7 +584,7 @@ export async function createSynomemMcpServer(
     {
       title: 'Review an agent inbox',
       description:
-        'Return compact pending kudos, unread memos, and open tasks for the configured agent. An agent may inspect only its own private items.',
+        'Return compact pending kudos, unread memos, and open tasks for the configured agent -- what another actor is waiting on it for, and nothing else. Notes, posts, and todos are never here, because nobody is waiting: reach those through synomem_list with kinds. An agent may inspect only its own private items.',
       inputSchema: z.object({
         limit: z.number().int().min(1).max(50).default(10),
         cursor: z.string().max(500).optional(),

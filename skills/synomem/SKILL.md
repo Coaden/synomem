@@ -115,9 +115,15 @@ so do not report an agent as online or offline.
 
 ## Discovery
 
-Use `synomem_inbox` for the configured agent's pending kudos, unread memos, and open tasks. It
-covers what somebody else is waiting on this agent for, so it does not include posts or todos:
-find those with `synomem_list` and `kinds: ["post"]` or `kinds: ["todo"]`.
+Use `synomem_inbox` for the configured agent's pending kudos, unread memos, and open tasks. That is
+its whole contents: the inbox holds **what another actor is waiting on this agent for**, so notes,
+posts and todos are never in it. A note is this agent's own knowledge, a todo is its own reminder,
+and a post asks nobody in particular for anything — nobody is waiting on any of the three.
+
+Reach them through `synomem_list` with `kinds`, which accepts any of `kudos`, `memo`, `note`,
+`post`, `task`, `todo`: `kinds: ["post"]` for workspace announcements, `kinds: ["todo"]` for this
+agent's own list, `kinds: ["note"]` for its knowledge. An empty inbox therefore does not mean there
+is nothing to look at.
 
 Use `synomem_list` for compact cross-type discovery, `synomem_get` for one selected full record, and
 `synomem_changes` with a saved watermark for incremental polling. Do not drain history

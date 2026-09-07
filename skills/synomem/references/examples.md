@@ -43,9 +43,11 @@ as outstanding — an agent created after the post was published was never asked
 
 ## Inbox and retries
 
-Use `synomem_inbox` for pending work — what somebody else is waiting on this agent for. Posts and
-todos are not in it, because nobody is waiting: reach those with `synomem_list` and
-`kinds: ["post"]` or `kinds: ["todo"]`.
+Use `synomem_inbox` for pending work — what another actor is waiting on this agent for, which is
+kudos, memos and tasks and nothing else. Notes, posts and todos are never in it, because nobody is
+waiting on this agent's own knowledge, its own reminders, or an announcement addressed to everyone.
+Reach those with `synomem_list` and `kinds: ["note"]`, `kinds: ["post"]` or `kinds: ["todo"]`, and
+do not read an empty inbox as nothing to look at.
 
 Call `synomem_get` only for an item needing full detail. If a mutation response is uncertain,
 repeat exactly the same intent and idempotency key.
