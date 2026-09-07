@@ -3,10 +3,12 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Worker } from 'node:worker_threads';
@@ -342,6 +344,42 @@ describe('SQLite storage and projections', () => {
         expect.objectContaining({ code: 'MIGRATIONS_INCONSISTENT', level: 'error' }),
         expect.objectContaining({ code: 'ALIAS_CONFLICTS_FOUND', level: 'error' }),
       ]),
+    );
+    await client.close();
+  });
+
+  /*
+   * Agents carry an opaque canonical ID and a separate handle, and the two are
+   * used for different things: stored events reference the ID, while projected
+   * directories are named by the handle. Two checks in `doctor` reached for the
+   * wrong one, and both failed silently rather than loudly -- the staleness
+   * comparison never agreed with the manifest, and the symbolic-link check
+   * inspected a directory that does not exist.
+   */
+  it('checks projections and agent directories by handle, not by canonical ID', async () => {
+    const client = await testClient(tempHome());
+    const codex = await client.agents.create({ handle: 'codex', displayName: 'Codex' });
+    expect(codex.id).not.toBe(codex.handle);
+    await client.kudos.give({
+      recipientAgentId: codex.id,
+      title: 'Projection paths',
+      reason: 'Gives the inbox projection something to write.',
+    });
+    client.projections.rebuild();
+
+    // Nothing has changed since the rebuild, so nothing is stale.
+    const healthy = await client.doctor();
+    expect(healthy.diagnostics).toEqual(
+      expect.arrayContaining([expect.objectContaining({ code: 'PROJECTIONS_CURRENT' })]),
+    );
+
+    // And the directory the writers actually create is the one guarded.
+    rmSync(join(client.home, codex.handle), { recursive: true, force: true });
+    symlinkSync(tmpdir(), join(client.home, codex.handle), 'dir');
+    const unsafe = await client.doctor();
+    expect(unsafe.healthy).toBe(false);
+    expect(unsafe.diagnostics).toEqual(
+      expect.arrayContaining([expect.objectContaining({ code: 'UNSAFE_SYMLINK', level: 'error' })]),
     );
     await client.close();
   });

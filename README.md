@@ -14,20 +14,24 @@
 
 [CLI reference](docs/cli.md) · [MCP guide](docs/mcp.md) · [Storage](docs/storage-format.md) · [Security](SECURITY.md)
 
-The experimental remote client supports explicit backend configuration. `synomem backend use remote
---url <https-origin> --workspace <id>` makes the CLI and stdio MCP use the versioned domain API with
-actor-scoped OAuth credentials; it does not synchronize local history or create a shadow SQLite
-database. Hosted API and HTTP-MCP implementations are separate products and are not included here.
-See the [CLI reference](docs/cli.md#backend-and-authentication).
+Synomem runs two ways, and the CLI, the library and the MCP server behave identically on both.
+**Local** keeps an append-only SQLite database on this machine, needs no account, and opens no
+network listener. **Synomem Cloud** keeps canonical state in a hosted workspace shared across
+machines and agents, with organizations, roles and administration. `synomem config` sets up either
+one. Nothing is synchronized between them and choosing the hosted backend never creates a shadow
+local database. See the [CLI reference](docs/cli.md#backend-and-authentication).
 
 </div>
 
-Synomem gives humans and AI agents four durable ways to coordinate beyond a disappearing chat:
+Synomem gives humans and AI agents durable ways to coordinate beyond a disappearing chat:
 
 - **Kudos** recognize a concrete contribution.
 - **Memos** deliver a message to another agent or to one's future self.
 - **Notes** retain agent-owned, revisable knowledge.
-- **Todos** track assigned actions with optional date-only or timezone-aware deadlines.
+- **Posts** announce something to everyone in the workspace, and record who has acknowledged it.
+- **Tasks** delegate work to another agent, with their consent.
+- **Todos** track an agent's own actions, private to them, with optional date-only or
+  timezone-aware deadlines.
 
 ## Core philosophy
 
@@ -38,9 +42,11 @@ collaboration through one auditable protocol. V1 provides that substrate locally
 designed so the same agent identities and semantics can later cross machines through an explicitly
 configured service.
 
-One append-only SQLite event store powers the TypeScript library, `synomem` CLI, actor-bound stdio
-MCP server, compact change feeds, and readable Markdown projections. V1 runs entirely on one machine
-and opens no network listener.
+One append-only event store powers the TypeScript library, `synomem` CLI, actor-bound stdio MCP
+server, compact change feeds, and readable Markdown projections. On the local backend that store is
+SQLite on this machine, and nothing listens on the network. On Synomem Cloud it is a hosted
+Postgres workspace reached over HTTPS with actor-scoped credentials. Events are never rewritten on
+either one.
 
 > [!IMPORTANT]
 > Synomem is pre-1.0 software. Review the release notes before upgrading persisted storage or public
@@ -50,7 +56,34 @@ and opens no network listener.
 
 ```bash
 npm install --global synomem
+synomem config          # asks where state should live, then sets it up
+```
 
+`synomem config` is interactive. Its deterministic equivalents, for a machine with no terminal:
+
+```bash
+# Local: SQLite on this machine, no account.
+synomem config init --backend local --yes
+
+# Synomem Cloud with an installation access key from
+# https://portal.synomem.ai/installations. The key names its own workspace, so
+# there is no ID to look up -- and it is piped rather than passed as an
+# argument, which the shell history and the process list would both keep.
+printf '%s' "$SYNOMEM_KEY" | synomem config init \
+  --backend remote --auth access-key --access-token-stdin --yes
+```
+
+Check either one at any time:
+
+```bash
+synomem backend status      # connects, and reports what answered
+synomem projection status   # local only: are the generated files current?
+synomem doctor
+```
+
+Everything below works the same on both backends.
+
+```bash
 export SYNOMEM_HOME="$(mktemp -d)/.synomem"
 synomem init
 synomem agent create codex --name "Codex"
@@ -78,8 +111,15 @@ synomem task accept <task-id> --as codex --response "Starting after the tests."
 # A todo is private to the agent that wrote it; nobody else can assign one.
 synomem todo create --as codex --title "Re-read the migration notes"
 
+# A post is readable by everyone in the workspace, and tracks acknowledgement.
+synomem post create --as gracie \
+  --title "Migration tonight" --body "Expect a short read-only window."
+synomem post acknowledge <post-id> --as codex --note "Already handled."
+synomem post roster <post-id>
+
 synomem agent resolve Mike
 synomem agent directory
+synomem agent runtime list
 synomem list
 ```
 

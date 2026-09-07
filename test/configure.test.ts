@@ -79,7 +79,11 @@ describe('onboarding configuration', () => {
 
   it('offers only credential stores that exist on the platform', () => {
     expect(credentialStoreChoices('darwin')[0]?.label).toContain('Keychain');
-    expect(credentialStoreChoices('win32')[0]?.label).toContain('Credential Manager');
+    // Windows Credential Manager is not implemented in the credential layer,
+    // so the wizard must not offer it: a choice that fails on first use is
+    // worse than a plainly second-best one.
+    expect(credentialStoreChoices('win32').map((choice) => choice.value)).not.toContain('keychain');
+    expect(credentialStoreChoices('win32')[0]?.value).toBe('file');
     expect(credentialStoreChoices('linux')[0]?.label).toContain('Secret Service');
     for (const platform of ['darwin', 'win32', 'linux'] as const) {
       const values = credentialStoreChoices(platform).map((choice) => choice.value);
@@ -87,7 +91,86 @@ describe('onboarding configuration', () => {
       // headless machine with no keyring is never left without an option.
       expect(values).toContain('file');
       expect(values).toContain('environment');
+      // And each option is offered exactly once, whichever is recommended.
+      expect(new Set(values).size).toBe(values.length);
     }
+  });
+});
+
+/*
+ * Remote setup used to ask a person to type `ws-04psqx2rkt8ttft7a1t2z69r97`
+ * from memory. An installation access key is bound to exactly one workspace,
+ * so the service can be asked instead.
+ */
+describe('remote setup', () => {
+  it('takes the workspace from the access key rather than asking for it', async () => {
+    const { runCli } = await import('../src/cli.js');
+    const home = tempHome();
+    const lines: string[] = [];
+    const io = { stdout: (t: string) => lines.push(t), stderr: (t: string) => lines.push(t) };
+
+    const discovered: string[] = [];
+    const code = await runCli(
+      [
+        'node',
+        'synomem',
+        '--home',
+        home,
+        'config',
+        'init',
+        '--backend',
+        'remote',
+        '--auth',
+        'access-key',
+        '--access-token-stdin',
+        '--credential-store',
+        'file',
+        '--yes',
+      ],
+      io,
+      undefined,
+      {
+        // Piped, not typed: `--access-token-stdin` reads the whole stream, so
+        // the key never becomes a shell-history entry or a process argument.
+        promptIo: { ...scriptedIo(['installation-key-secret']), interactive: false },
+        // Kept off the network: the closing diagnostics reach the configured
+        // service, and a test must not depend on the real one being up.
+        env: { ...process.env, SYNOMEM_API_URL: 'http://127.0.0.1:1' },
+        discoverBoundWorkspace: async ({ accessToken }) => {
+          discovered.push(accessToken);
+          return { workspaceId: 'ws-04psqx2rkt8ttft7a1t2z69r97' };
+        },
+      },
+    );
+
+    // A non-zero code here is the unreachable stub service, not the setup: the
+    // configuration and the credential are both written before diagnostics run.
+    expect([0, 4, 5]).toContain(code);
+    // The key was what answered the question, and it never reached the output.
+    expect(discovered).toEqual(['installation-key-secret']);
+    const printed = lines.join('');
+    expect(printed).toContain('ws-04psqx2rkt8ttft7a1t2z69r97');
+    expect(printed).not.toContain('installation-key-secret');
+    expect(
+      JSON.parse(readFileSync(join(home, 'config.json'), 'utf8')) as {
+        backend: { kind: string; workspaceId: string };
+      },
+    ).toMatchObject({
+      backend: { kind: 'remote', workspaceId: 'ws-04psqx2rkt8ttft7a1t2z69r97' },
+    });
+  });
+
+  it('still requires an explicit workspace when there is no key to ask', async () => {
+    const { runCli } = await import('../src/cli.js');
+    const lines: string[] = [];
+    const io = { stdout: (t: string) => lines.push(t), stderr: (t: string) => lines.push(t) };
+    expect(
+      await runCli(
+        ['node', 'synomem', '--home', tempHome(), 'config', 'init', '--backend', 'remote', '--yes'],
+        io,
+      ),
+    ).toBe(2);
+    expect(lines.join('')).toContain('--workspace');
   });
 });
 

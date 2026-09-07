@@ -21,6 +21,7 @@ import {
   type ConfigPlan,
   type CredentialStoreChoice,
 } from './configure.js';
+import { discoverBoundWorkspace, discoverOrganizations, workspaceChoices } from './discover.js';
 import { defaultPromptIo, type PromptIo } from './prompt.js';
 import { credentialReference, OsCredentialStore, type CredentialStore } from './credentials.js';
 import { asSynomemError, SynomemError, type SynomemErrorCode } from './errors.js';
@@ -45,6 +46,7 @@ import {
 } from './skill-install.js';
 import type {
   ActorIdentity,
+  AgentRuntimeBinding,
   EvidenceReference,
   KudosListInput,
   KudosRecord,
@@ -74,6 +76,14 @@ export interface CliDependencies {
     reference: string;
     credentialStore: CredentialStore;
   }) => Promise<void>;
+  /*
+   * Injected so setup can be tested without a network. The default asks the
+   * service which workspace an access key is bound to.
+   */
+  discoverBoundWorkspace?: (options: {
+    baseUrl: string;
+    accessToken: string;
+  }) => Promise<{ workspaceId: string }>;
   createImportBundle?: (home: string) => Promise<ImportBundle>;
   remoteImport?: (options: {
     baseUrl: string;
@@ -300,6 +310,7 @@ export function createCli(
   const env = dependencies.env ?? process.env;
   const credentialStore = dependencies.credentialStore ?? new OsCredentialStore();
   const oauthLogin = dependencies.oauthLogin ?? loginWithOAuth;
+  const discoverWorkspace = dependencies.discoverBoundWorkspace ?? discoverBoundWorkspace;
   const promptIo = dependencies.promptIo ?? defaultPromptIo();
   const verifyRemoteCredential =
     dependencies.verifyRemoteCredential ??
@@ -340,6 +351,51 @@ export function createCli(
     .configureOutput({ writeOut: io.stdout, writeErr: io.stderr });
 
   const remoteCommand = program.command('remote').description('Administer a remote workspace');
+
+  /*
+   * The browser counterpart to an access key naming its own workspace.
+   *
+   * A signed-in account may reach several organizations, each with several
+   * workspaces, so there is a genuine choice to make -- and no way to make it
+   * without seeing the list. Printing the IDs alongside the names is the point:
+   * the ID is what `backend use remote --workspace` takes.
+   */
+  remoteCommand
+    .command('workspaces')
+    .description('List the organizations and workspaces this credential can reach')
+    .option('--url <url>', 'internal: alternate HTTPS origin')
+    .action(async (options: { url?: string }, command: Command) => {
+      const global = globals(command);
+      const config = readSynomemConfig(global.home, env);
+      const baseUrl =
+        options.url ??
+        (config?.backend.kind === 'remote' ? config.backend.baseUrl : cloudApiUrl(env));
+      const accessToken = env.SYNOMEM_ACCESS_TOKEN;
+      if (!accessToken) {
+        throw new SynomemError(
+          'AUTH_REQUIRED',
+          'Set SYNOMEM_ACCESS_TOKEN, or run `synomem auth login` first.',
+        );
+      }
+      const organizations = await discoverOrganizations({ baseUrl, accessToken });
+      const choices = workspaceChoices(organizations);
+      const human = organizations.length
+        ? organizations
+            .map((organization) =>
+              [
+                `${organization.displayName} (${organization.slug}) — ${organization.role}`,
+                ...(organization.workspaces.length
+                  ? organization.workspaces.map(
+                      (workspace) => `  ${workspace.id}  ${workspace.displayName}`,
+                    )
+                  : ['  (no workspaces yet)']),
+              ].join('\n'),
+            )
+            .join('\n')
+        : 'This account belongs to no organizations yet.';
+      output(io, global.json, { organizations, choices }, human);
+    });
+
   remoteCommand
     .command('import')
     .description('Preview or confirm a one-way import from a local Synomem home')
@@ -452,14 +508,53 @@ export function createCli(
     global: { home?: string; json: boolean },
   ): Promise<void> => {
     const home = plan.home;
+    const serviceUrl = plan.serviceUrl ?? cloudApiUrl(env);
+
+    /*
+     * The workspace is discovered, not typed.
+     *
+     * An installation access key is bound to exactly one workspace, so the
+     * service can be asked which one rather than the person. An explicit
+     * --workspace still wins, because automation should not depend on a
+     * network round trip to configure a machine.
+     */
+    let workspaceId = plan.workspaceId;
+    if (plan.backend === 'remote' && !workspaceId && token) {
+      const bound = await discoverWorkspace({ baseUrl: serviceUrl, accessToken: token });
+      workspaceId = bound.workspaceId;
+      io.stdout(`Access key is bound to workspace ${workspaceId}.\n`);
+    }
+    if (plan.backend === 'remote' && !workspaceId) {
+      /*
+       * Signing in through a browser needs an actor identity and a client ID,
+       * which is `synomem auth login`'s job. Rather than write a remote
+       * backend with no workspace -- a configuration that fails on its first
+       * real use -- say exactly what remains.
+       */
+      output(
+        io,
+        global.json,
+        { applied: false, pending: 'sign-in', home, serviceUrl },
+        [
+          '',
+          'Nothing was configured yet: signing in through a browser is a separate step.',
+          '',
+          'Run, with the actor this machine acts as:',
+          '',
+          '  synomem auth login --actor-id <agent> --client-id <client>',
+          '',
+          'Then select the workspace it reports:',
+          '',
+          '  synomem backend use remote --workspace <workspace-id>',
+        ].join('\n'),
+      );
+      return;
+    }
+
     const config = writeSynomemBackend(
       plan.backend === 'local'
         ? { kind: 'local' }
-        : {
-            kind: 'remote',
-            baseUrl: plan.serviceUrl ?? cloudApiUrl(env),
-            workspaceId: plan.workspaceId!,
-          },
+        : { kind: 'remote', baseUrl: serviceUrl, workspaceId: workspaceId! },
       home,
     );
 
@@ -474,7 +569,7 @@ export function createCli(
         // The platform store is the default, and a failure falls back to the
         // restricted file rather than leaving the credential nowhere.
         try {
-          await credentialStore.set(`synomem:${plan.workspaceId}`, {
+          await credentialStore.set(`synomem:${workspaceId}`, {
             kind: 'installation-key',
             accessToken: token,
           });
@@ -559,8 +654,13 @@ export function createCli(
           throw new SynomemError('INVALID_INPUT', 'Pass --backend local or --backend remote.');
         }
         const backend: BackendChoice = options.backend;
-        if (backend === 'remote' && !options.workspace) {
-          throw new SynomemError('INVALID_INPUT', 'Remote setup requires --workspace.');
+        // An access key names its own workspace, so --workspace is only
+        // required when there is no key to ask.
+        if (backend === 'remote' && !options.workspace && !options.accessTokenStdin) {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            'Remote setup requires --workspace, or --access-token-stdin so the key can name its own.',
+          );
         }
         const token = options.accessTokenStdin ? await readAccessToken(promptIo) : undefined;
         if (backend === 'remote' && options.auth === 'access-key' && !token) {
@@ -743,6 +843,92 @@ export function createCli(
         { backend: config.backend },
         `Selected ${config.backend.kind} Synomem backend.`,
       );
+    });
+
+  /*
+   * `show` reads the config file; `status` proves the selection actually works.
+   *
+   * The two are deliberately separate. A person debugging a broken setup needs
+   * to know what is configured even when nothing can be reached, and a person
+   * checking that a setup is live needs a connection to have been made. One
+   * command doing both would make a printed workspace ID look like a reachable
+   * workspace.
+   */
+  backendCommand
+    .command('status')
+    .description('Connect to the selected backend and report what answered')
+    .action(async (_options, command: Command) => {
+      const global = globals(command);
+      const config = readSynomemConfig(global.home);
+      if (!config) {
+        throw new SynomemError(
+          'CONFIG_INVALID',
+          'No Synomem home here yet. Run `synomem config init` first.',
+        );
+      }
+      const result = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli'),
+        async (client) => ({
+          info: await client.info(),
+          capabilities: await client.capabilities(),
+          diagnostics: (await client.doctor()).diagnostics.filter(
+            (item) => item.level === 'error' || item.level === 'warning',
+          ),
+        }),
+      );
+      const { info, capabilities, diagnostics } = result;
+      const where =
+        info.backend === 'local'
+          ? `Home: ${info.home}\nDatabase: ${info.databasePath}`
+          : `URL: ${info.baseUrl}`;
+      const problems = diagnostics.length
+        ? diagnostics
+            .map((item) => `${item.level.toUpperCase()} ${item.code}: ${item.message}`)
+            .join('\n')
+        : 'No warnings or errors.';
+      const human = [
+        `Backend: ${info.backend} (reachable)`,
+        where,
+        `Workspace: ${capabilities.binding.workspaceId}`,
+        `Acting as: ${capabilities.binding.actor.kind} ${capabilities.binding.actor.id}`,
+        problems,
+      ].join('\n');
+      output(io, global.json, { reachable: true, info, capabilities, diagnostics }, human);
+      if (diagnostics.some((item) => item.level === 'error')) cliExitCodes.set(program, 5);
+    });
+
+  const projectionCommand = program
+    .command('projection')
+    .description('Inspect the generated files Synomem derives from events');
+  projectionCommand
+    .command('status')
+    .description('Report whether the generated files match the canonical events')
+    .action(async (_options, command: Command) => {
+      const global = globals(command);
+      const status = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) => {
+        if (!client.projectionStatus) {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            'The remote backend keeps no filesystem projections, so there is nothing to report.',
+          );
+        }
+        return client.projectionStatus();
+      });
+      const enabled = Object.entries(status.settings)
+        .filter(([, on]) => on)
+        .map(([name]) => name);
+      const lines = [
+        `Directory: ${status.directory ?? '(none)'}`,
+        `Enabled: ${enabled.length ? enabled.join(', ') : 'none'}`,
+        `Last rebuilt: ${status.lastRebuiltAt ?? 'never'}`,
+        status.current
+          ? `Current: ${status.counts.manifest} generated file(s) match the events.`
+          : `Stale: ${status.counts.missing} missing, ${status.counts.unexpected} no longer expected. Run \`synomem rebuild\`.`,
+      ];
+      for (const path of status.missing) lines.push(`  missing     ${path}`);
+      for (const path of status.unexpected) lines.push(`  unexpected  ${path}`);
+      output(io, global.json, status, lines.join('\n'));
     });
 
   const authCommand = program.command('auth').description('Inspect remote authentication');
@@ -1245,23 +1431,45 @@ export function createCli(
       },
     );
 
+  /*
+   * With no agent named this answers the question people actually arrive with:
+   * "where is any of my stuff running?". Naming an agent narrows it. Requiring
+   * the agent, as this once did, means you must already know the answer to the
+   * question you came to ask.
+   */
   runtimeCommand
-    .command('list <agent>')
-    .description('List an agent runtime bindings')
-    .action(async (agent: string, _options, command: Command) => {
+    .command('list [agent]')
+    .description('List runtime bindings for one agent, or for every agent')
+    .action(async (agent: string | undefined, _options, command: Command) => {
       const global = globals(command);
-      const bindings = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
-        client.agents.bindings(agent),
+      const result = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli'),
+        async (client) => {
+          if (agent) {
+            const profile = await client.agents.get(agent);
+            return [{ profile, runtimeBindings: await client.agents.bindings(agent) }];
+          }
+          return (await client.agents.directory()).filter(
+            (entry) => entry.runtimeBindings.length > 0,
+          );
+        },
       );
-      const human = bindings.length
-        ? bindings
-            .map(
-              (binding) =>
-                `${binding.id}  ${binding.runtime}${binding.profile ? `/${binding.profile}` : ''}  bound ${binding.boundAt}`,
+      const describe = (binding: AgentRuntimeBinding) =>
+        `  ${binding.id}  ${binding.runtime}${binding.profile ? `/${binding.profile}` : ''}  bound ${binding.boundAt}`;
+      const human = result.length
+        ? result
+            .map((entry) =>
+              [
+                `${entry.profile.handle} (${entry.profile.id})`,
+                ...entry.runtimeBindings.map(describe),
+              ].join('\n'),
             )
             .join('\n')
-        : 'No runtime bindings.';
-      output(io, global.json, { bindings }, human);
+        : agent
+          ? 'No runtime bindings.'
+          : 'No agent in this workspace has a runtime binding.';
+      output(io, global.json, { agents: result }, human);
     });
 
   runtimeCommand

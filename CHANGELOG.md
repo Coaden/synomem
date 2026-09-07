@@ -3,7 +3,48 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
-## [Unreleased]
+## [0.5.0] - 2026-09-07
+
+### Added
+
+- **`synomem backend status`** — connects to the selected backend and reports
+  what answered. `backend show` still reads the configuration file and connects
+  to nothing; a person debugging a broken setup needs that, and a person
+  confirming a working one needs a connection to have been made.
+- **`synomem projection status`** — whether the generated files match the
+  canonical events, when they were last rebuilt, and which ones drifted. The
+  comparison is against Synomem's own manifest, so a file somebody added to the
+  projection tree by hand is not reported as drift.
+- **`synomem remote workspaces`** — the organizations and workspaces a
+  credential can reach, with the IDs `backend use remote --workspace` takes.
+- `agent runtime list` with no agent named lists every agent that runs
+  anywhere. Requiring the agent meant already knowing the answer to the
+  question being asked.
+
+### Changed
+
+- **Remote setup no longer asks for a workspace ID.** An installation access
+  key is bound to exactly one workspace, so the service is asked which one
+  rather than the person; `config init --backend remote --access-token-stdin`
+  needs no `--workspace`. Typing `ws-04psqx2rkt8ttft7a1t2z69r97` from memory
+  was never something a person could do.
+- The Windows credential-store choice is the restricted file rather than
+  Credential Manager, which the credential layer does not implement. Offering a
+  store that cannot read its own credential back fails on first use, after
+  setup has already claimed the credential was safe.
+
+### Fixed
+
+- `doctor` reported every workspace's projections as stale once any agent had a
+  generated ID: the expected-path list was built from canonical IDs while the
+  files, the manifest and the cleanup all used handles.
+- `doctor`'s agent-directory symbolic-link check inspected a path built from the
+  canonical ID, so it examined a directory that does not exist and passed on a
+  workspace whose agent directory really had been replaced with a link.
+
+## [0.4.0] - 2026-09-07
+
+Published as 0.3.0 and 0.4.0 on the same day; the entries below cover both.
 
 ### Changed
 

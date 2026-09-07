@@ -737,6 +737,27 @@ export interface DoctorResult {
   healthy: boolean;
   diagnostics: Diagnostic[];
 }
+/**
+ * What the projected files on disk look like next to what they should be.
+ *
+ * Projections are derived, never canonical, so this reports drift rather than
+ * damage: `missing` and `unexpected` are both repaired by a rebuild, and
+ * neither means an event was lost.
+ */
+export interface ProjectionStatus {
+  /** Where projected files live. Absent on a backend that projects nothing. */
+  directory?: string;
+  settings: SynomemConfig['projection'];
+  /** True when the manifest matches what a rebuild would produce. */
+  current: boolean;
+  /** Recorded by the manifest, not the filesystem; absent before any rebuild. */
+  lastRebuiltAt?: string;
+  counts: { expected: number; manifest: number; missing: number; unexpected: number };
+  /** Expected but not on disk. Capped, because a large workspace has many. */
+  missing: string[];
+  /** On disk and in the manifest, but no longer expected. Capped likewise. */
+  unexpected: string[];
+}
 
 export type SynomemBackendConfig =
   { kind: 'local' } | { kind: 'remote'; baseUrl: string; workspaceId: string };

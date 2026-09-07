@@ -2041,6 +2041,15 @@ export class SynomemStorage implements SynomemRepository {
     ).map((row) => row.path);
   }
 
+  /** The manifest with the time each path was written, newest first. */
+  projectionManifestEntries(): { path: string; generatedAt: string }[] {
+    return (
+      this.db()
+        .prepare('SELECT path, generated_at FROM projection_manifest ORDER BY generated_at DESC')
+        .all() as unknown as { path: string; generated_at: string }[]
+    ).map((row) => ({ path: row.path, generatedAt: row.generated_at }));
+  }
+
   integrityCheck(): string[] {
     const rows = this.db().prepare('PRAGMA integrity_check').all() as unknown as Record<
       string,

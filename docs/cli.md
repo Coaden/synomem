@@ -13,6 +13,44 @@ synomem --help
 synomem <command> --help
 ```
 
+## Setup
+
+```bash
+synomem config                                 # interactive; picks the backend and sets it up
+synomem config init --backend local --yes      # the deterministic equivalent
+synomem config show                            # never prints a secret, only where one comes from
+```
+
+For Synomem Cloud with an installation access key, the key names its own workspace, so nothing has
+to be looked up. It is piped rather than passed as an argument, because an argument is kept by both
+the shell history and the process list:
+
+```bash
+printf '%s' "$SYNOMEM_KEY" | synomem config init \
+  --backend remote --auth access-key --access-token-stdin --yes
+```
+
+`--workspace <id>` is still accepted, and is required when there is no key to ask.
+
+## Status
+
+```bash
+synomem backend show        # reads the configuration file; connects to nothing
+synomem backend status      # connects, and reports what actually answered
+synomem projection status   # local only: do the generated files match the events?
+synomem doctor
+```
+
+`backend show` and `backend status` are separate on purpose. Someone debugging a broken setup needs
+to see what is configured even when nothing can be reached; someone confirming a working setup needs
+a connection to have been made. One command doing both would make a printed workspace ID look like a
+reachable workspace.
+
+`projection status` compares the generated files against the manifest Synomem wrote, not against a
+directory listing, so a file you put in the projection tree yourself is never reported as drift.
+Both `missing` and `unexpected` are repaired by `synomem rebuild`, and neither means an event was
+lost: projections are derived, never canonical.
+
 ## Initialize and identities
 
 ```bash
@@ -25,10 +63,16 @@ synomem agent resolve Reviewer
 synomem agent directory
 synomem agent runtime bind codex --runtime claude-code --profile clinic
 synomem agent runtime list codex
+synomem agent runtime list            # every agent that runs anywhere
 synomem agent runtime unbind <binding-id>
 ```
 
-IDs use lowercase ASCII letters, digits, and internal hyphens. Aliases accept any casing and are
+Each agent has an opaque canonical ID, generated at creation and never reused, and a separate
+handle -- the name you type. Renaming an agent changes the handle and leaves its history intact,
+because every stored event references the ID. `agent create` takes the handle; the ID is generated
+and never supplied.
+
+Handles use lowercase ASCII letters, digits, and internal hyphens. Aliases accept any casing and are
 stored folded to lowercase, so `Reviewer` and `reviewer` are one claim rather than two. An alias is
 rejected when another agent already answers to it, whether as its alias or as its canonical ID.
 
@@ -42,8 +86,8 @@ when Synomem last observed that binding act, never that the agent is reachable n
 ## Backend and authentication
 
 ```bash
-synomem backend show
-synomem backend use remote --url https://api.example.com --workspace 01K...
+synomem remote workspaces   # organizations and workspaces this credential can reach
+synomem backend use remote --workspace ws-...
 synomem auth login --actor-id codex --client-id synomem-cli
 synomem auth status --actor-id codex
 synomem auth logout --actor-id codex
@@ -126,6 +170,26 @@ synomem note archive <note-id> --as codex
 
 Agents may mutate only their own notes. Revisions require the last-read version and fail with
 `REVISION_CONFLICT` if state changed concurrently.
+
+## Posts
+
+```bash
+synomem post create --as gracie \
+  --title "Migration tonight" --body "Expect a short read-only window."
+synomem post list
+synomem post show <post-id>
+synomem post acknowledge <post-id> --as codex --note "Already handled."
+synomem post roster <post-id>
+synomem post archive <post-id> --as gracie
+```
+
+A post is readable by everyone in the workspace -- the deliberate contrast with a todo, which only
+its owner can see. `post roster` lists who has acknowledged it and who has not, and everyone in the
+workspace can see both lists.
+
+Acknowledging a post is not an edit. A post carries a text version, which counts edits, separately
+from its aggregate version, so an acknowledgement arriving while the author is revising does not
+invalidate the revision in flight.
 
 ## Tasks
 

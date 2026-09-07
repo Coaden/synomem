@@ -200,10 +200,18 @@ export class OsCredentialStore implements CredentialStore {
     return result.code === 0;
   }
 
+  /*
+   * Windows Credential Manager is not implemented yet. `cmdkey` can write a
+   * generic credential but deliberately will not read the secret back, so a
+   * store built on it would accept a credential and then never return it --
+   * worse than saying so plainly.
+   */
   private unsupported(): never {
     throw new SynomemError(
       'CONFIG_INVALID',
-      'Interactive credential storage is currently supported on macOS and Linux with secret-tool.',
+      this.platform === 'win32'
+        ? 'Windows Credential Manager storage is not supported yet. Run `synomem config init` and choose the restricted-file store, or set SYNOMEM_ACCESS_TOKEN.'
+        : 'Operating-system credential storage needs the macOS Keychain, or secret-tool on Linux. Run `synomem config init` and choose the restricted-file store, or set SYNOMEM_ACCESS_TOKEN.',
     );
   }
 }

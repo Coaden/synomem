@@ -51,10 +51,17 @@ export function credentialStoreChoices(
     platform === 'darwin'
       ? { value: 'keychain' as const, label: 'macOS Keychain', detail: 'Recommended.' }
       : platform === 'win32'
-        ? {
-            value: 'keychain' as const,
-            label: 'Windows Credential Manager',
-            detail: 'Recommended.',
+        ? /*
+           * Windows has no native option here yet, so the restricted file is
+           * the recommendation rather than Credential Manager. Offering a
+           * store the credential layer cannot actually read back would fail
+           * at the first use, after the wizard had already told the person
+           * their credential was safely stored.
+           */
+          {
+            value: 'file' as const,
+            label: 'A restricted file in the Synomem home',
+            detail: 'Recommended on Windows until Credential Manager support lands.',
           }
         : {
             value: 'keychain' as const,
@@ -63,11 +70,15 @@ export function credentialStoreChoices(
           };
   return [
     native,
-    {
-      value: 'file',
-      label: 'A restricted file in the Synomem home',
-      detail: 'Mode 0600. Use on headless machines with no keyring.',
-    },
+    ...(native.value === 'file'
+      ? []
+      : [
+          {
+            value: 'file' as const,
+            label: 'A restricted file in the Synomem home',
+            detail: 'Mode 0600. Use on headless machines with no keyring.',
+          },
+        ]),
     {
       value: 'environment',
       label: 'Print environment-variable instructions',
@@ -185,10 +196,15 @@ export async function runConfigWizard(
     },
   ]);
 
-  const workspaceId = await ask(io, 'Workspace ID');
-  if (!workspaceId) {
-    throw new SynomemError('INVALID_INPUT', 'A workspace ID is required for the hosted backend.');
-  }
+  /*
+   * Deliberately no workspace prompt here.
+   *
+   * A hosted workspace ID looks like `ws-04psqx2rkt8ttft7a1t2z69r97`, and the
+   * credential authorized in the next step already knows which workspace it
+   * reaches -- an installation key is bound to exactly one, and a browser
+   * sign-in can list the ones the account belongs to. Asking first means
+   * asking a person to go and look something up that we are about to be told.
+   */
 
   const credentialStore =
     auth === 'access-key'
@@ -199,7 +215,7 @@ export async function runConfigWizard(
         )
       : 'auto';
 
-  return { backend, home, serviceUrl, auth, workspaceId, credentialStore };
+  return { backend, home, serviceUrl, auth, credentialStore };
 }
 
 /** Reads an access key without ever accepting it as an argument. */

@@ -58,6 +58,7 @@ import type {
   UpdatePostInput,
   Diagnostic,
   DoctorResult,
+  ProjectionStatus,
   GiveKudosInput,
   GiveKudosResult,
   SendMemoInput,
@@ -1692,6 +1693,41 @@ export class SynomemClient extends SynomemCore implements SynomemService {
     this.projections = projections;
   }
 
+  /*
+   * Answers "would a rebuild change anything, and when did one last run?"
+   *
+   * The comparison is against the manifest rather than a directory walk, so a
+   * file a person dropped into the projection tree by hand is not reported as
+   * drift -- Synomem only claims authority over what it wrote.
+   */
+  async projectionStatus(): Promise<ProjectionStatus> {
+    this.checkAbort();
+    const expected = this.projections.expectedPaths();
+    const entries = this.storage.projectionManifestEntries();
+    const manifest = entries.map((entry) => entry.path);
+    const inManifest = new Set(manifest);
+    const inExpected = new Set(expected);
+    const missing = expected.filter(
+      (path) => !inManifest.has(path) || !existsSync(join(this.home, path)),
+    );
+    const unexpected = manifest.filter((path) => !inExpected.has(path));
+    const limit = 20;
+    return {
+      directory: this.home,
+      settings: { ...this.storage.config.projection },
+      current: missing.length === 0 && unexpected.length === 0,
+      ...(entries[0] ? { lastRebuiltAt: entries[0].generatedAt } : {}),
+      counts: {
+        expected: expected.length,
+        manifest: manifest.length,
+        missing: missing.length,
+        unexpected: unexpected.length,
+      },
+      missing: missing.slice(0, limit),
+      unexpected: unexpected.slice(0, limit),
+    };
+  }
+
   async doctor(): Promise<DoctorResult> {
     this.checkAbort();
     const diagnostics: Diagnostic[] = [];
@@ -1791,7 +1827,11 @@ export class SynomemClient extends SynomemCore implements SynomemService {
           : 'Projection manifest is current.',
       });
       for (const profile of this.storage.listAgents()) {
-        const directory = join(this.home, profile.id);
+        // Named by handle, which is what the projection writers create. Using
+        // the canonical ID here checks a directory that does not exist, which
+        // makes the check pass on a workspace whose agent directory really has
+        // been replaced with a symbolic link.
+        const directory = join(this.home, profile.handle);
         try {
           assertNoSymlinkEscape(this.home, directory);
           if (existsSync(directory) && lstatSync(directory).isSymbolicLink()) {
