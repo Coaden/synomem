@@ -9,8 +9,8 @@ import { tempHome, testClient } from './helpers.js';
 
 async function setupRuntime(home: string) {
   const setup = await testClient(home);
-  await setup.agents.create({ id: 'gracie', displayName: 'Gracie' });
-  await setup.agents.create({ id: 'codex', displayName: 'Codex' });
+  await setup.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+  await setup.agents.create({ handle: 'codex', displayName: 'Codex' });
   await setup.close();
   return connectRuntime(home, { kind: 'agent', id: 'gracie', displayName: 'Gracie' });
 }
@@ -139,7 +139,7 @@ describe('MCP protocol integration', () => {
     expect(result.isError).not.toBe(true);
     expect(result.structuredContent).toMatchObject({
       ok: true,
-      actor: { kind: 'agent', id: 'gracie' },
+      actor: { kind: 'agent' },
       data: { created: true, deduplicated: false },
     });
     const kudosId = (
@@ -202,7 +202,7 @@ describe('MCP protocol integration', () => {
 
     const createAgent = await protocolClient.callTool({
       name: 'synomem_agent_create',
-      arguments: { id: 'mycroft', displayName: 'Mycroft' },
+      arguments: { handle: 'mycroft', displayName: 'Mycroft' },
     });
     expect(createAgent.structuredContent).toMatchObject({ errorCode: 'POLICY_FORBIDDEN' });
 
@@ -280,9 +280,9 @@ describe('MCP protocol integration', () => {
   it('enforces private visibility through tools and resources', async () => {
     const home = tempHome();
     const setup = await testClient(home);
-    await setup.agents.create({ id: 'gracie', displayName: 'Gracie' });
-    await setup.agents.create({ id: 'codex', displayName: 'Codex' });
-    await setup.agents.create({ id: 'mycroft', displayName: 'Mycroft' });
+    await setup.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await setup.agents.create({ handle: 'codex', displayName: 'Codex' });
+    await setup.agents.create({ handle: 'mycroft', displayName: 'Mycroft' });
     await setup.close();
 
     const giver = await testClient(home, { kind: 'agent', id: 'gracie' });
@@ -334,9 +334,9 @@ describe('MCP protocol integration', () => {
   it('keeps private statistics scoped to the configured actor', async () => {
     const home = tempHome();
     const setup = await testClient(home);
-    await setup.agents.create({ id: 'gracie', displayName: 'Gracie' });
-    await setup.agents.create({ id: 'codex', displayName: 'Codex' });
-    await setup.agents.create({ id: 'mycroft', displayName: 'Mycroft' });
+    await setup.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await setup.agents.create({ handle: 'codex', displayName: 'Codex' });
+    await setup.agents.create({ handle: 'mycroft', displayName: 'Mycroft' });
     await setup.kudos.give({
       recipientAgentId: 'gracie',
       title: 'Visible recognition',
@@ -349,6 +349,9 @@ describe('MCP protocol integration', () => {
       reason: 'This should not influence an unrelated actor’s statistics.',
       visibility: 'private',
     });
+    // Stats are keyed by canonical agent ID, not handle: the key has to stay
+    // stable across a rename, and resolving handles belongs in presentation.
+    const gracieId = (await setup.agents.get('gracie')).id;
     await setup.close();
 
     const mycroft = await connectRuntime(
@@ -361,7 +364,7 @@ describe('MCP protocol integration', () => {
       arguments: {},
     });
     expect(result.structuredContent).toMatchObject({
-      data: { stats: { total: 1, byAgent: { gracie: 1 } } },
+      data: { stats: { total: 1, byAgent: { [gracieId]: 1 } } },
     });
     await mycroft.protocolClient.close();
     await mycroft.runtime.client.close();

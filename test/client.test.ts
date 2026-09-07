@@ -4,8 +4,8 @@ import { tempHome, testClient } from './helpers.js';
 
 async function seed(home: string) {
   const human = await testClient(home);
-  await human.agents.create({ id: 'codex', displayName: 'Codex', aliases: ['reviewer'] });
-  await human.agents.create({ id: 'gracie', displayName: 'Gracie' });
+  await human.agents.create({ handle: 'codex', displayName: 'Codex', aliases: ['reviewer'] });
+  await human.agents.create({ handle: 'gracie', displayName: 'Gracie' });
   return human;
 }
 
@@ -13,8 +13,8 @@ describe('SynomemClient identities and events', () => {
   it('creates, resolves, lists, and updates identities without rewriting history', async () => {
     const home = tempHome();
     const client = await seed(home);
-    expect((await client.agents.get('reviewer')).id).toBe('codex');
-    expect((await client.agents.list()).map((agent) => agent.id)).toEqual(['codex', 'gracie']);
+    expect((await client.agents.get('reviewer')).handle).toBe('codex');
+    expect((await client.agents.list()).map((agent) => agent.handle)).toEqual(['codex', 'gracie']);
     const before = client.storage.getEvents();
     await client.agents.update('codex', { displayName: 'Codex Prime', aliases: ['code-reviewer'] });
     expect((await client.agents.get('code-reviewer')).displayName).toBe('Codex Prime');
@@ -27,7 +27,7 @@ describe('SynomemClient identities and events', () => {
     const home = tempHome();
     const client = await seed(home);
     await expect(
-      client.agents.create({ id: 'mycroft', displayName: 'Mycroft', aliases: ['reviewer'] }),
+      client.agents.create({ handle: 'mycroft', displayName: 'Mycroft', aliases: ['reviewer'] }),
     ).rejects.toMatchObject({ code: 'ALIAS_CONFLICT' });
     await client.close();
   });
@@ -135,9 +135,16 @@ describe('SynomemClient identities and events', () => {
       reason: 'A matching system ID must not inherit agent recipient access.',
       visibility: 'private',
     });
+    /*
+     * The system actor deliberately takes the AGENT'S CANONICAL ID, not its
+     * handle. Opaque IDs make an accidental collision far harder — a system
+     * actor called `codex` is now simply a different actor — so the invariant
+     * has to be tested against the id that would actually collide.
+     */
+    const codexId = (await human.agents.get('codex')).id;
     await human.close();
 
-    const system = await testClient(home, { kind: 'system', id: 'codex' });
+    const system = await testClient(home, { kind: 'system', id: codexId });
     await expect(system.kudos.get(privateGiven.record.event.id)).rejects.toMatchObject({
       code: 'POLICY_FORBIDDEN',
     });
@@ -173,7 +180,7 @@ describe('SynomemClient identities and events', () => {
   it('enforces private kudos visibility in the public library API', async () => {
     const home = tempHome();
     const human = await seed(home);
-    await human.agents.create({ id: 'mycroft', displayName: 'Mycroft' });
+    await human.agents.create({ handle: 'mycroft', displayName: 'Mycroft' });
     await human.close();
 
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
@@ -241,7 +248,7 @@ describe('SynomemClient identities and events', () => {
     const readonly = await testClient(home, { kind: 'system', id: 'auditor' }, { readOnly: true });
     expect(await readonly.agents.list()).toHaveLength(2);
     await expect(
-      readonly.agents.create({ id: 'mycroft', displayName: 'Mycroft' }),
+      readonly.agents.create({ handle: 'mycroft', displayName: 'Mycroft' }),
     ).rejects.toBeInstanceOf(SynomemError);
     await readonly.close();
   });

@@ -6,7 +6,7 @@ title: CLI reference
 # CLI reference
 
 `synomem` is noninteractive by default. Add `--json` anywhere for stable machine output and
-`--home <path>` to override `SYNOMEM_HOME` and the default `~/.agents` root.
+`--home <path>` to override `SYNOMEM_HOME` and the default `~/.synomem` root.
 
 ```bash
 synomem --help

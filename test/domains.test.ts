@@ -7,9 +7,9 @@ import { tempHome, testClient } from './helpers.js';
 async function seededHome() {
   const home = tempHome();
   const admin = await testClient(home, { kind: 'human', id: 'troy' });
-  await admin.agents.create({ id: 'codex', displayName: 'Codex' });
-  await admin.agents.create({ id: 'gracie', displayName: 'Gracie' });
-  await admin.agents.create({ id: 'mycroft', displayName: 'Mycroft' });
+  await admin.agents.create({ handle: 'codex', displayName: 'Codex' });
+  await admin.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+  await admin.agents.create({ handle: 'mycroft', displayName: 'Mycroft' });
   await admin.close();
   return home;
 }
@@ -220,7 +220,7 @@ describe('Synomem domains', () => {
   it('keeps actor kinds distinct for private item reads and change feeds', async () => {
     const home = await seededHome();
     const admin = await testClient(home, { kind: 'human', id: 'troy' });
-    await admin.agents.create({ id: 'bob', displayName: 'Agent Bob' });
+    await admin.agents.create({ handle: 'bob', displayName: 'Agent Bob' });
     await admin.close();
 
     const humanBob = await testClient(home, { kind: 'human', id: 'bob' });
@@ -250,7 +250,7 @@ describe('task responses', () => {
   it('requires a reason when rejecting and keeps it in the durable history', async () => {
     const home = tempHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
-    await gracie.agents.create({ id: 'codex', displayName: 'Codex' });
+    await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
     const assigned = await gracie.tasks.create({
       assigneeAgentId: 'codex',
       title: 'Send the migration notice',
@@ -283,7 +283,7 @@ describe('task responses', () => {
   it('allows an acceptance response but does not demand one', async () => {
     const home = tempHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
-    await gracie.agents.create({ id: 'codex', displayName: 'Codex' });
+    await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
     const plain = await gracie.tasks.create({ assigneeAgentId: 'codex', title: 'Plain' });
     const conditional = await gracie.tasks.create({
       assigneeAgentId: 'codex',
@@ -312,7 +312,7 @@ describe('private todos', () => {
   it('is owned by its author and readable by nobody else', async () => {
     const home = tempHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
-    await gracie.agents.create({ id: 'codex', displayName: 'Codex' });
+    await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
     const todo = await gracie.todos.create({
       title: 'Draft the migration checklist',
       details: 'Check the rollback path before the Friday window.',
@@ -357,7 +357,7 @@ describe('private todos', () => {
   it('keeps todos out of another actor’s item list', async () => {
     const home = tempHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
-    await gracie.agents.create({ id: 'codex', displayName: 'Codex' });
+    await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
     await gracie.todos.create({ title: 'Private reminder' });
     const own = await gracie.todos.list();
     expect(own.items).toHaveLength(1);
@@ -393,7 +393,7 @@ describe('unanswered and overdue discovery', () => {
   it('finds work nobody has answered yet, without claiming why', async () => {
     const home = tempHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
-    await gracie.agents.create({ id: 'codex', displayName: 'Codex' });
+    await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
 
     await gracie.tasks.create({ assigneeAgentId: 'codex', title: 'Awaiting a decision' });
     await gracie.memos.send({ recipientAgentId: 'codex', subject: 'Unread', body: 'Please read.' });
@@ -424,7 +424,7 @@ describe('unanswered and overdue discovery', () => {
   it('respects an age filter', async () => {
     const home = tempHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
-    await gracie.agents.create({ id: 'codex', displayName: 'Codex' });
+    await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
     await gracie.tasks.create({ assigneeAgentId: 'codex', title: 'Fresh' });
 
     // Nothing is older than a day yet.
@@ -439,7 +439,7 @@ describe('unanswered and overdue discovery', () => {
   it('reports open work past its deadline and ignores finished work', async () => {
     const home = tempHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
-    await gracie.agents.create({ id: 'codex', displayName: 'Codex' });
+    await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
 
     await gracie.tasks.create({
       assigneeAgentId: 'codex',
@@ -470,7 +470,7 @@ describe('unanswered and overdue discovery', () => {
   it('treats a date-only deadline as the end of that day', async () => {
     const home = tempHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
-    await gracie.agents.create({ id: 'codex', displayName: 'Codex' });
+    await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
     const today = new Date().toISOString().slice(0, 10);
     await gracie.tasks.create({
       assigneeAgentId: 'codex',

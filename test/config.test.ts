@@ -36,7 +36,7 @@ describe('configuration and cancellation', () => {
   it('returns stable typed errors for invalid public API input', async () => {
     const client = await testClient(tempHome());
     await expect(
-      client.agents.create({ id: '../codex', displayName: 'Codex' }),
+      client.agents.create({ handle: '../codex', displayName: 'Codex' }),
     ).rejects.toMatchObject({
       code: 'INVALID_INPUT',
     });

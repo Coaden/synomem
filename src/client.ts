@@ -106,7 +106,11 @@ export interface SynomemCoreOptions {
 }
 
 export class SynomemCore implements SynomemDomainService {
-  readonly actor: ActorIdentity;
+  /**
+   * Mutable because an agent actor is resolved to its canonical identity on
+   * init: callers name a handle, events record the opaque ID.
+   */
+  actor: ActorIdentity;
   private readonly repository: SynomemRepository;
   private readonly projectionWriter: ProjectionWriter;
   private readonly clock: () => Date;
@@ -121,6 +125,11 @@ export class SynomemCore implements SynomemDomainService {
     get: (idOrAlias: string) => this.getAgent(idOrAlias),
     list: () => this.listAgents(),
     resolve: (query: string) => this.resolveAgent(query),
+    archive: (idOrAlias: string) => this.setAgentStatus(idOrAlias, 'archived'),
+    restore: (idOrAlias: string) => this.setAgentStatus(idOrAlias, 'active'),
+    addAliases: (idOrAlias: string, aliases: string[]) => this.addAgentAliases(idOrAlias, aliases),
+    removeAliases: (idOrAlias: string, aliases: string[]) =>
+      this.removeAgentAliases(idOrAlias, aliases),
     directory: () => this.agentDirectory(),
     bindings: (idOrAlias: string) => this.listRuntimeBindings(idOrAlias),
     bindRuntime: (input: BindRuntimeInput) => this.bindRuntime(input),
@@ -271,6 +280,30 @@ export class SynomemCore implements SynomemDomainService {
     if (this.initialized) return;
     await this.repository.init();
     this.initialized = true;
+
+    /*
+     * An agent actor is resolved to its canonical identity here.
+     *
+     * Callers name a handle because that is what people and harnesses know,
+     * but every event must record the opaque ID — otherwise renaming a handle
+     * would orphan the history written under the old one. The display name
+     * comes from the profile for the same reason a harness cannot assert it on
+     * the command line: the stored record is the authority, not the argument.
+     *
+     * An unresolvable name is left as given rather than rejected, so a system
+     * actor can still create the agent that does not exist yet. Writing as an
+     * unknown agent is refused later by the checks that already exist.
+     */
+    if (this.actor.kind === 'agent') {
+      const resolved = await this.repository.resolveAgent(this.actor.id);
+      if (resolved.match) {
+        this.actor = {
+          kind: 'agent',
+          id: resolved.match.id,
+          ...(resolved.match.displayName ? { displayName: resolved.match.displayName } : {}),
+        };
+      }
+    }
   }
 
   async close(): Promise<void> {
@@ -314,20 +347,29 @@ export class SynomemCore implements SynomemDomainService {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
     const parsed = this.validate(() => createAgentSchema.parse(input));
-    if (await this.repository.getAgent(parsed.id)) {
-      throw new SynomemError('AGENT_EXISTS', `Agent or alias already exists: ${parsed.id}`);
+    if (await this.repository.getAgent(parsed.handle)) {
+      throw new SynomemError('AGENT_EXISTS', `Agent or alias already exists: ${parsed.handle}`);
     }
     const aliases = [...new Set(parsed.aliases ?? [])].sort();
-    if (aliases.includes(parsed.id)) {
-      throw new SynomemError('ALIAS_CONFLICT', 'An agent cannot use its own ID as an alias.');
+    if (aliases.includes(parsed.handle)) {
+      throw new SynomemError('ALIAS_CONFLICT', 'An agent cannot use its own handle as an alias.');
     }
     for (const alias of aliases) {
       if (await this.repository.getAgent(alias)) {
         throw new SynomemError('ALIAS_CONFLICT', `Alias already belongs to an agent: ${alias}`);
       }
     }
+    /*
+     * The canonical ID is generated here and never supplied by the caller.
+     * Every event references it permanently, so it has to be free of meaning:
+     * a caller that could choose it could choose one that collides with an
+     * archived agent's history, and a meaningful ID becomes a handle nobody can
+     * rename.
+     */
     const profile: AgentProfile = {
-      id: parsed.id,
+      id: this.nextId(),
+      handle: parsed.handle,
+      status: 'active',
       displayName: parsed.displayName,
       ...(aliases.length ? { aliases } : {}),
       ...(parsed.description !== undefined ? { description: parsed.description } : {}),
@@ -355,8 +397,20 @@ export class SynomemCore implements SynomemDomainService {
     const existing = await this.repository.getAgent(idOrAlias);
     if (!existing) throw new SynomemError('AGENT_NOT_FOUND', `Unknown agent: ${idOrAlias}`);
     const aliases = parsed.aliases ? [...new Set(parsed.aliases)].sort() : existing.aliases;
-    if (aliases?.includes(existing.id)) {
-      throw new SynomemError('ALIAS_CONFLICT', 'An agent cannot use its own ID as an alias.');
+    const handle = parsed.handle ?? existing.handle;
+    if (aliases?.includes(handle)) {
+      throw new SynomemError('ALIAS_CONFLICT', 'An agent cannot use its own handle as an alias.');
+    }
+    // Renaming the handle is allowed and is why the canonical ID exists, but a
+    // handle another agent already answers to is still refused.
+    if (parsed.handle && parsed.handle !== existing.handle) {
+      const owner = await this.repository.getAgent(parsed.handle);
+      if (owner && owner.id !== existing.id) {
+        throw new SynomemError(
+          'ALIAS_CONFLICT',
+          `Handle already belongs to ${owner.id}: ${parsed.handle}`,
+        );
+      }
     }
     for (const alias of aliases ?? []) {
       const owner = await this.repository.getAgent(alias);
@@ -382,6 +436,52 @@ export class SynomemCore implements SynomemDomainService {
     });
     await this.projectionWriter.syncAgent(updated.id);
     return updated;
+  }
+
+  /**
+   * Archiving stops an agent acting without erasing it.
+   *
+   * Events reference the actor permanently, so deleting an agent would leave
+   * history pointing at nothing. Archived agents keep their records and their
+   * handle, and can be restored.
+   */
+  private async setAgentStatus(
+    idOrAlias: string,
+    status: 'active' | 'archived',
+  ): Promise<AgentProfile> {
+    this.checkAbort();
+    await this.repository.assertEventCompatibility();
+    this.validate(() => agentLookupSchema.parse(idOrAlias));
+    const existing = await this.repository.getAgent(idOrAlias);
+    if (!existing) throw new SynomemError('AGENT_NOT_FOUND', `Unknown agent: ${idOrAlias}`);
+    if (existing.status === status) return existing;
+    const updated: AgentProfile = { ...existing, status };
+    await this.repository.transaction(async () => {
+      const event: SynomemEvent = {
+        ...this.eventBase(existing.id, await this.repository.nextAggregateVersion(existing.id)),
+        type: 'agent.updated',
+        agentId: existing.id,
+        changes: { status },
+      };
+      await this.repository.updateAgent(updated, event.createdAt);
+      await this.repository.insertEvent(event);
+    });
+    await this.projectionWriter.syncAgent(updated.id);
+    return updated;
+  }
+
+  /** Adds aliases without disturbing the ones already there. */
+  private async addAgentAliases(idOrAlias: string, add: string[]): Promise<AgentProfile> {
+    const existing = await this.getAgent(idOrAlias);
+    const merged = [...new Set([...(existing.aliases ?? []), ...add])].sort();
+    return await this.updateAgent(existing.id, { aliases: merged });
+  }
+
+  private async removeAgentAliases(idOrAlias: string, remove: string[]): Promise<AgentProfile> {
+    const existing = await this.getAgent(idOrAlias);
+    const drop = new Set(remove.map((alias) => alias.trim().toLowerCase()));
+    const kept = (existing.aliases ?? []).filter((alias) => !drop.has(alias));
+    return await this.updateAgent(existing.id, { aliases: kept });
   }
 
   private async getAgent(idOrAlias: string): Promise<AgentProfile> {
@@ -1441,10 +1541,34 @@ export class SynomemCore implements SynomemDomainService {
     return await this.getTodoRecord(input.todoId);
   }
 
+  /**
+   * Turns an agent name in a filter into the canonical ID the records hold.
+   *
+   * Callers filter by the name they know — a handle or an alias — while every
+   * record stores the opaque ID. Without this the filter silently matches
+   * nothing, which reads as "there is nothing here" rather than "that name
+   * means something else now".
+   *
+   * An unresolvable name is passed through unchanged so it can match a legacy
+   * name-shaped ID rather than being swallowed.
+   */
+  private async canonicalAgentId(name: string | undefined): Promise<string | undefined> {
+    if (!name) return name;
+    const resolved = await this.repository.resolveAgent(name);
+    return resolved.match?.id ?? name;
+  }
+
   private async listItems(input: ItemListInput): Promise<Page<ItemSummary>> {
     this.checkAbort();
     const parsed = this.validate(() => itemListInputSchema.parse(input));
-    return await this.repository.listItemSummaries(parsed, this.actor);
+    const resolved = {
+      ...parsed,
+      ...(parsed.participantAgentId
+        ? { participantAgentId: await this.canonicalAgentId(parsed.participantAgentId) }
+        : {}),
+      ...(parsed.actorId ? { actorId: await this.canonicalAgentId(parsed.actorId) } : {}),
+    };
+    return await this.repository.listItemSummaries(resolved, this.actor);
   }
   private async listItemChanges(input: ChangesInput): Promise<ChangePage> {
     this.checkAbort();
@@ -1539,8 +1663,8 @@ export class SynomemCore implements SynomemDomainService {
  * check that silently lags the migration runner reports a healthy database as
  * broken.
  */
-const CURRENT_SCHEMA_VERSION = 6;
-const EXPECTED_APPLIED_MIGRATIONS = [1, 2, 3, 4, 5, 6];
+const CURRENT_SCHEMA_VERSION = 7;
+const EXPECTED_APPLIED_MIGRATIONS = [1, 2, 3, 4, 5, 6, 7];
 
 export class SynomemClient extends SynomemCore implements SynomemService {
   readonly home: string;

@@ -314,7 +314,7 @@ export function createCli(
       'Local-first communication, memory, recognition, and task infrastructure for agents',
     )
     .version(packageVersion())
-    .option('--home <path>', 'storage root (defaults to SYNOMEM_HOME or ~/.agents)')
+    .option('--home <path>', 'storage root (defaults to SYNOMEM_HOME or ~/.synomem)')
     .option('--json', 'emit stable machine-readable JSON', false)
     .showSuggestionAfterError()
     .configureOutput({ writeOut: io.stdout, writeErr: io.stderr });
@@ -599,14 +599,14 @@ export function createCli(
     .command('agent')
     .description('Create and inspect stable agent identities');
   agentCommand
-    .command('create <id>')
-    .description('Create a stable agent profile')
+    .command('create <handle>')
+    .description('Create an agent. The canonical ID is generated, not chosen.')
     .requiredOption('--name <display-name>', 'display name')
-    .option('--alias <id>', 'alias (repeatable)', collect, [])
+    .option('--alias <name>', 'alias (repeatable)', collect, [])
     .option('--description <text>')
     .action(
       async (
-        id: string,
+        handle: string,
         options: { name: string; alias: string[]; description?: string },
         command: Command,
       ) => {
@@ -616,15 +616,86 @@ export function createCli(
           defaultActor(env, 'system', 'cli'),
           (client) =>
             client.agents.create({
-              id,
+              handle,
               displayName: options.name,
               ...(options.alias.length ? { aliases: options.alias } : {}),
               ...(options.description ? { description: options.description } : {}),
             }),
         );
-        output(io, global.json, profile, `Created ${profile.displayName} (${profile.id})`);
+        // Both are printed because both matter: the handle is what people type,
+        // the ID is what every event records and what MCP registration uses.
+        output(
+          io,
+          global.json,
+          profile,
+          `Created ${profile.displayName}\n\nHandle:   ${profile.handle}\nAgent ID: ${profile.id}`,
+        );
       },
     );
+
+  const aliasCommand = agentCommand
+    .command('alias')
+    .description('Add or remove discovery aliases without replacing the set');
+
+  aliasCommand
+    .command('add <agent> <alias...>')
+    .description('Add aliases, keeping the ones already there')
+    .action(async (agent: string, aliases: string[], _options, command: Command) => {
+      const global = globals(command);
+      const profile = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
+        client.agents.addAliases(agent, aliases),
+      );
+      output(io, global.json, profile, `Aliases: ${(profile.aliases ?? []).join(', ') || 'none'}`);
+    });
+
+  aliasCommand
+    .command('remove <agent> <alias...>')
+    .description('Remove aliases, keeping the rest')
+    .action(async (agent: string, aliases: string[], _options, command: Command) => {
+      const global = globals(command);
+      const profile = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
+        client.agents.removeAliases(agent, aliases),
+      );
+      output(io, global.json, profile, `Aliases: ${(profile.aliases ?? []).join(', ') || 'none'}`);
+    });
+
+  agentCommand
+    .command('rename <agent> <handle>')
+    .description('Change an agent handle. Its canonical ID never changes.')
+    .action(async (agent: string, handle: string, _options, command: Command) => {
+      const global = globals(command);
+      const profile = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
+        client.agents.update(agent, { handle }),
+      );
+      output(
+        io,
+        global.json,
+        profile,
+        `Handle:   ${profile.handle}\nAgent ID: ${profile.id} (unchanged)`,
+      );
+    });
+
+  agentCommand
+    .command('archive <agent>')
+    .description('Stop an agent acting, keeping its records and history')
+    .action(async (agent: string, _options, command: Command) => {
+      const global = globals(command);
+      const profile = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
+        client.agents.archive(agent),
+      );
+      output(io, global.json, profile, `Archived ${profile.handle} (${profile.id})`);
+    });
+
+  agentCommand
+    .command('restore <agent>')
+    .description('Let an archived agent act again')
+    .action(async (agent: string, _options, command: Command) => {
+      const global = globals(command);
+      const profile = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
+        client.agents.restore(agent),
+      );
+      output(io, global.json, profile, `Restored ${profile.handle} (${profile.id})`);
+    });
 
   const skillCommand = program
     .command('skill')
@@ -750,7 +821,11 @@ export function createCli(
         ? agents
             .map(
               (profile) =>
-                `${profile.id}  ${profile.displayName}${profile.aliases?.length ? `  aliases: ${profile.aliases.join(', ')}` : ''}`,
+                // Handle first: it is what people type. The canonical ID
+                // follows because MCP registration needs it.
+                `${profile.handle}  ${profile.displayName}${
+                  profile.status === 'archived' ? '  [archived]' : ''
+                }${profile.aliases?.length ? `  aliases: ${profile.aliases.join(', ')}` : ''}\n  ${profile.id}`,
             )
             .join('\n')
         : 'No agents configured.';
@@ -769,7 +844,7 @@ export function createCli(
         io,
         global.json,
         profile,
-        `${profile.displayName} (${profile.id})\n${profile.description ?? 'No description.'}`,
+        `${profile.displayName}\n\nHandle:   ${profile.handle}\nAgent ID: ${profile.id}\nStatus:   ${profile.status}\n\n${profile.description ?? 'No description.'}`,
       );
     });
 
@@ -1983,14 +2058,15 @@ export function createCli(
               );
             }
             const capabilities = await client.capabilities();
-            const path = join(info.home, profile.id, 'WINS.md');
+            // Projections are written under the handle, since they exist to be read.
+            const path = join(info.home, profile.handle, 'WINS.md');
             if (!existsSync(path)) {
               const hint = capabilities.projections.writeWinsMarkdown
                 ? 'Run `synomem rebuild` to generate it.'
                 : 'Enable projection.writeWinsMarkdown and run `synomem rebuild`.';
               throw new SynomemError(
                 'INVALID_INPUT',
-                `No generated WINS.md exists for ${profile.id}. ${hint}`,
+                `No generated WINS.md exists for ${profile.handle}. ${hint}`,
               );
             }
             return { profile, path, content: readFileSync(path, 'utf8') };

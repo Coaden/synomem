@@ -73,7 +73,14 @@ export const configSchema = policySchema.extend({
 });
 
 export function resolveHome(explicitHome?: string): string {
-  const candidate = explicitHome ?? process.env.SYNOMEM_HOME ?? resolve(homedir(), '.agents');
+  /*
+   * `~/.synomem`, resolved as an exact directory.
+   *
+   * No detection of or migration from `~/.agents`: the project is greenfield,
+   * and code that quietly moves somebody's database is worse than a clear
+   * message telling them where the new home is.
+   */
+  const candidate = explicitHome ?? process.env.SYNOMEM_HOME ?? resolve(homedir(), '.synomem');
   if (candidate.includes('\0')) throw new SynomemError('UNSAFE_PATH', 'Storage home contains NUL.');
   return resolve(candidate);
 }

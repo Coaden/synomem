@@ -16,7 +16,7 @@ describe('domain service boundary', () => {
     });
     await service.init();
 
-    await service.agents.create({ id: 'codex', displayName: 'Codex' });
+    await service.agents.create({ handle: 'codex', displayName: 'Codex' });
     const memo = await service.memos.send({
       recipientAgentId: 'codex',
       subject: 'Repository boundary',
@@ -36,7 +36,7 @@ describe('domain service boundary', () => {
       actor: { kind: 'human', id: 'owner', displayName: 'Owner' },
     });
     await administrator.init();
-    await administrator.agents.create({ id: 'codex', displayName: 'Codex' });
+    await administrator.agents.create({ handle: 'codex', displayName: 'Codex' });
     const kudos = await administrator.kudos.give({
       recipientAgentId: 'codex',
       title: 'Explicit authority',
@@ -78,7 +78,7 @@ describe('domain service boundary', () => {
       projections: { writeWinsMarkdown: true },
     });
 
-    await service.agents.create({ id: 'codex', displayName: 'Codex' });
+    await service.agents.create({ handle: 'codex', displayName: 'Codex' });
     const result = await service.kudos.give({
       recipientAgentId: 'codex',
       title: 'Preserved the domain boundary',

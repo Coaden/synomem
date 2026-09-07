@@ -179,6 +179,30 @@ export class RemoteSynomemService implements SynomemService {
         'GET',
         `agents/resolve?query=${encodeURIComponent(query)}`,
       ),
+    archive: (idOrAlias: string) =>
+      this.mutation<Awaited<ReturnType<SynomemService['agents']['archive']>>>(
+        'POST',
+        `agents/${encodeURIComponent(idOrAlias)}/archive`,
+        {},
+      ),
+    restore: (idOrAlias: string) =>
+      this.mutation<Awaited<ReturnType<SynomemService['agents']['restore']>>>(
+        'POST',
+        `agents/${encodeURIComponent(idOrAlias)}/restore`,
+        {},
+      ),
+    addAliases: (idOrAlias: string, aliases: string[]) =>
+      this.mutation<Awaited<ReturnType<SynomemService['agents']['addAliases']>>>(
+        'POST',
+        `agents/${encodeURIComponent(idOrAlias)}/aliases`,
+        { aliases },
+      ),
+    removeAliases: (idOrAlias: string, aliases: string[]) =>
+      this.mutation<Awaited<ReturnType<SynomemService['agents']['removeAliases']>>>(
+        'POST',
+        `agents/${encodeURIComponent(idOrAlias)}/aliases/remove`,
+        { aliases },
+      ),
     directory: () =>
       this.request<Awaited<ReturnType<SynomemService['agents']['directory']>>>(
         'GET',

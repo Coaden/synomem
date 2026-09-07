@@ -84,7 +84,7 @@ describe('CLI', () => {
     const sourceHome = tempHome();
     const source = new SynomemClient({ home: sourceHome });
     await source.init();
-    await source.agents.create({ id: 'codex', displayName: 'Codex' });
+    await source.agents.create({ handle: 'codex', displayName: 'Codex' });
     await source.close();
     const targetHome = tempHome();
     let captured = capture();
@@ -311,7 +311,7 @@ describe('CLI', () => {
       ),
     ).toBe(0);
     expect(JSON.parse(captured.stdout.join(''))).toMatchObject({
-      id: 'codex',
+      handle: 'codex',
       displayName: 'Codex',
     });
 
@@ -359,7 +359,7 @@ describe('CLI', () => {
     const home = tempHome();
     const client = new SynomemClient({ home, actor: { kind: 'human', id: 'troy' } });
     await client.init();
-    await client.agents.create({ id: 'codex', displayName: 'Codex' });
+    await client.agents.create({ handle: 'codex', displayName: 'Codex' });
     client.storage
       .db()
       .prepare(
@@ -389,7 +389,7 @@ describe('CLI', () => {
       config: { projection: { writeWinsMarkdown: false } },
     });
     await client.init();
-    await client.agents.create({ id: 'codex', displayName: 'Codex' });
+    await client.agents.create({ handle: 'codex', displayName: 'Codex' });
     await client.close();
 
     const captured = capture();

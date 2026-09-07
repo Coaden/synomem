@@ -17,12 +17,34 @@ const reservedIds = new Set([
   'lpt1',
 ]);
 
-export const agentIdSchema = z
+/**
+ * A handle: the human-friendly name for an agent, unique within its workspace.
+ *
+ * Mutable, unlike the canonical ID. People and agents type this, so it stays
+ * lowercase kebab and refuses the reserved words that would collide with
+ * filesystem or route segments.
+ */
+export const agentHandleSchema = z
   .string()
   .min(1)
   .max(63)
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Use lowercase ASCII letters, digits, and hyphens')
-  .refine((id) => !reservedIds.has(id), 'Reserved agent ID');
+  .refine((handle) => !reservedIds.has(handle), 'Reserved agent handle');
+
+/** A canonical opaque agent ID: a ULID, uppercase Crockford base32. */
+export const agentUlidSchema = z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+
+/**
+ * An actor ID as it appears in an event.
+ *
+ * Accepts a ULID or a handle-shaped name. New agents are created with an opaque
+ * ULID so a handle can be renamed without orphaning the events that reference
+ * the actor; agents that predate that, and human and system actors, carry a
+ * name-shaped ID. Widening rather than replacing keeps append-only history
+ * readable — rewriting the actor ID inside stored events to tidy the format
+ * would be exactly the rewrite the event log exists to prevent.
+ */
+export const agentIdSchema = z.union([agentUlidSchema, agentHandleSchema]);
 
 /**
  * An alias as written, folded to the canonical lowercase form.
@@ -110,16 +132,42 @@ export const evidenceSchema = z
   });
 
 export const profileSchema = z.object({
+  /** Canonical, opaque and immutable. Events reference this, never the handle. */
   id: agentIdSchema,
+  handle: agentHandleSchema,
   displayName: z.string().trim().min(1).max(200),
   aliases: z.array(agentAliasSchema).max(50).optional(),
   description: z.string().trim().max(2000).optional(),
+  /** Archived agents keep their history and stop being able to act. */
+  status: z.enum(['active', 'archived']).default('active'),
   createdAt: z.string().datetime({ offset: true }),
   metadata: metadataSchema.optional(),
 });
 
-export const createAgentSchema = profileSchema.omit({ createdAt: true });
-export const updateAgentSchema = createAgentSchema.omit({ id: true }).partial();
+/**
+ * Creating an agent names a handle; the canonical ID is generated, never
+ * supplied. A caller that could choose the ID could choose one that collides
+ * with an archived agent's history.
+ */
+export const createAgentSchema = z
+  .object({
+    handle: agentHandleSchema,
+    displayName: z.string().trim().min(1).max(200),
+    aliases: z.array(agentAliasSchema).max(50).optional(),
+    description: z.string().trim().max(2000).optional(),
+    metadata: metadataSchema.optional(),
+  })
+  .strict();
+
+export const updateAgentSchema = z
+  .object({
+    handle: agentHandleSchema.optional(),
+    displayName: z.string().trim().min(1).max(200).optional(),
+    aliases: z.array(agentAliasSchema).max(50).optional(),
+    description: z.string().trim().max(2000).optional(),
+    metadata: metadataSchema.optional(),
+  })
+  .strict();
 
 /**
  * A runtime binding is a claim about where an agent runs, so the fields stay
@@ -196,7 +244,14 @@ const agentCreatedSchema = baseEventSchema.extend({
 const agentUpdatedSchema = baseEventSchema.extend({
   type: z.literal('agent.updated'),
   agentId: agentIdSchema,
-  changes: updateAgentSchema,
+  /*
+   * Archiving is recorded as an update, so `status` belongs in the event even
+   * though callers cannot set it through `agents.update` — it moves through
+   * `archive` and `restore`, which keep the transition explicit.
+   */
+  changes: updateAgentSchema.extend({
+    status: z.enum(['active', 'archived']).optional(),
+  }),
 });
 
 const memoSentSchema = baseEventSchema.extend({

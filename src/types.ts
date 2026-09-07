@@ -28,10 +28,22 @@ export interface EvidenceReference {
 }
 
 export interface AgentProfile {
+  /**
+   * Canonical, opaque, immutable. Every event references this, so it can never
+   * change — which is exactly why the handle exists separately.
+   */
   id: string;
+  /** The human-friendly name, unique in the workspace and safe to rename. */
+  handle: string;
   displayName: string;
   aliases?: string[];
   description?: string;
+  /**
+   * Archived agents keep their history and stop being able to act. Events
+   * reference the actor permanently, so deletion would leave history pointing
+   * at nothing.
+   */
+  status: 'active' | 'archived';
   createdAt: string;
   metadata?: Record<string, JsonValue>;
 }
@@ -684,13 +696,15 @@ export interface BindRuntimeInput {
 }
 
 export interface CreateAgentInput {
-  id: string;
+  /** The handle. The canonical ID is generated, never supplied. */
+  handle: string;
   displayName: string;
   aliases?: string[];
   description?: string;
   metadata?: Record<string, JsonValue>;
 }
 export interface UpdateAgentInput {
+  handle?: string;
   displayName?: string;
   aliases?: string[];
   description?: string;

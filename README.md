@@ -51,7 +51,7 @@ and opens no network listener.
 ```bash
 npm install --global synomem
 
-export SYNOMEM_HOME="$(mktemp -d)/.agents"
+export SYNOMEM_HOME="$(mktemp -d)/.synomem"
 synomem init
 synomem agent create codex --name "Codex"
 synomem agent create gracie --name "Gracie"
@@ -93,12 +93,12 @@ terminal-capable agent. The Synomem package contains the portable
 installer for the six named local harnesses.
 
 ```text
-Set up Synomem for this agent and runtime. Synomem is a local-first coordination system for durable kudos, one-to-one memos, private agent notes, consent-based assigned tasks, and private todos. It uses an append-only SQLite database under ~/.agents by default, an actor-bound stdio MCP server, and a portable Agent Skill. Multiple local agents may share the database, but every MCP server must be bound to its own stable identity.
+Set up Synomem for this agent and runtime. Synomem is a local-first coordination system for durable kudos, one-to-one memos, private agent notes, consent-based assigned tasks, and private todos. It uses an append-only SQLite database under ~/.synomem by default, an actor-bound stdio MCP server, and a portable Agent Skill. Multiple local agents may share the database, but every MCP server must be bound to its own stable identity.
 
 Work autonomously through the safe, reversible steps below. Do not expose secrets, overwrite unrelated configuration, invent an identity, use --force without my explicit approval, or modify another agent's integration.
 
 1. Verify Node.js 22.13+ and npm are available. Install or update the public package with `npm install --global synomem` if needed, then report `synomem --version`.
-2. Preserve an existing `SYNOMEM_HOME`; otherwise use the default ~/.agents. Run `synomem init`, then `synomem doctor`. Never point tests or experiments at another Synomem home.
+2. Preserve an existing `SYNOMEM_HOME`; otherwise use the default ~/.synomem. Run `synomem init`, then `synomem doctor`. Never point tests or experiments at another Synomem home.
 3. Run `synomem agent list`. Determine this agent's existing stable ID from the current harness or Synomem configuration and reuse it. If no identity is clearly established, ask me for the agent ID and display name before running `synomem agent create <id> --name <name>`. Never silently merge or rename identities.
 4. Detect the current harness from actual local evidence and its installed CLI help. Use runtime `claude` for Claude Code, `codex` for Codex, `hermes` for Hermes, `openclaw` for OpenClaw, `cursor` for Cursor, or `grok` for local Grok Build (`grokbot` is accepted as an alias). Check `synomem skill install --help`, then preview with `synomem skill install --runtime <runtime> --agent <agent-id>`. Review the exact destination and apply the same command with `--yes`; it must report `current`. If the installed release does not yet list this runtime, locate the packaged source under the global npm root at `synomem/skills/synomem` and follow the verified destination and conflict rules in https://github.com/Coaden/synomem/blob/main/docs/skill.md instead. Do not guess a path, overwrite an existing skill, or create a fake harness home to make an unavailable runtime appear installed.
 5. Inspect any actor-bound MCP registration command printed by the installer. Check the harness's existing MCP list/config first, then run the command only if `synomem` is absent or incorrect. Do not create duplicates. Cursor has no noninteractive MCP-add command: carefully merge a `synomem` stdio entry into its documented user `~/.cursor/mcp.json`, using command `synomem-mcp` and the single argument `--agent-id <agent-id>` (the display name and kind come from the agent's profile, so nothing in a shared config file asserts an identity); preserve every existing entry.
@@ -202,7 +202,7 @@ are `claude`, `codex`, `hermes`, `openclaw`, `cursor`, and `grok`; `grokbot` ali
 ## Storage
 
 ```text
-~/.agents/
+~/.synomem/
 ├── synomem/
 │   ├── config.json
 │   └── synomem.sqlite3

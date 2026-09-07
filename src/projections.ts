@@ -550,7 +550,7 @@ export class ProjectionManager implements ProjectionWriter {
     const generated: string[] = [];
 
     for (const profile of profiles) {
-      const agentDirectory = join(this.storage.home, profile.id);
+      const agentDirectory = join(this.storage.home, profile.handle);
       assertNoSymlinkEscape(this.storage.home, agentDirectory);
       ensureDirectory(agentDirectory);
       const profilePath = join(agentDirectory, 'profile.json');
@@ -656,7 +656,7 @@ export class ProjectionManager implements ProjectionWriter {
       (record) => record.event.assigneeAgentId === profile.id,
     );
     const rebuiltAt = events.at(-1)?.createdAt ?? new Date(0).toISOString();
-    const agentDirectory = join(this.storage.home, profile.id);
+    const agentDirectory = join(this.storage.home, profile.handle);
     const inboxDirectory = join(agentDirectory, 'inbox');
     const kudosInboxDirectory = join(inboxDirectory, 'kudos');
     const memoInboxDirectory = join(inboxDirectory, 'memos');
@@ -729,7 +729,7 @@ export class ProjectionManager implements ProjectionWriter {
     }
 
     const keep = new Set(generated);
-    const prefixes = [`${profile.id}/`, `${profile.id}\\`];
+    const prefixes = [`${profile.handle}/`, `${profile.handle}\\`];
     const removed: string[] = [];
     for (const stale of this.storage
       .projectionManifest()
@@ -745,7 +745,7 @@ export class ProjectionManager implements ProjectionWriter {
       unlinkSync(path);
       removed.push(stale);
     }
-    this.storage.replaceAgentProjectionManifest(profile.id, generated, rebuiltAt);
+    this.storage.replaceAgentProjectionManifest(profile.handle, generated, rebuiltAt);
     return { generated: generated.sort(), removed: removed.sort() };
   }
 

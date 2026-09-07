@@ -79,6 +79,10 @@ export interface SynomemDomainService {
     get(idOrAlias: string): Promise<AgentProfile>;
     list(): Promise<AgentProfile[]>;
     resolve(query: string): Promise<AgentResolution>;
+    archive(idOrAlias: string): Promise<AgentProfile>;
+    restore(idOrAlias: string): Promise<AgentProfile>;
+    addAliases(idOrAlias: string, aliases: string[]): Promise<AgentProfile>;
+    removeAliases(idOrAlias: string, aliases: string[]): Promise<AgentProfile>;
     directory(): Promise<AgentDirectoryEntry[]>;
     bindings(idOrAlias: string): Promise<AgentRuntimeBinding[]>;
     bindRuntime(input: BindRuntimeInput): Promise<AgentRuntimeBinding>;

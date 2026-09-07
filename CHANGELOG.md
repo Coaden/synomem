@@ -5,6 +5,29 @@ All notable changes will be documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Agents have an opaque canonical ID and a separate handle.** `agent create
+  <handle>` generates a ULID; the handle is what people type and can be renamed
+  with `agent rename` without orphaning the events written under the old name.
+  Events, rosters and statistics key on the canonical ID.
+- The default home is `~/.synomem`. There is no detection of or migration from
+  `~/.agents`, per the greenfield policy.
+- Projection directories are named by handle, since they exist to be read.
+
+### Added
+
+- `agent rename`, `agent archive`, `agent restore`, and `agent alias add` /
+  `alias remove`, which add and remove aliases without replacing the set.
+- The MCP server reports the canonical actor rather than the requested name, so
+  a misconfigured runtime cannot appear to act as somebody it is not.
+
+### Schema
+
+- Version 7 adds `agents.handle` (backfilled from the ID, uniquely indexed) and
+  `agents.status`. Existing agents keep their name-shaped ID; only new agents
+  get a generated one.
+
 ### Added
 
 - Posts: publication to everyone in a workspace, with per-actor acknowledgements

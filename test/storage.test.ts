@@ -20,7 +20,7 @@ describe('SQLite storage and projections', () => {
   it('enforces append-only canonical events at the database layer', async () => {
     const home = tempHome();
     const client = await testClient(home);
-    await client.agents.create({ id: 'codex', displayName: 'Codex' });
+    await client.agents.create({ handle: 'codex', displayName: 'Codex' });
     expect(() => client.storage.db().prepare("UPDATE events SET type = 'changed'").run()).toThrow(
       /append-only/,
     );
@@ -31,7 +31,7 @@ describe('SQLite storage and projections', () => {
   it('builds escaped deterministic projections and preserves human-owned files', async () => {
     const home = tempHome();
     const client = await testClient(home);
-    await client.agents.create({ id: 'codex', displayName: 'Codex <Prime>' });
+    await client.agents.create({ handle: 'codex', displayName: 'Codex <Prime>' });
     const notesPath = join(home, 'codex', 'NOTES.md');
     writeFileSync(notesPath, 'Troy owns this.\n');
     const given = await client.kudos.give({
@@ -60,7 +60,7 @@ describe('SQLite storage and projections', () => {
   it('renders legacy multiline titles once without allowing heading injection', async () => {
     const home = tempHome();
     const client = await testClient(home);
-    await client.agents.create({ id: 'codex', displayName: 'Codex' });
+    const codex = await client.agents.create({ handle: 'codex', displayName: 'Codex' });
     const id = '01ARZ3NDEKTSV4RRFFQ69G5FAA';
     await client.storage.transaction(() =>
       client.storage.insertEvent({
@@ -72,7 +72,9 @@ describe('SQLite storage and projections', () => {
         type: 'kudos.given',
         createdAt: new Date().toISOString(),
         actor: { kind: 'human', id: 'troy' },
-        recipientAgentId: 'codex',
+        // Raw insertion bypasses the client, so the canonical ID is supplied
+        // directly: projections are keyed by the agent this actually names.
+        recipientAgentId: codex.id,
         recipientDisplayName: 'Codex',
         title: 'First line\n# Injected heading',
         reason: 'Legacy event created before titles became single-line input.',
@@ -92,18 +94,18 @@ describe('SQLite storage and projections', () => {
     const outside = tempHome();
     const client = await testClient(home);
     symlinkSync(outside, join(home, 'codex'));
-    await expect(client.agents.create({ id: 'codex', displayName: 'Codex' })).rejects.toMatchObject(
-      {
-        code: 'UNSAFE_PATH',
-      },
-    );
+    await expect(
+      client.agents.create({ handle: 'codex', displayName: 'Codex' }),
+    ).rejects.toMatchObject({
+      code: 'UNSAFE_PATH',
+    });
     await client.close();
   });
 
   it('isolates unsupported rows for reads and raw export while failing closed on writes', async () => {
     const home = tempHome();
     const client = await testClient(home);
-    await client.agents.create({ id: 'codex', displayName: 'Codex' });
+    await client.agents.create({ handle: 'codex', displayName: 'Codex' });
     const unsupportedId = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
     client.storage
       .db()
@@ -147,7 +149,7 @@ describe('SQLite storage and projections', () => {
     const dbPath = initialized.storage.databasePath;
     await initialized.close();
     const raw = new DatabaseSync(dbPath);
-    raw.exec('PRAGMA user_version = 7');
+    raw.exec('PRAGMA user_version = 8');
     raw.close();
     const unsupported = new SynomemClient({ home: otherHome, readOnly: true });
     await expect(unsupported.init()).rejects.toMatchObject({ code: 'UNSUPPORTED_SCHEMA' });
@@ -156,7 +158,7 @@ describe('SQLite storage and projections', () => {
   it('creates a consistent independent backup', async () => {
     const home = tempHome();
     const client = await testClient(home);
-    await client.agents.create({ id: 'codex', displayName: 'Codex' });
+    await client.agents.create({ handle: 'codex', displayName: 'Codex' });
     const backup = join(tempHome(), 'kudos-backup.sqlite3');
     await client.backup(backup);
     await client.close();
@@ -178,7 +180,7 @@ describe('SQLite storage and projections', () => {
   it('keeps live SQLite files private to the filesystem owner', async () => {
     const home = tempHome();
     const client = await testClient(home);
-    await client.agents.create({ id: 'codex', displayName: 'Codex' });
+    await client.agents.create({ handle: 'codex', displayName: 'Codex' });
     if (process.platform !== 'win32') {
       const files = readdirSync(join(home, 'synomem')).filter((name) => name.includes('sqlite3'));
       expect(files.length).toBeGreaterThan(0);
@@ -195,6 +197,8 @@ describe('SQLite storage and projections', () => {
       client.storage.transaction(() => {
         client.storage.insertAgent({
           id: 'rollback',
+          handle: 'rollback',
+          status: 'active',
           displayName: 'Rollback',
           createdAt: new Date().toISOString(),
         });
@@ -215,21 +219,21 @@ describe('SQLite storage and projections', () => {
     expect(
       (client.storage.db().prepare('PRAGMA user_version').get() as { user_version: number })
         .user_version,
-    ).toBe(6);
+    ).toBe(7);
     expect(
       (
         client.storage.db().prepare('SELECT COUNT(*) AS count FROM schema_migrations').get() as {
           count: number;
         }
       ).count,
-    ).toBe(6);
+    ).toBe(7);
     await client.close();
   });
 
   it('migrates version one events into the sequence and current-state index', async () => {
     const home = tempHome();
     const initial = await testClient(home);
-    await initial.agents.create({ id: 'codex', displayName: 'Codex' });
+    await initial.agents.create({ handle: 'codex', displayName: 'Codex' });
     const given = await initial.kudos.give({
       recipientAgentId: 'codex',
       title: 'Pre-index recognition',
@@ -253,12 +257,15 @@ describe('SQLite storage and projections', () => {
       ALTER TABLE events DROP COLUMN aggregate_id;
       ALTER TABLE events DROP COLUMN workspace_id;
       ALTER TABLE events DROP COLUMN sequence;
+      DROP INDEX agents_handle;
+      ALTER TABLE agents DROP COLUMN handle;
+      ALTER TABLE agents DROP COLUMN status;
       DROP INDEX post_acknowledgments_post;
       DROP TABLE post_acknowledgments;
       DROP INDEX aliases_normalized;
       ALTER TABLE aliases DROP COLUMN normalized_alias;
       DROP TABLE agent_runtime_bindings;
-      DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6);
+      DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7);
       PRAGMA user_version = 1;
     `);
     legacy.close();
@@ -270,7 +277,7 @@ describe('SQLite storage and projections', () => {
     expect(
       (migrated.storage.db().prepare('PRAGMA user_version').get() as { user_version: number })
         .user_version,
-    ).toBe(6);
+    ).toBe(7);
     expect((await migrated.kudos.list()).items[0]?.id).toBe(given.record.event.id);
     expect(migrated.storage.currentIndexHealth()).toEqual({
       given: 1,
@@ -282,7 +289,7 @@ describe('SQLite storage and projections', () => {
 
   it('diagnoses and rebuilds current-state status drift', async () => {
     const client = await testClient(tempHome());
-    await client.agents.create({ id: 'codex', displayName: 'Codex' });
+    await client.agents.create({ handle: 'codex', displayName: 'Codex' });
     const given = await client.kudos.give({
       recipientAgentId: 'codex',
       title: 'Recoverable recognition',
@@ -318,12 +325,14 @@ describe('SQLite storage and projections', () => {
 
   it('diagnoses migration metadata and alias-to-identity conflicts', async () => {
     const client = await testClient(tempHome());
-    await client.agents.create({ id: 'codex', displayName: 'Codex' });
-    await client.agents.create({ id: 'gracie', displayName: 'Gracie' });
+    await client.agents.create({ handle: 'codex', displayName: 'Codex' });
+    const gracie = await client.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    // An alias that names another agent's HANDLE. With opaque IDs this is the
+    // collision that makes a lookup ambiguous, so it is what doctor looks for.
     client.storage
       .db()
-      .prepare("INSERT INTO aliases(alias, agent_id) VALUES ('codex', 'gracie')")
-      .run();
+      .prepare('INSERT INTO aliases(alias, agent_id, normalized_alias) VALUES (?, ?, ?)')
+      .run('codex', gracie.id, 'codex');
     client.storage.db().prepare('DELETE FROM schema_migrations WHERE version = 2').run();
 
     const doctor = await client.doctor();
@@ -340,7 +349,7 @@ describe('SQLite storage and projections', () => {
   it('keeps give latency practical with a realistic pending inbox', async () => {
     const client = await testClient(tempHome());
     try {
-      await client.agents.create({ id: 'codex', displayName: 'Codex' });
+      await client.agents.create({ handle: 'codex', displayName: 'Codex' });
       const started = performance.now();
       for (let index = 0; index < 100; index += 1) {
         await client.kudos.give({
@@ -366,7 +375,7 @@ describe('SQLite storage and projections', () => {
         config: { projection: { writeWinsMarkdown: false, writeInboxEntries: false } },
       },
     );
-    await client.agents.create({ id: 'codex', displayName: 'Codex' });
+    await client.agents.create({ handle: 'codex', displayName: 'Codex' });
     await client.storage.transaction(() => {
       for (let index = 0; index < 5_000; index += 1) {
         const id = ulid(1_700_000_000_000 + index);
@@ -407,7 +416,7 @@ describe('SQLite storage and projections', () => {
       id: 'wide-test',
       displayName: 'W'.repeat(200),
     });
-    await client.agents.create({ id: 'codex', displayName: 'C'.repeat(200) });
+    await client.agents.create({ handle: 'codex', displayName: 'C'.repeat(200) });
     const tags = Array.from({ length: 20 }, (_, index) => `tag-${index}-${'x'.repeat(50)}`);
     await client.storage.transaction(() => {
       for (let index = 0; index < 50; index += 1) {
@@ -443,7 +452,7 @@ describe('SQLite storage and projections', () => {
   it('handles concurrent writers without lost or duplicate events', async () => {
     const home = tempHome();
     const setup = await testClient(home);
-    await setup.agents.create({ id: 'codex', displayName: 'Codex' });
+    await setup.agents.create({ handle: 'codex', displayName: 'Codex' });
     await setup.close();
     const moduleUrl = pathToFileURL(join(process.cwd(), 'dist', 'index.js')).href;
     const workerSource = `
@@ -493,7 +502,7 @@ describe('SQLite storage and projections', () => {
   it('waits for a bounded interval and reports a busy database', async () => {
     const home = tempHome();
     const setup = await testClient(home);
-    await setup.agents.create({ id: 'codex', displayName: 'Codex' });
+    await setup.agents.create({ handle: 'codex', displayName: 'Codex' });
     const databasePath = setup.storage.databasePath;
     await setup.close();
 
