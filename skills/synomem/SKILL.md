@@ -1,28 +1,44 @@
 ---
 name: synomem
-description: Use durable local-first kudos, memos, notes, assigned tasks, and private todos for stable AI-agent identities when users request recognition, inter-agent communication, memory capture, inbox review, agent lookup, or task tracking.
+description: Use durable kudos, memos, notes, workspace posts, assigned tasks, and private todos for stable AI-agent identities when users request recognition, inter-agent communication, memory capture, announcements, inbox review, agent lookup, task delegation, or personal reminders.
 ---
 
 # Synomem
 
 Synomem preserves useful information beyond one conversation. Prefer actor-bound `synomem_*` MCP
 tools when available; otherwise use the `synomem` CLI when command execution is permitted. Never
-edit the SQLite event store or generated Markdown directly.
+edit the event store or generated Markdown directly.
 
 ## Choose the right record
 
-- **Kudos:** specific recognition for an observed contribution and its consequence.
-- **Memo:** a durable message delivered to another agent or to your future self.
-- **Note:** knowledge owned by this agent and deliberately retrieved later.
-- **Task:** a concrete action assigned to an agent, optionally with a due date or time.
+Start from **who the record is for**, because that is what separates the kinds:
+
+| For                       | Kind      | Shape                                             |
+| ------------------------- | --------- | ------------------------------------------------- |
+| One agent, as recognition | **Kudos** | A contribution that happened, and why it mattered |
+| One agent, as a message   | **Memo**  | Delivered once; the recipient marks it read       |
+| Yourself, as knowledge    | **Note**  | Owned by this agent, revised later with a version |
+| Yourself, as a reminder   | **Todo**  | Private. Nobody else can see it or assign one     |
+| Another agent, as work    | **Task**  | Needs the assignee's consent before work begins   |
+| Everyone in the workspace | **Post**  | An announcement; tracks who has acknowledged it   |
+
+The two that get confused are Task and Todo. **A task is work you are asking somebody else to
+do**, so it has an assignee and they must accept or reject it. **A todo is your own reminder**, so
+it has no assignee, is visible to nobody else, and can never be given to another agent. If you find
+yourself wanting to put a todo on someone's list, you want a task.
+
+Post is the third case: nobody in particular is being asked for anything, but everyone should know.
+A post has no recipient and no assignee — work for one actor is a memo or a task.
 
 A self-memo belongs in the inbox and can be marked read. A note belongs in memory and is revised
-with version checks. Do not use tasks for information with no requested action.
+with version checks. Do not use a task for information with no requested action.
 
 ## Safety and quality
 
 - Act only on explicit user requests or clear task needs permitted by the current harness.
-- Resolve stable agent IDs from known profiles; ask one concise question if identity is ambiguous.
+- Resolve agent identity from known profiles; ask one concise question if it is ambiguous. An agent
+  has an opaque canonical ID and a separate handle people type; the ID is what records reference,
+  and it is generated, never chosen. Never assert an ID yourself.
 - Store concise factual content, not whole transcripts or speculative conclusions.
 - Never store tokens, passwords, cookies, authentication headers, environment values, private keys,
   private file contents, raw sensitive tool arguments, or unnecessary personal information.
@@ -64,9 +80,29 @@ and pass the current version. Complete, reopen, or cancel through the matching l
 
 ## Todos
 
-Use `synomem_todo_create` for the configured agent's own reminders. A todo has no assignee and is
-visible to no one else, so never use one to ask another agent for work: that is a task. Do not copy
-another agent's todo into your own.
+Use `synomem_todo_create` for the configured agent's own reminders — the personal list, not a way to
+direct anybody. A todo has no assignee and is visible to no one else, so never use one to ask
+another agent for work: that is a task. Do not copy another agent's todo into your own, and do not
+create one on a user's behalf as a substitute for telling them something.
+
+Read before `synomem_todo_update` and pass the current version. Close one through
+`synomem_todo_complete`, `synomem_todo_reopen`, `synomem_todo_cancel`, or `synomem_todo_archive`.
+
+## Posts
+
+Use `synomem_post_create` to tell everyone in the workspace something they should know — a
+migration window, a changed convention, a decision that affects shared work. Everyone in the
+workspace can read a post, and everyone can see who has acknowledged it, so write it as a public
+statement rather than a note to one person.
+
+Use `synomem_post_acknowledge` only after this agent has actually read and understood the post;
+acknowledging is a claim about you, not a way to clear a list. Reading a post does not acknowledge
+it. Use `synomem_post_roster` to see who has acknowledged and who has not — report that as
+outstanding, never as unresponsive, because an agent created after the post was published was never
+asked.
+
+Acknowledging is not an edit: a post carries its text version separately from its aggregate
+version, so an acknowledgement never invalidates a revision the author has in flight.
 
 ## Agent identity
 
@@ -79,8 +115,11 @@ so do not report an agent as online or offline.
 
 ## Discovery
 
-Use `synomem_inbox` for the configured agent's pending kudos, unread memos, and open tasks. Use
-`synomem_list` for compact cross-type discovery, `synomem_get` for one selected full record, and
+Use `synomem_inbox` for the configured agent's pending kudos, unread memos, and open tasks. It
+covers what somebody else is waiting on this agent for, so it does not include posts or todos:
+find those with `synomem_list` and `kinds: ["post"]` or `kinds: ["todo"]`.
+
+Use `synomem_list` for compact cross-type discovery, `synomem_get` for one selected full record, and
 `synomem_changes` with a saved watermark for incremental polling. Do not drain history
 speculatively.
 

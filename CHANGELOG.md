@@ -3,6 +3,25 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
+## [0.5.2] - 2026-09-07
+
+### Documentation
+
+- The packaged Agent Skill did not mention posts at all, and left todos out of
+  the record chooser, so an agent reading it had no way to reach either. The
+  chooser is now organised by **who a record is for**, which is the thing that
+  actually separates the kinds, and spells out the pair that gets confused: a
+  task is work assigned to another agent, who must accept it; a todo is this
+  agent's own private reminder that nobody else can see or assign.
+- The Skill now covers `synomem_post_create`, `synomem_post_acknowledge` and
+  `synomem_post_roster`, including that reading a post does not acknowledge it
+  and that an agent created after publication was never asked.
+- The Skill, examples and the pasteable install prompt say where posts and
+  todos are found, since `synomem_inbox` deliberately holds only what somebody
+  else is waiting on: it covers kudos, memos and tasks, not posts or todos.
+- The MCP server's own instruction string, which every client sees, listed four
+  record kinds out of six.
+
 ## [0.5.1] - 2026-09-07
 
 ### Documentation
