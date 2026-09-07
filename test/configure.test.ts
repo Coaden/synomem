@@ -10,6 +10,7 @@ import {
   writeCredentialFile,
 } from '../src/configure.js';
 import type { PromptIo } from '../src/prompt.js';
+import type { SynomemServiceFactory } from '../src/service.js';
 import { tempHome } from './helpers.js';
 
 function scriptedIo(lines: string[]): PromptIo & { written: string } {
@@ -52,8 +53,21 @@ describe('onboarding configuration', () => {
     const path = writeCredentialFile(home, 'syn_abcdef0123456789');
 
     expect(path).toBe(join(home, 'credentials', 'installation.json'));
-    expect(statSync(path).mode & 0o777).toBe(0o600);
-    expect(statSync(join(home, 'credentials')).mode & 0o777).toBe(0o700);
+    /*
+     * POSIX modes are a POSIX guarantee. On Windows `chmod` only toggles the
+     * read-only bit, so asserting 0600 there would be asserting something the
+     * platform cannot express -- and passing it off as protection the file does
+     * not have. What Windows does give is the user profile directory's own
+     * access control, which is why the credential lives under the Synomem home
+     * rather than anywhere shared.
+     */
+    if (process.platform === 'win32') {
+      expect(existsSync(path)).toBe(true);
+      expect(statSync(join(home, 'credentials')).isDirectory()).toBe(true);
+    } else {
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      expect(statSync(join(home, 'credentials')).mode & 0o777).toBe(0o700);
+    }
 
     // Kept out of config.json so a configuration file can be shared without
     // carrying a secret with it.
@@ -110,6 +124,17 @@ describe('remote setup', () => {
     const io = { stdout: (t: string) => lines.push(t), stderr: (t: string) => lines.push(t) };
 
     const discovered: string[] = [];
+    /*
+     * A stub service, so the closing diagnostics neither reach the network nor
+     * make the exit code depend on how a given platform fails to connect.
+     */
+    const factory: SynomemServiceFactory = () =>
+      ({
+        init: async () => undefined,
+        close: async () => undefined,
+        doctor: async () => ({ healthy: true, diagnostics: [] }),
+      }) as unknown as ReturnType<SynomemServiceFactory>;
+
     const code = await runCli(
       [
         'node',
@@ -128,14 +153,11 @@ describe('remote setup', () => {
         '--yes',
       ],
       io,
-      undefined,
+      factory,
       {
         // Piped, not typed: `--access-token-stdin` reads the whole stream, so
         // the key never becomes a shell-history entry or a process argument.
         promptIo: { ...scriptedIo(['installation-key-secret']), interactive: false },
-        // Kept off the network: the closing diagnostics reach the configured
-        // service, and a test must not depend on the real one being up.
-        env: { ...process.env, SYNOMEM_API_URL: 'http://127.0.0.1:1' },
         discoverBoundWorkspace: async ({ accessToken }) => {
           discovered.push(accessToken);
           return { workspaceId: 'ws-04psqx2rkt8ttft7a1t2z69r97' };
@@ -143,9 +165,7 @@ describe('remote setup', () => {
       },
     );
 
-    // A non-zero code here is the unreachable stub service, not the setup: the
-    // configuration and the credential are both written before diagnostics run.
-    expect([0, 4, 5]).toContain(code);
+    expect(code).toBe(0);
     // The key was what answered the question, and it never reached the output.
     expect(discovered).toEqual(['installation-key-secret']);
     const printed = lines.join('');

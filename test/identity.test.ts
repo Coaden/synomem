@@ -143,7 +143,17 @@ describe('agent-bound MCP registration', () => {
         })}\n`,
       );
     });
-    server.kill();
+    /*
+     * Waited for, not just signalled. `kill` returns before the child has gone,
+     * and the child still holds the SQLite file -- so reopening the database
+     * below races it. Windows enforces that lock and fails the read with a disk
+     * I/O error; POSIX quietly tolerates it, which is what let this survive.
+     */
+    await new Promise<void>((resolveExit) => {
+      if (server.exitCode !== null || server.signalCode !== null) return resolveExit();
+      server.once('exit', () => resolveExit());
+      server.kill();
+    });
     expect(stdout).toContain('"result"');
 
     // The alias resolved to the canonical agent, and nothing on the command

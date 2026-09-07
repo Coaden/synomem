@@ -60,8 +60,11 @@ export function credentialStoreChoices(
            */
           {
             value: 'file' as const,
-            label: 'A restricted file in the Synomem home',
-            detail: 'Recommended on Windows until Credential Manager support lands.',
+            label: 'A file in the Synomem home',
+            // Not called "restricted" on Windows: `chmod` there only toggles
+            // the read-only bit, so the protection is the user profile
+            // directory's access control, not a mode of 0600.
+            detail: 'Protected by your user profile. Recommended until Credential Manager lands.',
           }
         : {
             value: 'keychain' as const,
