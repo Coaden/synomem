@@ -131,18 +131,46 @@ export const evidenceSchema = z
     }
   });
 
-export const profileSchema = z.object({
-  /** Canonical, opaque and immutable. Events reference this, never the handle. */
-  id: agentIdSchema,
-  handle: agentHandleSchema,
-  displayName: z.string().trim().min(1).max(200),
-  aliases: z.array(agentAliasSchema).max(50).optional(),
-  description: z.string().trim().max(2000).optional(),
-  /** Archived agents keep their history and stop being able to act. */
-  status: z.enum(['active', 'archived']).default('active'),
-  createdAt: z.string().datetime({ offset: true }),
-  metadata: metadataSchema.optional(),
-});
+/**
+ * An agent profile, tolerant of the shape written before handles existed.
+ *
+ * Agents gained a mutable handle alongside their canonical ID in schema 7.
+ * Every `agent.created` event written before that carries an id and no handle,
+ * and those events are in an append-only log: rewriting them to add the field
+ * is precisely what such a log exists to prevent. So the READER widens instead.
+ *
+ * A missing handle means the record predates handles, and back then the ID *was*
+ * the name somebody typed — so the ID is not a placeholder here, it is the
+ * correct handle. Without this, one pre-7 agent made the compatibility check
+ * refuse the whole event stream, and every write in that workspace failed with
+ * `UNSUPPORTED_EVENT`.
+ */
+export const profileSchema = z.preprocess(
+  (value) => {
+    if (
+      value !== null &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      !('handle' in value) &&
+      typeof (value as { id?: unknown }).id === 'string'
+    ) {
+      return { ...(value as Record<string, unknown>), handle: (value as { id: string }).id };
+    }
+    return value;
+  },
+  z.object({
+    /** Canonical, opaque and immutable. Events reference this, never the handle. */
+    id: agentIdSchema,
+    handle: agentHandleSchema,
+    displayName: z.string().trim().min(1).max(200),
+    aliases: z.array(agentAliasSchema).max(50).optional(),
+    description: z.string().trim().max(2000).optional(),
+    /** Archived agents keep their history and stop being able to act. */
+    status: z.enum(['active', 'archived']).default('active'),
+    createdAt: z.string().datetime({ offset: true }),
+    metadata: metadataSchema.optional(),
+  }),
+);
 
 /**
  * Creating an agent names a handle; the canonical ID is generated, never
