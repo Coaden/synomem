@@ -21,10 +21,23 @@ synomem agent create codex --name "Codex" --alias reviewer
 synomem agent list
 synomem agent show reviewer
 synomem agent update codex --description "Careful reviewer"
+synomem agent resolve Reviewer
+synomem agent directory
+synomem agent runtime bind codex --runtime claude-code --profile clinic
+synomem agent runtime list codex
+synomem agent runtime unbind <binding-id>
 ```
 
-IDs and aliases use lowercase ASCII letters, digits, and internal hyphens. Aliases never silently
-merge established identities.
+IDs use lowercase ASCII letters, digits, and internal hyphens. Aliases accept any casing and are
+stored folded to lowercase, so `Reviewer` and `reviewer` are one claim rather than two. An alias is
+rejected when another agent already answers to it, whether as its alias or as its canonical ID.
+
+`agent resolve` returns a match only when exactly one agent answers to the name. When several do, it
+exits successfully with the candidates listed and no match, so a caller asks which was meant instead
+of acting on a guess.
+
+Runtime bindings record where an agent was registered to run. They are advisory: `last seen` reports
+when Synomem last observed that binding act, never that the agent is reachable now.
 
 ## Backend and authentication
 
@@ -114,39 +127,51 @@ synomem note archive <note-id> --as codex
 Agents may mutate only their own notes. Revisions require the last-read version and fail with
 `REVISION_CONFLICT` if state changed concurrently.
 
+## Tasks
+
+```bash
+synomem task create codex --from gracie --title "Review migration" --due-date 2026-09-15
+synomem task create codex --from gracie --title "Join review" \
+  --due-at 2026-09-15T14:00:00-05:00 --time-zone America/Chicago
+synomem task list --assignee codex --status open
+synomem task show <task-id>
+synomem task accept <task-id> --as codex
+synomem task reject <task-id> --as codex --reason "Outside current scope."
+synomem task update <task-id> --as codex --expected-version 2 --priority 2
+synomem task complete <task-id> --as codex
+synomem task reopen <task-id> --as codex
+synomem task cancel <task-id> --as codex --reason "Superseded."
+```
+
+Tasks assigned by another actor begin `assigned` and cannot be worked or completed until the
+assignee explicitly accepts them. Rejection is preserved as a lifecycle event. Self-created agent
+tasks begin open. Date-only deadlines do not invent a time; timed deadlines require both an RFC 3339
+offset datetime and an IANA time zone.
+
 ## Todos
 
 ```bash
-synomem todo create codex --from gracie --title "Review migration" --due-date 2026-09-15
-synomem todo create codex --from gracie --title "Join review" \
-  --due-at 2026-09-15T14:00:00-05:00 --time-zone America/Chicago
-synomem todo list --assignee codex --status open
-synomem todo show <todo-id>
-synomem todo accept <todo-id> --as codex
-synomem todo reject <todo-id> --as codex --reason "Outside current scope."
-synomem todo update <todo-id> --as codex --expected-version 2 --priority 2
+synomem todo create --as codex --title "Re-read the migration notes" --due-date 2026-09-15
+synomem todo list --as codex
 synomem todo complete <todo-id> --as codex
-synomem todo reopen <todo-id> --as codex
-synomem todo cancel <todo-id> --as codex --reason "Superseded."
 ```
 
-Todos assigned by another actor begin `assigned` and cannot be worked or completed until the
-assignee explicitly accepts them. Rejection is preserved as a lifecycle event. Self-created agent
-todos begin open. Date-only deadlines do not invent a time; timed deadlines require both an RFC 3339
-offset datetime and an IANA time zone.
+A todo belongs to the agent that created it and is visible to no one else, including administrators
+reading through the shared database. Nobody can assign one: work meant for another agent is a task,
+which that agent may accept or reject.
 
 ## Unified discovery and inbox
 
 ```bash
 synomem inbox codex
-synomem list --kind memo --kind todo --participant codex --limit 10
+synomem list --kind memo --kind task --participant codex --limit 10
 synomem changes --after <opaque-watermark>
 ```
 
 List results are compact, default to 10, allow at most 50, and omit full detail fields. Changes
 default to 20 and allow at most 100. Both apply an approximate 24 KiB budget and return opaque
 continuation state. Fetch full detail with the appropriate `kudos show`, `memo show`, `note show`,
-or `todo show` command.
+or `task show` command.
 
 ## Administration
 
@@ -155,11 +180,19 @@ synomem doctor
 synomem rebuild
 synomem backup ./synomem-backup.sqlite3
 synomem export --format json|jsonl|markdown
-synomem mcp --actor-id codex --actor-kind agent --actor-name "Codex"
-synomem skill install --runtime codex --actor-id codex --actor-name "Codex" --yes
-synomem skill install --runtime hermes --actor-id mycroft --actor-name "Mycroft" --yes
+synomem mcp --agent-id codex
+synomem skill install --runtime codex --agent codex --yes
+synomem skill install --runtime hermes --agent mycroft --yes
 synomem skill status
 ```
+
+`--agent` accepts an ID or an alias and is resolved before anything is written, so an ambiguous or
+unknown name stops the command instead of installing a skill pointed at an agent that does not
+exist. Applying an install also records a runtime binding for each runtime that was installed.
+
+The generated MCP registration carries only `--agent-id`. Display name and actor kind are read from
+the agent's profile when the server starts, so renaming an agent does not require re-registering it
+with every harness, and a harness cannot sign another agent's name to work it did.
 
 Skill runtime names are `claude`, `codex`, `hermes`, `openclaw`, `cursor`, and `grok`;
 `grokbot` is accepted as an alias for local Grok Build. Omit `--runtime` to inspect every detected

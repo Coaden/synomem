@@ -74,13 +74,13 @@ describe('MCP protocol integration', () => {
         'synomem_note_create',
         'synomem_note_revise',
         'synomem_note_archive',
-        'synomem_todo_create',
-        'synomem_todo_update',
-        'synomem_todo_accept',
-        'synomem_todo_reject',
-        'synomem_todo_complete',
-        'synomem_todo_reopen',
-        'synomem_todo_cancel',
+        'synomem_task_create',
+        'synomem_task_update',
+        'synomem_task_accept',
+        'synomem_task_reject',
+        'synomem_task_complete',
+        'synomem_task_reopen',
+        'synomem_task_cancel',
         'synomem_agent_create',
         'synomem_agent_list',
         'synomem_rebuild',
@@ -117,7 +117,7 @@ describe('MCP protocol integration', () => {
         'synomem_summarize_agent_wins',
         'synomem_send_durable_memo',
         'synomem_capture_agent_note',
-        'synomem_create_actionable_todo',
+        'synomem_create_actionable_task',
       ]),
     );
     await protocolClient.close();
@@ -230,7 +230,7 @@ describe('MCP protocol integration', () => {
     await runtime.client.close();
   });
 
-  it('exposes actor-bound memos, notes, todos, and the unified feed', async () => {
+  it('exposes actor-bound memos, notes, tasks, and the unified feed', async () => {
     const home = tempHome();
     const { runtime, protocolClient } = await setupRuntime(home);
     const memo = await protocolClient.callTool({
@@ -259,19 +259,19 @@ describe('MCP protocol integration', () => {
       },
     });
     expect(sharedNote.isError).toBe(true);
-    const todo = await protocolClient.callTool({
-      name: 'synomem_todo_create',
+    const task = await protocolClient.callTool({
+      name: 'synomem_task_create',
       arguments: {
         assigneeAgentId: 'codex',
         title: 'Review the event migration',
         due: { kind: 'date', date: '2026-09-15' },
       },
     });
-    expect(todo.isError).not.toBe(true);
+    expect(task.isError).not.toBe(true);
     const list = await protocolClient.callTool({ name: 'synomem_list', arguments: {} });
     const items = (list.structuredContent as { data: { items: Array<{ kind: string }> } }).data
       .items;
-    expect(new Set(items.map((item) => item.kind))).toEqual(new Set(['memo', 'note', 'todo']));
+    expect(new Set(items.map((item) => item.kind))).toEqual(new Set(['memo', 'note', 'task']));
     expect(items.every((item) => !('body' in item) && !('description' in item))).toBe(true);
     await protocolClient.close();
     await runtime.client.close();

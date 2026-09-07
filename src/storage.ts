@@ -22,13 +22,18 @@ import {
   ensureDirectory,
   readJsonFile,
 } from './fs-utils.js';
+import { dueInstant } from './projections.js';
 import { actorSchema, eventSchema, profileSchema } from './schemas.js';
 import type {
   ActorIdentity,
   SynomemConfig,
   SynomemConfigOverrides,
   AgentProfile,
+  AgentRuntimeBinding,
   ChangePage,
+  PostAcknowledgment,
+  PostRoster,
+  JsonValue,
   KudosChange,
   SynomemEvent,
   ItemChange,
@@ -186,6 +191,70 @@ CREATE INDEX kudos_current_actor ON kudos_current(actor_kind, actor_id, given_se
 CREATE INDEX kudos_current_status ON kudos_current(status, revocation_status, given_sequence DESC);
 `;
 
+/**
+ * v4 records a task's or todo's deadline on the item index.
+ *
+ * The plan asks for "accepted Tasks past their due date" as a bounded query.
+ * Answering that from the event log means replaying every task on every call,
+ * so the deadline is projected alongside the rest of the summary. It is stored
+ * as an ISO instant: a date-only due date resolves to the end of that day, so
+ * "overdue" means the day has actually passed rather than merely started.
+ */
+const migrationV4 = `
+ALTER TABLE items_current ADD COLUMN due_at TEXT;
+CREATE INDEX items_current_due ON items_current(kind, status, due_at);
+`;
+
+/**
+ * v5 makes alias lookup case-insensitive and unambiguous.
+ *
+ * The plan requires that `mycroft`, `Mycroft` and `Mike` may all resolve to one
+ * canonical agent, while a name two agents both claim must return candidates
+ * rather than guessing. A normalized column with a unique index enforces the
+ * second half at write time: the collision is refused when the alias is added,
+ * not discovered later by whoever happens to look it up first.
+ *
+ * Runtime bindings arrive here too. An agent is not one harness forever —
+ * Mycroft may run Hermes on two machines, or move between harnesses — so the
+ * binding is its own row keyed by agent, installation, runtime and profile
+ * rather than a field on the agent.
+ */
+const migrationV5 = `
+ALTER TABLE aliases ADD COLUMN normalized_alias TEXT;
+UPDATE aliases SET normalized_alias = lower(alias);
+CREATE UNIQUE INDEX aliases_normalized ON aliases(normalized_alias);
+
+CREATE TABLE agent_runtime_bindings (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  installation_id TEXT,
+  runtime TEXT NOT NULL,
+  profile TEXT,
+  capabilities_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(capabilities_json)),
+  bound_at TEXT NOT NULL,
+  last_seen_at TEXT
+) STRICT;
+CREATE UNIQUE INDEX agent_runtime_bindings_unique
+  ON agent_runtime_bindings(agent_id, runtime, COALESCE(profile, ''), COALESCE(installation_id, ''));
+CREATE INDEX agent_runtime_bindings_agent ON agent_runtime_bindings(agent_id);
+`;
+
+const migrationV6 = `
+-- Acknowledgements are their own rows rather than a column on the post: many
+-- actors acknowledge one post independently, and the interesting question is
+-- who, not how many.
+CREATE TABLE post_acknowledgments (
+  post_id TEXT NOT NULL,
+  actor_kind TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  actor_display_name TEXT,
+  note TEXT,
+  acknowledged_at TEXT NOT NULL,
+  PRIMARY KEY (post_id, actor_kind, actor_id)
+) STRICT;
+CREATE INDEX post_acknowledgments_post ON post_acknowledgments(post_id);
+`;
+
 const migrationV3 = `
 DROP TRIGGER IF EXISTS events_append_only_update;
 DROP TRIGGER IF EXISTS events_append_only_delete;
@@ -303,10 +372,19 @@ function itemSummaryFromRow(row: ItemRow): ItemSummary {
   };
 }
 
+/**
+ * Resolves a due value to a comparable instant.
+ *
+ * A date-only deadline resolves to the END of that day, so "overdue" means the
+ * day has passed rather than merely begun. Treating 2026-09-15 as midnight
+ * would report a task due today as already late.
+ */
 function eventKind(event: SynomemEvent): RecordKind | undefined {
   if (event.type.startsWith('kudos.')) return 'kudos';
   if (event.type.startsWith('memo.')) return 'memo';
   if (event.type.startsWith('note.')) return 'note';
+  if (event.type.startsWith('post.')) return 'post';
+  if (event.type.startsWith('task.')) return 'task';
   if (event.type.startsWith('todo.')) return 'todo';
   return undefined;
 }
@@ -440,7 +518,7 @@ export class SynomemStorage implements SynomemRepository {
     const version = Number(
       (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
     );
-    if (version > 3) {
+    if (version > 6) {
       throw new SynomemError(
         'UNSUPPORTED_SCHEMA',
         `Database schema version ${version} is newer than this package supports.`,
@@ -474,11 +552,50 @@ export class SynomemStorage implements SynomemRepository {
     if (afterV2 === 2) {
       this.transactionSync(() => {
         db.exec(migrationV3);
-        this.rebuildItemsCurrentIndex();
+        // The item index is left empty here and populated by v4, which adds the
+        // due-date column the projection writes. Rebuilding before that column
+        // exists fails on the first task.
         db.prepare(
           'INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         ).run(3, new Date().toISOString());
         db.exec('PRAGMA user_version = 3');
+      });
+    }
+    const afterV3 = Number(
+      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    );
+    if (afterV3 === 3) {
+      this.transactionSync(() => {
+        db.exec(migrationV4);
+        this.rebuildItemsCurrentIndex();
+        db.prepare(
+          'INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        ).run(4, new Date().toISOString());
+        db.exec('PRAGMA user_version = 4');
+      });
+    }
+    const afterV4 = Number(
+      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    );
+    if (afterV4 === 4) {
+      this.transactionSync(() => {
+        db.exec(migrationV5);
+        db.prepare(
+          'INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        ).run(5, new Date().toISOString());
+        db.exec('PRAGMA user_version = 5');
+      });
+    }
+    const afterV5 = Number(
+      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    );
+    if (afterV5 === 5) {
+      this.transactionSync(() => {
+        db.exec(migrationV6);
+        db.prepare(
+          'INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        ).run(6, new Date().toISOString());
+        db.exec('PRAGMA user_version = 6');
       });
     }
   }
@@ -487,16 +604,16 @@ export class SynomemStorage implements SynomemRepository {
     const version = Number(
       (this.db().prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
     );
-    if (version !== 3) {
-      if (version === 1 || version === 2) {
+    if (version !== 6) {
+      if (version >= 1 && version <= 5) {
         throw new SynomemError(
           'UNSUPPORTED_SCHEMA',
-          'Database schema version 1 requires migration. Open this home once with readOnly: false, then retry the read-only client.',
+          `Database schema version ${version} requires migration. Open this home once with readOnly: false, then retry the read-only client.`,
         );
       }
       throw new SynomemError(
         'UNSUPPORTED_SCHEMA',
-        `Expected database schema version 3; found ${version}.`,
+        `Expected database schema version 5; found ${version}.`,
       );
     }
   }
@@ -673,6 +790,7 @@ export class SynomemStorage implements SynomemRepository {
       ownerDisplayName?: string;
       assigneeAgentId?: string;
       assigneeDisplayName?: string;
+      dueAt?: string;
     }): void => {
       this.db()
         .prepare(
@@ -680,8 +798,8 @@ export class SynomemStorage implements SynomemRepository {
           item_id, kind, created_sequence, updated_sequence, created_at, updated_at,
           actor_kind, actor_id, actor_display_name, title, tags_json, visibility, status,
           recipient_agent_id, recipient_display_name, owner_agent_id, owner_display_name,
-          assignee_agent_id, assignee_display_name
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          assignee_agent_id, assignee_display_name, due_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           event.aggregateId,
@@ -703,6 +821,7 @@ export class SynomemStorage implements SynomemRepository {
           values.ownerDisplayName ?? null,
           values.assigneeAgentId ?? null,
           values.assigneeDisplayName ?? null,
+          values.dueAt ?? null,
         );
     };
     const updateStatus = (status: string): void => {
@@ -747,6 +866,61 @@ export class SynomemStorage implements SynomemRepository {
         ownerAgentId: event.ownerAgentId,
         ownerDisplayName: event.ownerDisplayName,
       });
+    } else if (event.type === 'post.created') {
+      /*
+       * A post is addressed to the workspace, so it is recorded as `workspace`
+       * visibility rather than carrying a visibility of its own. There is no
+       * owner-scoped or recipient-scoped read filter to apply: everyone who can
+       * read the workspace can read it, which is the whole point of the domain.
+       */
+      insert({
+        kind: 'post',
+        title: event.title,
+        tags: event.tags,
+        visibility: 'workspace',
+        status: 'active',
+      });
+    } else if (event.type === 'post.edited') {
+      this.db()
+        .prepare(
+          `UPDATE items_current SET title = ?, tags_json = ?,
+         updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
+        )
+        .run(
+          event.title,
+          JSON.stringify(event.tags ?? []),
+          sequence,
+          event.createdAt,
+          event.postId,
+        );
+    } else if (event.type === 'post.archived') {
+      updateStatus('archived');
+    } else if (event.type === 'post.acknowledged') {
+      // One row per actor per post: acknowledging twice is the same statement,
+      // not a second one.
+      this.db()
+        .prepare(
+          `INSERT INTO post_acknowledgments
+             (post_id, actor_kind, actor_id, actor_display_name, note, acknowledged_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(post_id, actor_kind, actor_id) DO UPDATE SET
+             note = excluded.note,
+             acknowledged_at = excluded.acknowledged_at`,
+        )
+        .run(
+          event.postId,
+          event.actor.kind,
+          event.actor.id,
+          event.actor.displayName ?? null,
+          event.note ?? null,
+          event.createdAt,
+        );
+    } else if (event.type === 'post.acknowledgment.withdrawn') {
+      this.db()
+        .prepare(
+          'DELETE FROM post_acknowledgments WHERE post_id = ? AND actor_kind = ? AND actor_id = ?',
+        )
+        .run(event.postId, event.actor.kind, event.actor.id);
     } else if (event.type === 'note.revised') {
       this.db()
         .prepare(
@@ -762,35 +936,69 @@ export class SynomemStorage implements SynomemRepository {
           event.aggregateId,
         );
     } else if (event.type === 'note.archived') updateStatus('archived');
-    else if (event.type === 'todo.created') {
+    else if (event.type === 'task.created') {
       insert({
-        kind: 'todo',
+        kind: 'task',
         title: event.title,
         tags: event.tags,
         visibility: event.visibility,
         status: event.requiresAcceptance ? 'assigned' : 'open',
         assigneeAgentId: event.assigneeAgentId,
         assigneeDisplayName: event.assigneeDisplayName,
+        ...((due) => (due ? { dueAt: due } : {}))(dueInstant(event.due)),
       });
-    } else if (event.type === 'todo.updated') {
+    } else if (event.type === 'task.updated') {
       this.db()
         .prepare(
-          `UPDATE items_current SET title = ?, tags_json = ?, visibility = ?,
+          `UPDATE items_current SET title = ?, tags_json = ?, visibility = ?, due_at = ?,
          updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
         )
         .run(
           event.title,
           JSON.stringify(event.tags ?? []),
           event.visibility,
+          dueInstant(event.due) ?? null,
           sequence,
           event.createdAt,
           event.aggregateId,
         );
-    } else if (event.type === 'todo.accepted') updateStatus('open');
-    else if (event.type === 'todo.rejected') updateStatus('rejected');
-    else if (event.type === 'todo.completed') updateStatus('completed');
+    } else if (event.type === 'task.accepted') updateStatus('open');
+    else if (event.type === 'task.rejected') updateStatus('rejected');
+    else if (event.type === 'task.completed') updateStatus('completed');
+    else if (event.type === 'task.reopened') updateStatus('open');
+    else if (event.type === 'task.canceled') updateStatus('canceled');
+    else if (event.type === 'todo.created') {
+      // A Todo's owner IS its author, and it is always private. Recording the
+      // owner explicitly rather than inferring it from the actor keeps the
+      // owner-scoped read filters uniform across notes and todos.
+      insert({
+        kind: 'todo',
+        title: event.title,
+        tags: event.tags,
+        visibility: 'private',
+        status: 'open',
+        ownerAgentId: event.actor.id,
+        ...(event.actor.displayName ? { ownerDisplayName: event.actor.displayName } : {}),
+        ...((due) => (due ? { dueAt: due } : {}))(dueInstant(event.due)),
+      });
+    } else if (event.type === 'todo.updated') {
+      this.db()
+        .prepare(
+          `UPDATE items_current SET title = ?, tags_json = ?, due_at = ?,
+         updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
+        )
+        .run(
+          event.title,
+          JSON.stringify(event.tags ?? []),
+          dueInstant(event.due) ?? null,
+          sequence,
+          event.createdAt,
+          event.aggregateId,
+        );
+    } else if (event.type === 'todo.completed') updateStatus('completed');
     else if (event.type === 'todo.reopened') updateStatus('open');
     else if (event.type === 'todo.canceled') updateStatus('canceled');
+    else if (event.type === 'todo.archived') updateStatus('archived');
   }
 
   rebuildItemsCurrentIndex(): void {
@@ -1037,11 +1245,48 @@ export class SynomemStorage implements SynomemRepository {
     if (input.pending) {
       add(`((kind = 'kudos' AND status = 'unacknowledged') OR
         (kind = 'memo' AND status = 'unread') OR
-        (kind = 'todo' AND status IN ('assigned', 'open')))`);
+        (kind = 'task' AND status IN ('assigned', 'open')))`);
     }
     if (input.visibility) add('visibility = ?', input.visibility);
     if (input.from) add('created_at >= ?', input.from);
     if (input.to) add('created_at <= ?', input.to);
+
+    // Unanswered discovery: items still waiting for somebody to respond. Kept
+    // distinct from `pending`, which also counts accepted-and-in-progress work.
+    if (input.awaitingResponse) {
+      add(`((kind = 'kudos' AND status = 'unacknowledged') OR
+        (kind = 'memo' AND status = 'unread') OR
+        (kind = 'task' AND status = 'assigned'))`);
+    }
+    if (input.awaitingSince) add('created_at <= ?', input.awaitingSince);
+
+    // Overdue discovery: a deadline that has passed, on work still open. A
+    // completed or canceled item is not overdue, however late it was.
+    if (input.overdueAsOf) {
+      add(
+        `(due_at IS NOT NULL AND due_at < ? AND status IN ('assigned', 'open'))`,
+        input.overdueAsOf,
+      );
+    }
+
+    /*
+     * Private todos are owner-only for EVERY viewer, including a human.
+     *
+     * The visibility rules below exempt human actors, on the reasoning that a
+     * person operating a local home is its operator. That does not extend to
+     * todos: the plan is explicit that a todo is visible only to its owner
+     * except through an explicitly authorized administrative capability, and
+     * this release has no such capability. Without this clause a human actor
+     * would see every agent's private reminders in an item list.
+     */
+    add(
+      `(kind != 'todo' OR (owner_agent_id = ? AND ? = 'agent') OR (actor_id = ? AND actor_kind = ?))`,
+      viewer.id,
+      viewer.kind,
+      viewer.id,
+      viewer.kind,
+    );
+
     if (viewer.kind !== 'human') {
       if (viewer.kind === 'agent') {
         add(
@@ -1259,7 +1504,7 @@ export class SynomemStorage implements SynomemRepository {
         this.db()
           .prepare(
             `SELECT COUNT(*) AS count FROM events WHERE type IN
-       ('kudos.given', 'memo.sent', 'note.created', 'todo.created')`,
+       ('kudos.given', 'memo.sent', 'note.created', 'post.created', 'task.created')`,
           )
           .get() as { count: number }
       ).count,
@@ -1412,13 +1657,24 @@ export class SynomemStorage implements SynomemRepository {
           'note.created',
           'note.revised',
           'note.archived',
+          'post.created',
+          'post.edited',
+          'post.archived',
+          'post.acknowledged',
+          'post.acknowledgment.withdrawn',
+          'task.created',
+          'task.updated',
+          'task.completed',
+          'task.reopened',
+          'task.accepted',
+          'task.rejected',
+          'task.canceled',
           'todo.created',
           'todo.updated',
           'todo.completed',
           'todo.reopened',
-          'todo.accepted',
-          'todo.rejected',
           'todo.canceled',
+          'todo.archived',
         ]);
         if (
           (typeof candidate.schemaVersion === 'number' && candidate.schemaVersion > 1) ||
@@ -1436,7 +1692,7 @@ export class SynomemStorage implements SynomemRepository {
             legacy.kudosId ??
             legacy.memoId ??
             legacy.noteId ??
-            legacy.todoId ??
+            legacy.taskId ??
             (typeof legacy.agentId === 'string' ? legacy.agentId : undefined) ??
             (typeof legacy.agent === 'object' && legacy.agent !== null
               ? (legacy.agent as { id?: unknown }).id
@@ -1480,9 +1736,7 @@ export class SynomemStorage implements SynomemRepository {
         parsed.createdAt,
         parsed.createdAt,
       );
-    for (const alias of parsed.aliases ?? []) {
-      this.db().prepare('INSERT INTO aliases(alias, agent_id) VALUES (?, ?)').run(alias, parsed.id);
-    }
+    this.insertAliases(parsed.id, parsed.aliases ?? []);
   }
 
   updateAgent(profile: AgentProfile, updatedAt: string): void {
@@ -1491,22 +1745,206 @@ export class SynomemStorage implements SynomemRepository {
       .prepare('UPDATE agents SET display_name = ?, profile_json = ?, updated_at = ? WHERE id = ?')
       .run(parsed.displayName, JSON.stringify(parsed), updatedAt, parsed.id);
     this.db().prepare('DELETE FROM aliases WHERE agent_id = ?').run(parsed.id);
-    for (const alias of parsed.aliases ?? []) {
-      this.db().prepare('INSERT INTO aliases(alias, agent_id) VALUES (?, ?)').run(alias, parsed.id);
-    }
+    this.insertAliases(parsed.id, parsed.aliases ?? []);
   }
 
   getAgent(idOrAlias: string): AgentProfile | undefined {
-    const direct = this.db()
-      .prepare('SELECT profile_json FROM agents WHERE id = ?')
-      .get(idOrAlias) as ProfileRow | undefined;
-    if (direct) return profileSchema.parse(JSON.parse(direct.profile_json));
-    const alias = this.db()
+    const resolved = this.resolveAgent(idOrAlias);
+    return resolved.match;
+  }
+
+  /**
+   * Resolves a name to a canonical agent, reporting ambiguity rather than
+   * guessing.
+   *
+   * The plan is specific: `mycroft`, `Mycroft` and `Mike` may all resolve to one
+   * agent, but a name two visible agents both claim must return candidates. An
+   * alias that collides with a different agent's canonical ID is exactly that
+   * case — silently preferring the ID would attribute work to the wrong agent,
+   * and the person who typed the name would never know.
+   */
+  resolveAgent(query: string): { match?: AgentProfile; candidates: AgentProfile[] } {
+    const normalized = query.trim().toLowerCase();
+    const rows = this.db()
       .prepare(
-        'SELECT a.profile_json FROM agents a JOIN aliases x ON x.agent_id = a.id WHERE x.alias = ?',
+        `SELECT DISTINCT a.profile_json
+           FROM agents a
+           LEFT JOIN aliases x ON x.agent_id = a.id
+          WHERE lower(a.id) = ? OR x.normalized_alias = ?
+          ORDER BY a.id ASC`,
       )
-      .get(idOrAlias) as ProfileRow | undefined;
-    return alias ? profileSchema.parse(JSON.parse(alias.profile_json)) : undefined;
+      .all(normalized, normalized) as unknown as ProfileRow[];
+    const candidates = rows.map((row) => profileSchema.parse(JSON.parse(row.profile_json)));
+    return candidates.length === 1 ? { match: candidates[0]!, candidates } : { candidates };
+  }
+
+  /* -------------------------------------------------------- post acknowledgment */
+
+  listPostAcknowledgments(postId: string): PostAcknowledgment[] {
+    const rows = this.db()
+      .prepare(
+        `SELECT actor_kind, actor_id, actor_display_name, note, acknowledged_at
+           FROM post_acknowledgments WHERE post_id = ? ORDER BY acknowledged_at ASC`,
+      )
+      .all(postId) as unknown as Array<{
+      actor_kind: string;
+      actor_id: string;
+      actor_display_name: string | null;
+      note: string | null;
+      acknowledged_at: string;
+    }>;
+    return rows.map((row) => ({
+      actor: {
+        kind: row.actor_kind as ActorIdentity['kind'],
+        id: row.actor_id,
+        ...(row.actor_display_name ? { displayName: row.actor_display_name } : {}),
+      },
+      acknowledgedAt: row.acknowledged_at,
+      ...(row.note ? { note: row.note } : {}),
+    }));
+  }
+
+  /**
+   * Who has acknowledged a post and who has not.
+   *
+   * The denominator is agents that existed when the post was written. An agent
+   * created afterwards is counted separately rather than listed as
+   * outstanding — it was not there, and a roster that says otherwise accuses a
+   * newcomer of ignoring something written before it arrived.
+   */
+  postRoster(postId: string): PostRoster | undefined {
+    const post = this.db()
+      .prepare("SELECT created_at FROM items_current WHERE item_id = ? AND kind = 'post'")
+      .get(postId) as { created_at: string } | undefined;
+    if (!post) return undefined;
+
+    const acknowledged = this.listPostAcknowledgments(postId);
+    const acknowledgedIds = new Set(acknowledged.map((entry) => entry.actor.id));
+
+    const eligible = this.db()
+      .prepare('SELECT id, display_name, created_at FROM agents ORDER BY id ASC')
+      .all() as unknown as Array<{ id: string; display_name: string; created_at: string }>;
+
+    const outstanding = eligible
+      .filter((agent) => agent.created_at <= post.created_at && !acknowledgedIds.has(agent.id))
+      .map((agent) => ({ id: agent.id, displayName: agent.display_name }));
+    const joinedSince = eligible.filter((agent) => agent.created_at > post.created_at).length;
+
+    return { postId, acknowledged, outstanding, joinedSince };
+  }
+
+  /* ------------------------------------------------------- runtime bindings */
+
+  listRuntimeBindings(agentId: string): AgentRuntimeBinding[] {
+    const rows = this.db()
+      .prepare(
+        `SELECT id, agent_id, installation_id, runtime, profile, capabilities_json,
+                bound_at, last_seen_at
+           FROM agent_runtime_bindings WHERE agent_id = ? ORDER BY bound_at ASC`,
+      )
+      .all(agentId) as unknown as Array<{
+      id: string;
+      agent_id: string;
+      installation_id: string | null;
+      runtime: string;
+      profile: string | null;
+      capabilities_json: string;
+      bound_at: string;
+      last_seen_at: string | null;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      agentId: row.agent_id,
+      ...(row.installation_id ? { installationId: row.installation_id } : {}),
+      runtime: row.runtime,
+      ...(row.profile ? { profile: row.profile } : {}),
+      capabilities: JSON.parse(row.capabilities_json) as Record<string, JsonValue>,
+      boundAt: row.bound_at,
+      ...(row.last_seen_at ? { lastSeenAt: row.last_seen_at } : {}),
+    }));
+  }
+
+  bindRuntime(binding: {
+    id: string;
+    agentId: string;
+    installationId?: string;
+    runtime: string;
+    profile?: string;
+    capabilities?: Record<string, JsonValue>;
+    boundAt: string;
+  }): void {
+    this.db()
+      .prepare(
+        `INSERT INTO agent_runtime_bindings(
+           id, agent_id, installation_id, runtime, profile, capabilities_json, bound_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(agent_id, runtime, COALESCE(profile, ''), COALESCE(installation_id, ''))
+         DO UPDATE SET capabilities_json = excluded.capabilities_json`,
+      )
+      .run(
+        binding.id,
+        binding.agentId,
+        binding.installationId ?? null,
+        binding.runtime,
+        binding.profile ?? null,
+        JSON.stringify(binding.capabilities ?? {}),
+        binding.boundAt,
+      );
+  }
+
+  unbindRuntime(bindingId: string): boolean {
+    const result = this.db()
+      .prepare('DELETE FROM agent_runtime_bindings WHERE id = ?')
+      .run(bindingId);
+    return Number(result.changes) > 0;
+  }
+
+  /**
+   * Advisory only. Records that Synomem observed this binding act — never that
+   * the runtime is reachable now, and never that a delivery succeeded.
+   */
+  touchRuntimeBinding(agentId: string, runtime: string, at: string): void {
+    this.db()
+      .prepare(
+        'UPDATE agent_runtime_bindings SET last_seen_at = ? WHERE agent_id = ? AND runtime = ?',
+      )
+      .run(at, agentId, runtime);
+  }
+
+  /**
+   * Writes an agent's aliases, refusing any that would make a name ambiguous.
+   *
+   * Two collisions matter and both are rejected here rather than at lookup: an
+   * alias another agent already claims, and an alias equal to a different
+   * agent's canonical ID. Catching them at write means the person adding the
+   * alias sees the conflict, instead of a later reader silently getting one of
+   * two possible agents.
+   */
+  private insertAliases(agentId: string, aliases: string[]): void {
+    for (const alias of aliases) {
+      const normalized = alias.trim().toLowerCase();
+      const conflictingAgent = this.db()
+        .prepare('SELECT id FROM agents WHERE lower(id) = ? AND id != ?')
+        .get(normalized, agentId) as { id: string } | undefined;
+      if (conflictingAgent) {
+        throw new SynomemError(
+          'ALIAS_CONFLICT',
+          `Alias "${alias}" is already the canonical ID of agent ${conflictingAgent.id}. Aliases must resolve to exactly one agent.`,
+        );
+      }
+      const conflictingAlias = this.db()
+        .prepare('SELECT agent_id FROM aliases WHERE normalized_alias = ? AND agent_id != ?')
+        .get(normalized, agentId) as { agent_id: string } | undefined;
+      if (conflictingAlias) {
+        throw new SynomemError(
+          'ALIAS_CONFLICT',
+          `Alias "${alias}" already belongs to agent ${conflictingAlias.agent_id}. Aliases must resolve to exactly one agent.`,
+        );
+      }
+      this.db()
+        .prepare('INSERT INTO aliases(alias, agent_id, normalized_alias) VALUES (?, ?, ?)')
+        .run(alias, agentId, normalized);
+    }
   }
 
   listAgents(): AgentProfile[] {

@@ -34,7 +34,7 @@ import type {
   KudosSummary,
   ItemListInput,
   ItemSummary,
-  TodoDue,
+  TaskDue,
 } from './types.js';
 import { packageVersion } from './version.js';
 import type { SynomemService, SynomemServiceFactory } from './service.js';
@@ -125,11 +125,11 @@ function defaultActor(
   return actor(env.SYNOMEM_ACTOR_KIND?.trim() || fallbackKind, id, env.SYNOMEM_ACTOR_NAME?.trim());
 }
 
-function todoDue(options: {
+function taskDue(options: {
   dueDate?: string;
   dueAt?: string;
   timeZone?: string;
-}): TodoDue | undefined {
+}): TaskDue | undefined {
   if (options.dueDate && options.dueAt)
     throw new SynomemError('INVALID_INPUT', 'Use due-date or due-at, not both.');
   if (options.dueDate) return { kind: 'date', date: options.dueDate };
@@ -637,29 +637,73 @@ export function createCli(
     .option('--yes', 'apply the displayed plan', false)
     .option('--force', 'replace a conflicting synomem directory', false)
     .option('--link', 'symlink to the packaged skill instead of copying it', false)
-    .option('--actor-id <id>', 'print actor-bound MCP registration commands')
-    .option('--actor-name <name>', 'display name used in MCP registration commands')
+    .option('--agent <id-or-alias>', 'bind this installation to an agent')
     .action(
-      (
+      async (
         options: {
           runtime: string[];
           yes: boolean;
           force: boolean;
           link: boolean;
-          actorId?: string;
-          actorName?: string;
+          agent?: string;
         },
         command: Command,
       ) => {
         const global = globals(command);
+        const runtimes = skillRuntimes(options.runtime);
+
+        /*
+         * The agent is resolved BEFORE anything is written. An ambiguous or
+         * unknown name then stops the command with a name to fix, rather than
+         * leaving a skill installed and pointed at an agent that does not
+         * exist.
+         */
+        let agentId: string | undefined;
+        if (options.agent) {
+          agentId = await withClient(
+            global.home,
+            defaultActor(env, 'system', 'cli'),
+            async (client) => {
+              const resolution = await client.agents.resolve(options.agent!);
+              if (!resolution.match) {
+                throw new SynomemError(
+                  'AGENT_NOT_FOUND',
+                  resolution.candidates.length
+                    ? `"${options.agent}" matches ${resolution.candidates.length} agents: ${resolution.candidates
+                        .map((candidate) => candidate.id)
+                        .join(', ')}. Name one of them.`
+                    : `Unknown agent: ${options.agent}`,
+                );
+              }
+              return resolution.match.id;
+            },
+          );
+        }
+
         const result = installSkill({
-          runtimes: skillRuntimes(options.runtime),
+          ...(runtimes ? { runtimes } : {}),
           apply: options.yes,
           force: options.force,
           link: options.link,
-          actorId: options.actorId,
-          actorName: options.actorName,
+          ...(agentId ? { agentId } : {}),
         });
+
+        // Bindings follow what was actually installed, and only on a real run:
+        // a dry run must not claim a binding it did not make, and a runtime
+        // whose harness is not present here is not somewhere this agent runs.
+        if (agentId && options.yes) {
+          const installed = result.locations
+            .filter((location) => location.state !== 'unavailable')
+            .map((location) => location.runtime);
+          if (installed.length) {
+            await withClient(global.home, defaultActor(env, 'system', 'cli'), async (client) => {
+              for (const runtime of installed) {
+                await client.agents.bindRuntime({ agentId, runtime });
+              }
+            });
+          }
+        }
+
         output(io, global.json, result, formatSkillResult(result, 'install'));
       },
     );
@@ -668,19 +712,15 @@ export function createCli(
     .command('status')
     .description('Show installed, stale, missing, or conflicting skill copies')
     .option('--runtime <runtime>', `${skillRuntimeHelp} (repeatable)`, collect, [])
-    .option('--actor-id <id>', 'print actor-bound MCP registration commands')
-    .option('--actor-name <name>', 'display name used in MCP registration commands')
-    .action(
-      (options: { runtime: string[]; actorId?: string; actorName?: string }, command: Command) => {
-        const global = globals(command);
-        const result = skillStatus({
-          runtimes: skillRuntimes(options.runtime),
-          actorId: options.actorId,
-          actorName: options.actorName,
-        });
-        output(io, global.json, result, formatSkillResult(result, 'status'));
-      },
-    );
+    .option('--agent <id>', 'print the registration command for this agent')
+    .action((options: { runtime: string[]; agent?: string }, command: Command) => {
+      const global = globals(command);
+      const result = skillStatus({
+        runtimes: skillRuntimes(options.runtime),
+        ...(options.agent ? { agentId: options.agent } : {}),
+      });
+      output(io, global.json, result, formatSkillResult(result, 'status'));
+    });
 
   skillCommand
     .command('uninstall')
@@ -762,6 +802,293 @@ export function createCli(
       },
     );
 
+  agentCommand
+    .command('resolve <name>')
+    .description('Resolve a name or alias to one agent, or list the candidates')
+    .action(async (name: string, _options, command: Command) => {
+      const global = globals(command);
+      const resolution = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli'),
+        (client) => client.agents.resolve(name),
+      );
+      // An ambiguous name is a question, not a failure: exit zero and show the
+      // candidates so the caller can pick one.
+      const human = resolution.match
+        ? `${resolution.match.displayName} (${resolution.match.id})`
+        : resolution.candidates.length
+          ? `"${resolution.query}" is ambiguous. Candidates:\n${resolution.candidates
+              .map((profile) => `  ${profile.id}  ${profile.displayName}`)
+              .join('\n')}`
+          : `No agent answers to "${resolution.query}".`;
+      output(io, global.json, resolution, human);
+    });
+
+  agentCommand
+    .command('directory')
+    .description('List agents with their runtime bindings')
+    .action(async (_options, command: Command) => {
+      const global = globals(command);
+      const entries = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
+        client.agents.directory(),
+      );
+      const human = entries.length
+        ? entries
+            .map((entry) => {
+              const runtimes = entry.runtimeBindings.length
+                ? entry.runtimeBindings
+                    .map(
+                      (binding) =>
+                        `    ${binding.runtime}${binding.profile ? `/${binding.profile}` : ''}` +
+                        // Last-seen is advisory, so it is labelled as an
+                        // observation rather than a status.
+                        `${binding.lastSeenAt ? `  last seen ${binding.lastSeenAt}` : '  not yet seen'}`,
+                    )
+                    .join('\n')
+                : '    no runtime bindings';
+              return `${entry.profile.id}  ${entry.profile.displayName}\n${runtimes}`;
+            })
+            .join('\n')
+        : 'No agents configured.';
+      output(io, global.json, { entries }, human);
+    });
+
+  const runtimeCommand = agentCommand.command('runtime').description('Record where an agent runs');
+
+  runtimeCommand
+    .command('bind <agent>')
+    .description('Bind an agent to a runtime')
+    .requiredOption('--runtime <name>', 'runtime family, e.g. claude-code')
+    .option('--profile <name>', 'named configuration within the runtime')
+    .option('--installation <id>', 'hosted installation this binding belongs to')
+    .action(
+      async (
+        agent: string,
+        options: { runtime: string; profile?: string; installation?: string },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const binding = await withClient(
+          global.home,
+          defaultActor(env, 'system', 'cli'),
+          (client) =>
+            client.agents.bindRuntime({
+              agentId: agent,
+              runtime: options.runtime,
+              ...(options.profile ? { profile: options.profile } : {}),
+              ...(options.installation ? { installationId: options.installation } : {}),
+            }),
+        );
+        output(
+          io,
+          global.json,
+          binding,
+          `Bound ${binding.agentId} to ${binding.runtime}${binding.profile ? `/${binding.profile}` : ''} (${binding.id})`,
+        );
+      },
+    );
+
+  runtimeCommand
+    .command('list <agent>')
+    .description('List an agent runtime bindings')
+    .action(async (agent: string, _options, command: Command) => {
+      const global = globals(command);
+      const bindings = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
+        client.agents.bindings(agent),
+      );
+      const human = bindings.length
+        ? bindings
+            .map(
+              (binding) =>
+                `${binding.id}  ${binding.runtime}${binding.profile ? `/${binding.profile}` : ''}  bound ${binding.boundAt}`,
+            )
+            .join('\n')
+        : 'No runtime bindings.';
+      output(io, global.json, { bindings }, human);
+    });
+
+  runtimeCommand
+    .command('unbind <binding-id>')
+    .description('Remove a runtime binding')
+    .action(async (bindingId: string, _options, command: Command) => {
+      const global = globals(command);
+      const removed = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
+        client.agents.unbindRuntime(bindingId),
+      );
+      output(
+        io,
+        global.json,
+        { removed },
+        removed ? `Removed binding ${bindingId}.` : `No binding ${bindingId}.`,
+      );
+    });
+
+  const postCommand = program.command('post').description('Publish to everyone in the workspace');
+
+  postCommand
+    .command('create')
+    .description('Publish a post the whole workspace can read')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .requiredOption('--title <title>')
+    .requiredOption('--body <body>')
+    .option('--tag <tag>', 'repeatable', collect, [])
+    .option('--reply-to <post-id>')
+    .action(
+      async (
+        options: {
+          as: string;
+          actorKind: string;
+          title: string;
+          body: string;
+          tag: string[];
+          replyTo?: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const result = await withClient(
+          global.home,
+          actor(options.actorKind, options.as),
+          (client) =>
+            client.posts.create({
+              title: options.title,
+              body: options.body,
+              ...(options.tag.length ? { tags: options.tag } : {}),
+              ...(options.replyTo ? { replyTo: options.replyTo } : {}),
+            }),
+        );
+        output(io, global.json, result, `Published ${result.record.event.id}`);
+      },
+    );
+
+  postCommand
+    .command('list')
+    .description('List posts in this workspace')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .option('--limit <n>', 'default 10, maximum 50')
+    .action(
+      async (options: { as: string; actorKind: string; limit?: string }, command: Command) => {
+        const global = globals(command);
+        const page = await withClient(global.home, actor(options.actorKind, options.as), (client) =>
+          client.posts.list(options.limit ? { limit: Number(options.limit) } : {}),
+        );
+        const human = page.items.length
+          ? page.items.map((item) => `${item.id}  ${item.title}`).join('\n')
+          : 'No posts yet.';
+        output(io, global.json, page, human);
+      },
+    );
+
+  postCommand
+    .command('show <post-id>')
+    .description('Show one post with its acknowledgements')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .action(
+      async (postId: string, options: { as: string; actorKind: string }, command: Command) => {
+        const global = globals(command);
+        const record = await withClient(
+          global.home,
+          actor(options.actorKind, options.as),
+          (client) => client.posts.get(postId),
+        );
+        const acks = record.acknowledgments.length
+          ? record.acknowledgments
+              .map((entry) => `  ${entry.actor.id}${entry.note ? ` — ${entry.note}` : ''}`)
+              .join('\n')
+          : '  none yet';
+        output(
+          io,
+          global.json,
+          record,
+          `${record.title}\n\n${record.body}\n\nAcknowledged by:\n${acks}`,
+        );
+      },
+    );
+
+  postCommand
+    .command('acknowledge <post-id>')
+    .description('Say you have seen a post')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .option('--note <text>', 'optional context for the author')
+    .action(
+      async (
+        postId: string,
+        options: { as: string; actorKind: string; note?: string },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const record = await withClient(
+          global.home,
+          actor(options.actorKind, options.as),
+          (client) =>
+            client.posts.acknowledge({
+              postId,
+              ...(options.note ? { note: options.note } : {}),
+            }),
+        );
+        output(io, global.json, record, `Acknowledged ${postId}`);
+      },
+    );
+
+  postCommand
+    .command('roster <post-id>')
+    .description('Who has acknowledged a post, and who has not')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .action(
+      async (postId: string, options: { as: string; actorKind: string }, command: Command) => {
+        const global = globals(command);
+        const roster = await withClient(
+          global.home,
+          actor(options.actorKind, options.as),
+          (client) => client.posts.roster(postId),
+        );
+        // "Outstanding" means no acknowledgement recorded — never that somebody
+        // has not read it, which this cannot know.
+        const lines = [
+          `Acknowledged (${roster.acknowledged.length}):`,
+          ...(roster.acknowledged.length
+            ? roster.acknowledged.map((entry) => `  ${entry.actor.id}`)
+            : ['  none yet']),
+          `No acknowledgement recorded (${roster.outstanding.length}):`,
+          ...(roster.outstanding.length
+            ? roster.outstanding.map((entry) => `  ${entry.id}`)
+            : ['  none']),
+        ];
+        if (roster.joinedSince > 0) {
+          lines.push(`${roster.joinedSince} agent(s) joined after this was posted.`);
+        }
+        output(io, global.json, roster, lines.join('\n'));
+      },
+    );
+
+  postCommand
+    .command('archive <post-id>')
+    .description('Archive a post you wrote')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .option('--reason <text>')
+    .action(
+      async (
+        postId: string,
+        options: { as: string; actorKind: string; reason?: string },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const record = await withClient(
+          global.home,
+          actor(options.actorKind, options.as),
+          (client) =>
+            client.posts.archive({ postId, ...(options.reason ? { reason: options.reason } : {}) }),
+        );
+        output(io, global.json, record, `Archived ${postId}`);
+      },
+    );
+
   const kudosCommand = program.command('kudos').description('Give and manage agent recognition');
 
   kudosCommand
@@ -819,7 +1146,7 @@ export function createCli(
 
   program
     .command('inbox [agent]')
-    .description('Show pending kudos, memos, and todos for an agent')
+    .description('Show pending kudos, memos, and tasks for an agent')
     .option('--as <agent-id>', 'defaults to the positional agent')
     .option('--limit <number>', 'maximum results (default 10, maximum 50)', '10')
     .option('--cursor <cursor>', 'opaque cursor returned by the previous page')
@@ -876,7 +1203,7 @@ export function createCli(
   program
     .command('list')
     .description('List compact summaries across all record types')
-    .option('--kind <kind>', 'kudos, memo, note, or todo (repeatable)', collect, [])
+    .option('--kind <kind>', 'kudos, memo, note, or task (repeatable)', collect, [])
     .option('--participant <agent>')
     .option('--actor <id>')
     .option('--tag <tag>')
@@ -1194,8 +1521,163 @@ export function createCli(
       },
     );
 
-  const todoCommand = program.command('todo').description('Create and manage agent todos');
+  const todoCommand = program
+    .command('todo')
+    .description('Create and manage your own private reminders');
   todoCommand
+    .command('create')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .requiredOption('--title <title>')
+    .option('--details <text>', 'private working detail')
+    .option('--priority <number>', '1 highest, 4 lowest', '3')
+    .option('--due-date <date>')
+    .option('--due-at <datetime>')
+    .option('--time-zone <iana-zone>')
+    .option('--tag <tag>', 'tag (repeatable)', collect, [])
+    .option('--idempotency-key <key>')
+    .action(
+      async (
+        options: {
+          as: string;
+          actorKind: string;
+          title: string;
+          details?: string;
+          priority: string;
+          dueDate?: string;
+          dueAt?: string;
+          timeZone?: string;
+          tag: string[];
+          idempotencyKey?: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const result = await withClient(
+          global.home,
+          actor(options.actorKind, options.as),
+          (client) =>
+            client.todos.create({
+              title: options.title,
+              ...(options.details ? { details: options.details } : {}),
+              priority: Number(options.priority) as 1 | 2 | 3 | 4,
+              ...((due) => (due ? { due } : {}))(taskDue(options)),
+              ...(options.tag.length ? { tags: options.tag } : {}),
+              ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+            }),
+        );
+        output(
+          io,
+          global.json,
+          result,
+          `${result.deduplicated ? 'Found existing' : 'Created'} private todo\nTitle: ${result.record.current.title}\nID: ${result.record.event.id}`,
+        );
+      },
+    );
+  todoCommand
+    .command('list')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .option('--status <status>')
+    .option('--limit <number>', 'maximum results', '10')
+    .action(
+      async (
+        options: { as: string; actorKind: string; status?: string; limit: string },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const page = await withClient(global.home, actor(options.actorKind, options.as), (client) =>
+          client.todos.list({
+            ...(options.status ? { status: options.status } : {}),
+            limit: Number(options.limit),
+          }),
+        );
+        output(
+          io,
+          global.json,
+          page,
+          page.items.length
+            ? page.items
+                .map((item) => `${item.id}  ${item.status.padEnd(9)}  ${item.title}`)
+                .join('\n')
+            : 'No todos.',
+        );
+      },
+    );
+  todoCommand
+    .command('show <todo-id>')
+    .requiredOption('--as <actor-id>')
+    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .action(async (id: string, options: { as: string; actorKind: string }, command: Command) => {
+      const global = globals(command);
+      const record = await withClient(global.home, actor(options.actorKind, options.as), (client) =>
+        client.todos.get(id),
+      );
+      output(
+        io,
+        global.json,
+        record,
+        `${record.current.title}\nStatus: ${record.status}\nPriority: ${record.current.priority}\nVersion: ${record.current.version}${record.current.details ? `\n\n${record.current.details}` : ''}`,
+      );
+    });
+  for (const operation of ['complete', 'reopen', 'cancel', 'archive'] as const) {
+    todoCommand
+      .command(`${operation} <todo-id>`)
+      .requiredOption('--as <actor-id>')
+      .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+      .option('--note <text>')
+      .option('--reason <text>')
+      .option('--idempotency-key <key>')
+      .action(
+        async (
+          id: string,
+          options: {
+            as: string;
+            actorKind: string;
+            note?: string;
+            reason?: string;
+            idempotencyKey?: string;
+          },
+          command: Command,
+        ) => {
+          const global = globals(command);
+          const record = await withClient(
+            global.home,
+            actor(options.actorKind, options.as),
+            (client) =>
+              operation === 'complete'
+                ? client.todos.complete({
+                    todoId: id,
+                    ...(options.note ? { note: options.note } : {}),
+                    ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+                  })
+                : operation === 'cancel'
+                  ? client.todos.cancel({
+                      todoId: id,
+                      ...(options.reason ? { reason: options.reason } : {}),
+                      ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+                    })
+                  : operation === 'archive'
+                    ? client.todos.archive({
+                        todoId: id,
+                        ...(options.idempotencyKey
+                          ? { idempotencyKey: options.idempotencyKey }
+                          : {}),
+                      })
+                    : client.todos.reopen({
+                        todoId: id,
+                        ...(options.idempotencyKey
+                          ? { idempotencyKey: options.idempotencyKey }
+                          : {}),
+                      }),
+          );
+          output(io, global.json, record, `Todo ${id} is now ${record.status}.`);
+        },
+      );
+  }
+
+  const taskCommand = program.command('task').description('Create and manage agent tasks');
+  taskCommand
     .command('create <assignee>')
     .requiredOption('--from <actor-id>')
     .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
@@ -1231,12 +1713,12 @@ export function createCli(
           global.home,
           actor(options.actorKind, options.from),
           (client) =>
-            client.todos.create({
+            client.tasks.create({
               assigneeAgentId: assignee,
               title: options.title,
               ...(options.description ? { description: options.description } : {}),
               priority: Number(options.priority) as 1 | 2 | 3 | 4,
-              ...((due) => (due ? { due } : {}))(todoDue(options)),
+              ...((due) => (due ? { due } : {}))(taskDue(options)),
               ...(options.tag.length ? { tags: options.tag } : {}),
               visibility: options.visibility,
               ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
@@ -1246,11 +1728,11 @@ export function createCli(
           io,
           global.json,
           result,
-          `${result.deduplicated ? 'Found existing' : 'Created'} todo for ${result.record.event.assigneeDisplayName}\nTitle: ${result.record.current.title}\nID: ${result.record.event.id}`,
+          `${result.deduplicated ? 'Found existing' : 'Created'} task for ${result.record.event.assigneeDisplayName}\nTitle: ${result.record.current.title}\nID: ${result.record.event.id}`,
         );
       },
     );
-  todoCommand
+  taskCommand
     .command('list')
     .option('--assignee <agent>')
     .option('--status <status>')
@@ -1262,21 +1744,21 @@ export function createCli(
           global.home,
           defaultActor(env, 'human', 'local-cli'),
           (client) =>
-            client.todos.list({
+            client.tasks.list({
               ...(options.assignee ? { participantAgentId: options.assignee } : {}),
               ...(options.status ? { status: options.status } : {}),
               limit: Number(options.limit),
             }),
         );
-        output(io, global.json, page, page.items.map(lineForItem).join('\n') || 'No todos found.');
+        output(io, global.json, page, page.items.map(lineForItem).join('\n') || 'No tasks found.');
       },
     );
-  todoCommand.command('show <todo-id>').action(async (id: string, _options, command: Command) => {
+  taskCommand.command('show <task-id>').action(async (id: string, _options, command: Command) => {
     const global = globals(command);
     const record = await withClient(
       global.home,
       defaultActor(env, 'human', 'local-cli'),
-      (client) => client.todos.get(id),
+      (client) => client.tasks.get(id),
     );
     output(
       io,
@@ -1285,8 +1767,8 @@ export function createCli(
       `${record.current.title}\nID: ${record.event.id}\nStatus: ${record.status}\nVersion: ${record.current.version}`,
     );
   });
-  todoCommand
-    .command('update <todo-id>')
+  taskCommand
+    .command('update <task-id>')
     .requiredOption('--as <actor-id>')
     .option('--actor-kind <kind>', 'agent or human', 'agent')
     .requiredOption('--expected-version <number>')
@@ -1319,13 +1801,13 @@ export function createCli(
         command: Command,
       ) => {
         const global = globals(command);
-        const parsedDue = todoDue(options);
+        const parsedDue = taskDue(options);
         const record = await withClient(
           global.home,
           actor(options.actorKind, options.as),
           (client) =>
-            client.todos.update({
-              todoId: id,
+            client.tasks.update({
+              taskId: id,
               expectedVersion: Number(options.expectedVersion),
               ...(options.title ? { title: options.title } : {}),
               ...(options.description !== undefined ? { description: options.description } : {}),
@@ -1335,71 +1817,78 @@ export function createCli(
               ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
             }),
         );
-        output(io, global.json, record, `Updated todo ${id} to version ${record.current.version}.`);
+        output(io, global.json, record, `Updated task ${id} to version ${record.current.version}.`);
       },
     );
   for (const operation of ['accept', 'reject', 'complete', 'reopen', 'cancel'] as const) {
-    todoCommand
-      .command(`${operation} <todo-id>`)
+    const command_ = taskCommand
+      .command(`${operation} <task-id>`)
       .requiredOption('--as <actor-id>')
       .option('--actor-kind <kind>', 'agent or human', 'agent')
       .option('--note <text>')
       .option('--reason <text>')
-      .option('--idempotency-key <key>')
-      .action(
-        async (
-          id: string,
-          options: {
-            as: string;
-            actorKind: string;
-            note?: string;
-            reason?: string;
-            idempotencyKey?: string;
-          },
-          command: Command,
-        ) => {
-          const global = globals(command);
-          const record = await withClient(
-            global.home,
-            actor(options.actorKind, options.as),
-            (client) =>
-              operation === 'accept'
-                ? client.todos.accept({
-                    todoId: id,
+      .option('--idempotency-key <key>');
+    // Rejecting requires saying why; accepting may. Marked required at the
+    // parser so the CLI refuses before touching the store.
+    if (operation === 'reject') {
+      command_.requiredOption('--response <text>', 'why the task is being refused');
+    } else if (operation === 'accept') {
+      command_.option('--response <text>', 'conditions, timing, or partial capability');
+    }
+    command_.action(
+      async (
+        id: string,
+        options: {
+          as: string;
+          actorKind: string;
+          note?: string;
+          reason?: string;
+          response?: string;
+          idempotencyKey?: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const record = await withClient(
+          global.home,
+          actor(options.actorKind, options.as),
+          (client) =>
+            operation === 'accept'
+              ? client.tasks.accept({
+                  taskId: id,
+                  ...(options.response ? { response: options.response } : {}),
+                  ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+                })
+              : operation === 'reject'
+                ? client.tasks.reject({
+                    taskId: id,
+                    response: options.response ?? options.reason ?? '',
                     ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
                   })
-                : operation === 'reject'
-                  ? client.todos.reject({
-                      todoId: id,
-                      ...(options.reason ? { reason: options.reason } : {}),
+                : operation === 'complete'
+                  ? client.tasks.complete({
+                      taskId: id,
+                      ...(options.note ? { note: options.note } : {}),
                       ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
                     })
-                  : operation === 'complete'
-                    ? client.todos.complete({
-                        todoId: id,
-                        ...(options.note ? { note: options.note } : {}),
+                  : operation === 'cancel'
+                    ? client.tasks.cancel({
+                        taskId: id,
+                        ...(options.reason ? { reason: options.reason } : {}),
                         ...(options.idempotencyKey
                           ? { idempotencyKey: options.idempotencyKey }
                           : {}),
                       })
-                    : operation === 'cancel'
-                      ? client.todos.cancel({
-                          todoId: id,
-                          ...(options.reason ? { reason: options.reason } : {}),
-                          ...(options.idempotencyKey
-                            ? { idempotencyKey: options.idempotencyKey }
-                            : {}),
-                        })
-                      : client.todos.reopen({
-                          todoId: id,
-                          ...(options.idempotencyKey
-                            ? { idempotencyKey: options.idempotencyKey }
-                            : {}),
-                        }),
-          );
-          output(io, global.json, record, `Todo ${id} is ${record.status}.`);
-        },
-      );
+                    : client.tasks.reopen({
+                        taskId: id,
+                        ...(options.idempotencyKey
+                          ? { idempotencyKey: options.idempotencyKey }
+                          : {}),
+                      }),
+        );
+        output(io, global.json, record, `Task ${id} is ${record.status}.`);
+      },
+    );
   }
 
   kudosCommand
@@ -1621,18 +2110,44 @@ export function createCli(
   program
     .command('mcp')
     .description('Run the actor-bound MCP server over stdio')
-    .requiredOption('--actor-id <id>')
-    .requiredOption('--actor-kind <kind>', 'human, agent, or system')
-    .option('--actor-name <display-name>')
+    .option('--agent-id <id>', 'bound agent, whose identity is read from Synomem')
+    .option('--actor-id <id>', 'bound non-agent actor ID')
+    .option('--actor-kind <kind>', 'human or system')
+    .option('--actor-name <display-name>', 'display name for a non-agent actor')
     .action(
       async (
-        options: { actorId: string; actorKind: string; actorName?: string },
+        options: { agentId?: string; actorId?: string; actorKind?: string; actorName?: string },
         command: Command,
       ) => {
         const global = globals(command);
+        // An agent's name comes from its profile, never from the command line:
+        // the name is written into every event the session appends, and a
+        // harness must not be able to sign another agent's name to work.
+        const bound = options.agentId
+          ? await withClient(global.home, defaultActor(env, 'system', 'cli'), async (client) => {
+              const resolution = await client.agents.resolve(options.agentId!);
+              if (!resolution.match) {
+                throw new SynomemError(
+                  'AGENT_NOT_FOUND',
+                  resolution.candidates.length
+                    ? `"${options.agentId}" matches ${resolution.candidates.length} agents: ${resolution.candidates
+                        .map((candidate) => candidate.id)
+                        .join(', ')}. Name one of them.`
+                    : `Unknown agent: ${options.agentId}`,
+                );
+              }
+              return actor('agent', resolution.match.id, resolution.match.displayName);
+            })
+          : undefined;
+        if (!bound && !(options.actorId && options.actorKind)) {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            'Specify --agent-id, or --actor-id with --actor-kind for a non-agent actor.',
+          );
+        }
         await startMcpServer({
           ...(global.home ? { home: global.home } : {}),
-          actor: actor(options.actorKind, options.actorId, options.actorName),
+          actor: bound ?? actor(options.actorKind!, options.actorId!, options.actorName),
         });
       },
     );

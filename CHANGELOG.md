@@ -5,6 +5,43 @@ All notable changes will be documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Posts: publication to everyone in a workspace, with per-actor acknowledgements
+  so an author can see who has responded. A post has no recipient and no
+  assignee — work for one actor is a memo or a task.
+- `post roster` answers who has acknowledged and who has not, counting agents
+  created after the post separately rather than listing them as outstanding.
+- Schema version 6 adds `post_acknowledgments`.
+
+### Changed
+
+- The MCP server binds to an agent with `--agent-id`, reading the display name and actor kind from
+  the agent's profile. `synomem skill install --agent <id-or-alias>` resolves the agent before
+  writing anything, records a runtime binding for each runtime it installs, and generates a
+  registration command carrying only the canonical ID.
+
+## [0.2.0] - 2026-09-05
+
+### Added
+
+- Private todos as a distinct domain: a todo belongs to the agent that wrote it, is visible to no
+  one else, and cannot be assigned. Work meant for another agent is a task.
+- Optional responses when accepting a task and required responses when rejecting one, so a refusal
+  always tells the assigner why.
+- Discovery for work that has stalled: tasks awaiting a response and tasks past their deadline.
+- Case-insensitive agent aliases with `agent resolve`, which returns candidates instead of guessing
+  when several agents answer to one name, and `agent directory`.
+- Advisory runtime bindings recording where an agent was registered to run, with `agent runtime
+bind`, `list`, and `unbind`, and the matching `synomem_agent_resolve` and
+  `synomem_agent_directory` MCP tools.
+
+### Changed
+
+- Schema version 5 adds a normalized alias column with a unique index and an
+  `agent_runtime_bindings` table. Existing databases migrate in place.
+- Aliases are stored folded to lowercase, so one name cannot be claimed twice in two casings.
+
 ## [0.1.1] - 2026-09-04
 
 ### Fixed

@@ -44,7 +44,7 @@ reconstruct one requested aggregate. Generated Markdown is never a machine query
 ## Authorization
 
 MCP servers bind one actor at startup, and tool inputs cannot override it. Humans have local
-administrative authority. Agents can manage their own notes, recipient memo state, and todos they
+administrative authority. Agents can manage their own notes and todos, recipient memo state, and tasks they
 created or received. System actors have no implicit agent or administrator authority. Actor
 principals are keyed by both kind and ID; matching text IDs across kinds do not share author access.
 
@@ -55,7 +55,7 @@ The filesystem owner remains the ultimate local authority.
 ## Concurrency and durability
 
 SQLite uses WAL, foreign keys, `synchronous=FULL`, a bounded busy handler, and `BEGIN IMMEDIATE`
-transactions. Actor-scoped idempotency protects retries. Note and todo revisions use aggregate
+transactions. Actor-scoped idempotency protects retries. Note, task, and todo revisions use aggregate
 versions so stale writes fail with `REVISION_CONFLICT` rather than overwriting concurrent state.
 
 V1 supports one machine and one filesystem owner. A future hosted service must enforce the same

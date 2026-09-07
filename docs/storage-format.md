@@ -18,8 +18,8 @@ title: Storage format
     ├── profile.json
     ├── WINS.md
     ├── MEMORY.md
-    ├── TODOS.md
-    ├── inbox/{kudos,memos,todos}/<item-id>.md
+    ├── TASKS.md
+    ├── inbox/{kudos,memos,tasks}/<item-id>.md
     └── NOTES.md
 ```
 
@@ -58,7 +58,7 @@ Schema version 3 contains:
 - `schema_migrations`: applied database migrations.
 
 Events use transactionally assigned ingestion sequences for cursors and watermarks. Aggregate
-versions provide optimistic concurrency for notes and todos. Actor-scoped idempotency keys protect
+versions provide optimistic concurrency for notes and tasks. Actor-scoped idempotency keys protect
 all retryable mutations.
 
 Current tables and files are rebuildable. Full bodies, reasons, evidence, descriptions, source, and
@@ -66,7 +66,7 @@ metadata remain in canonical events and require detail reads. Machine APIs never
 
 ## Generated and owned files
 
-`profile.json`, `WINS.md`, `MEMORY.md`, `TODOS.md`, and inbox entries are generated. Normal mutations
+`profile.json`, `WINS.md`, `MEMORY.md`, `TASKS.md`, and inbox entries are generated. Normal mutations
 synchronize only affected agents; `synomem rebuild` performs full deterministic regeneration.
 Cleanup removes only manifest-listed regular files and never follows symlinks.
 

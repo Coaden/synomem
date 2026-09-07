@@ -4,16 +4,21 @@ import type { SynomemService, SynomemServiceCapabilities, SynomemServiceInfo } f
 import type {
   ActorIdentity,
   ChangesInput,
+  BindRuntimeInput,
   CreateAgentInput,
+  CreatePostInput,
+  UpdatePostInput,
   CreateNoteInput,
-  CreateTodoInput,
+  CreateTaskInput,
   GiveKudosInput,
   ItemListInput,
   KudosListInput,
   ReviseNoteInput,
   SendMemoInput,
   UpdateAgentInput,
+  UpdateTaskInput,
   UpdateTodoInput,
+  CreateTodoInput,
 } from './types.js';
 
 const defaultMaximumResponseBytes = 1024 * 1024;
@@ -169,6 +174,78 @@ export class RemoteSynomemService implements SynomemService {
       ),
     list: () =>
       this.request<Awaited<ReturnType<SynomemService['agents']['list']>>>('GET', 'agents'),
+    resolve: (query: string) =>
+      this.request<Awaited<ReturnType<SynomemService['agents']['resolve']>>>(
+        'GET',
+        `agents/resolve?query=${encodeURIComponent(query)}`,
+      ),
+    directory: () =>
+      this.request<Awaited<ReturnType<SynomemService['agents']['directory']>>>(
+        'GET',
+        'agents/directory',
+      ),
+    bindings: (idOrAlias: string) =>
+      this.request<Awaited<ReturnType<SynomemService['agents']['bindings']>>>(
+        'GET',
+        `agents/${encodeURIComponent(idOrAlias)}/runtimes`,
+      ),
+    bindRuntime: (input: BindRuntimeInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['agents']['bindRuntime']>>>(
+        'POST',
+        `agents/${encodeURIComponent(input.agentId)}/runtimes`,
+        input,
+      ),
+    unbindRuntime: (bindingId: string) =>
+      this.request<Awaited<ReturnType<SynomemService['agents']['unbindRuntime']>>>(
+        'DELETE',
+        `agents/runtimes/${encodeURIComponent(bindingId)}`,
+      ),
+  };
+
+  readonly posts = {
+    create: (input: CreatePostInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['posts']['create']>>>('POST', 'posts', input),
+    list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
+      this.request<Awaited<ReturnType<SynomemService['posts']['list']>>>(
+        'GET',
+        `posts${queryString(input)}`,
+      ),
+    get: (id: string) =>
+      this.request<Awaited<ReturnType<SynomemService['posts']['get']>>>(
+        'GET',
+        `posts/${encodeURIComponent(id)}`,
+      ),
+    update: (input: UpdatePostInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['posts']['update']>>>(
+        'POST',
+        `posts/${encodeURIComponent(input.postId)}/revisions`,
+        input,
+        ['postId'],
+      ),
+    archive: (input: { postId: string; reason?: string; idempotencyKey?: string }) =>
+      this.mutation<Awaited<ReturnType<SynomemService['posts']['archive']>>>(
+        'POST',
+        `posts/${encodeURIComponent(input.postId)}/archive`,
+        input,
+        ['postId'],
+      ),
+    acknowledge: (input: { postId: string; note?: string; idempotencyKey?: string }) =>
+      this.mutation<Awaited<ReturnType<SynomemService['posts']['acknowledge']>>>(
+        'POST',
+        `posts/${encodeURIComponent(input.postId)}/acknowledgment`,
+        input,
+        ['postId'],
+      ),
+    withdrawAcknowledgment: (input: { postId: string; reason?: string }) =>
+      this.request<Awaited<ReturnType<SynomemService['posts']['withdrawAcknowledgment']>>>(
+        'DELETE',
+        `posts/${encodeURIComponent(input.postId)}/acknowledgment`,
+      ),
+    roster: (postId: string) =>
+      this.request<Awaited<ReturnType<SynomemService['posts']['roster']>>>(
+        'GET',
+        `posts/${encodeURIComponent(postId)}/roster`,
+      ),
   };
 
   readonly kudos = {
@@ -261,6 +338,42 @@ export class RemoteSynomemService implements SynomemService {
       ),
   };
 
+  readonly tasks = {
+    create: (input: CreateTaskInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['tasks']['create']>>>('POST', 'tasks', input),
+    list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
+      this.request<Awaited<ReturnType<SynomemService['tasks']['list']>>>(
+        'GET',
+        `tasks${queryString(input)}`,
+      ),
+    get: (id: string) =>
+      this.request<Awaited<ReturnType<SynomemService['tasks']['get']>>>(
+        'GET',
+        `tasks/${encodeURIComponent(id)}`,
+      ),
+    update: (input: UpdateTaskInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['tasks']['update']>>>(
+        'POST',
+        `tasks/${encodeURIComponent(input.taskId)}/revisions`,
+        input,
+        ['taskId'],
+      ),
+    accept: (input: { taskId: string; response?: string; idempotencyKey?: string }) =>
+      this.taskTransition('accept', input),
+    reject: (input: { taskId: string; response: string; idempotencyKey?: string }) =>
+      this.taskTransition('reject', input),
+    complete: (input: { taskId: string; note?: string; idempotencyKey?: string }) =>
+      this.taskTransition('complete', input),
+    reopen: (input: { taskId: string; idempotencyKey?: string }) =>
+      this.taskTransition('reopen', input),
+    cancel: (input: { taskId: string; reason?: string; idempotencyKey?: string }) =>
+      this.taskTransition('cancel', input),
+  };
+
+  /**
+   * Private self-reminders. The remote surface mirrors the local one exactly so
+   * a caller does not have to know which backend it is talking to.
+   */
   readonly todos = {
     create: (input: CreateTodoInput) =>
       this.mutation<Awaited<ReturnType<SynomemService['todos']['create']>>>('POST', 'todos', input),
@@ -281,16 +394,43 @@ export class RemoteSynomemService implements SynomemService {
         input,
         ['todoId'],
       ),
-    accept: (input: { todoId: string; idempotencyKey?: string }) =>
-      this.todoTransition('accept', input),
-    reject: (input: { todoId: string; reason?: string; idempotencyKey?: string }) =>
-      this.todoTransition('reject', input),
     complete: (input: { todoId: string; note?: string; idempotencyKey?: string }) =>
       this.todoTransition('complete', input),
     reopen: (input: { todoId: string; idempotencyKey?: string }) =>
       this.todoTransition('reopen', input),
     cancel: (input: { todoId: string; reason?: string; idempotencyKey?: string }) =>
       this.todoTransition('cancel', input),
+    archive: (input: { todoId: string; idempotencyKey?: string }) =>
+      this.todoTransition('archive', input),
+  };
+
+  /**
+   * Discovery mirrors the local semantics: the age/deadline is resolved here so
+   * both backends answer the same question, rather than each server deciding
+   * what "older than 24 hours" means.
+   */
+  readonly discovery = {
+    unanswered: (
+      input: Omit<ItemListInput, 'awaitingResponse' | 'pending'> & { olderThanHours?: number } = {},
+    ) => {
+      const { olderThanHours, awaitingSince, ...rest } = input;
+      const since =
+        awaitingSince ??
+        (olderThanHours !== undefined
+          ? new Date(Date.now() - olderThanHours * 3_600_000).toISOString()
+          : undefined);
+      return this.request<Awaited<ReturnType<SynomemService['items']['list']>>>(
+        'GET',
+        `items${queryString({ ...rest, awaitingResponse: true, ...(since ? { awaitingSince: since } : {}) })}`,
+      );
+    },
+    overdue: (input: Omit<ItemListInput, 'overdueAsOf'> & { asOf?: string } = {}) => {
+      const { asOf, ...rest } = input;
+      return this.request<Awaited<ReturnType<SynomemService['items']['list']>>>(
+        'GET',
+        `items${queryString({ ...rest, overdueAsOf: asOf ?? new Date().toISOString() })}`,
+      );
+    },
   };
 
   readonly items = {
@@ -410,11 +550,29 @@ export class RemoteSynomemService implements SynomemService {
     );
   }
 
-  private todoTransition(
+  private taskTransition(
     transition: 'accept' | 'reject' | 'complete' | 'reopen' | 'cancel',
+    input: {
+      taskId: string;
+      idempotencyKey?: string;
+      reason?: string;
+      note?: string;
+      response?: string;
+    },
+  ) {
+    return this.mutation<Awaited<ReturnType<SynomemService['tasks']['accept']>>>(
+      'POST',
+      `tasks/${encodeURIComponent(input.taskId)}/${transition}`,
+      input,
+      ['taskId'],
+    );
+  }
+
+  private todoTransition(
+    transition: 'complete' | 'reopen' | 'cancel' | 'archive',
     input: { todoId: string; idempotencyKey?: string; reason?: string; note?: string },
   ) {
-    return this.mutation<Awaited<ReturnType<SynomemService['todos']['accept']>>>(
+    return this.mutation<Awaited<ReturnType<SynomemService['todos']['complete']>>>(
       'POST',
       `todos/${encodeURIComponent(input.todoId)}/${transition}`,
       input,
@@ -437,7 +595,7 @@ export class RemoteSynomemService implements SynomemService {
   }
 
   private async request<T>(
-    method: 'GET' | 'POST' | 'PATCH',
+    method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
     path: string,
     body?: object,
     idempotencyKey?: string,

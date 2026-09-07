@@ -53,19 +53,22 @@ Skill content is operational guidance rather than confidential Synomem data and 
 database and projection file-mode policy. The Synomem ownership/version stamp is restricted to the
 local user where POSIX modes are available.
 
-Add identity options to print a ready-to-review actor-bound MCP command for Codex, Claude Code,
-Hermes, OpenClaw, or Grok Build:
+Name an agent to print a ready-to-review agent-bound MCP command for Codex, Claude Code, Hermes,
+OpenClaw, or Grok Build. `--agent` takes an ID or an alias and is resolved before anything is
+written:
 
 ```bash
-synomem skill install --runtime codex --actor-id codex --actor-name "Codex"
-synomem skill install --runtime claude --actor-id claude --actor-name "Claude"
-synomem skill install --runtime openclaw --actor-id mycroft --actor-name "Mycroft"
+synomem skill install --runtime codex --agent codex
+synomem skill install --runtime claude --agent claude
+synomem skill install --runtime openclaw --agent mycroft
 ```
 
 Cursor discovers skills automatically but currently requires MCP definitions in its global
 `~/.cursor/mcp.json` or project `.cursor/mcp.json`. Merge a `synomem` entry without replacing other
-servers. Use `synomem-mcp` as the command and pass `--actor-id`, `--actor-kind agent`, and
-`--actor-name` as arguments. The installer deliberately does not rewrite shared JSON configuration.
+servers. Use `synomem-mcp` as the command and pass `--agent-id <agent-id>` as its only argument:
+the display name and actor kind are read from the agent's profile at startup, so nothing in a shared
+configuration file asserts an identity. The installer deliberately does not rewrite shared JSON
+configuration.
 
 Global skill installation changes agent configuration and is always an explicit user action. Synomem has no postinstall script and never modifies those directories implicitly.
 

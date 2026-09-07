@@ -1,13 +1,23 @@
 import type {
   ActorIdentity,
+  AgentDirectoryEntry,
   AgentProfile,
+  CreatePostInput,
+  PostRecord,
+  PostRoster,
+  UpdatePostInput,
+  AgentResolution,
+  AgentRuntimeBinding,
+  BindRuntimeInput,
   ChangePage,
   ChangesInput,
   CreateAgentInput,
   CreateNoteInput,
   CreateNoteResult,
+  CreateTaskInput,
   CreateTodoInput,
   CreateTodoResult,
+  CreateTaskResult,
   DoctorResult,
   GiveKudosInput,
   GiveKudosResult,
@@ -27,8 +37,10 @@ import type {
   ReviseNoteInput,
   SendMemoInput,
   SendMemoResult,
+  TaskRecord,
   TodoRecord,
   UpdateAgentInput,
+  UpdateTaskInput,
   UpdateTodoInput,
 } from './types.js';
 
@@ -45,7 +57,7 @@ export interface SynomemServiceCapabilities {
   projections: {
     writeWinsMarkdown: boolean;
     writeMemoryMarkdown: boolean;
-    writeTodosMarkdown: boolean;
+    writeTasksMarkdown: boolean;
     writeInboxEntries: boolean;
   };
 }
@@ -66,6 +78,33 @@ export interface SynomemDomainService {
     update(id: string, changes: UpdateAgentInput): Promise<AgentProfile>;
     get(idOrAlias: string): Promise<AgentProfile>;
     list(): Promise<AgentProfile[]>;
+    resolve(query: string): Promise<AgentResolution>;
+    directory(): Promise<AgentDirectoryEntry[]>;
+    bindings(idOrAlias: string): Promise<AgentRuntimeBinding[]>;
+    bindRuntime(input: BindRuntimeInput): Promise<AgentRuntimeBinding>;
+    unbindRuntime(bindingId: string): Promise<boolean>;
+  };
+  readonly posts: {
+    create(input: CreatePostInput): Promise<{
+      record: PostRecord;
+      created: boolean;
+      deduplicated: boolean;
+    }>;
+    list(input?: Omit<ItemListInput, 'kinds'>): Promise<Page<ItemSummary>>;
+    get(id: string): Promise<PostRecord>;
+    update(input: UpdatePostInput): Promise<PostRecord>;
+    archive(input: {
+      postId: string;
+      reason?: string;
+      idempotencyKey?: string;
+    }): Promise<PostRecord>;
+    acknowledge(input: {
+      postId: string;
+      note?: string;
+      idempotencyKey?: string;
+    }): Promise<PostRecord>;
+    withdrawAcknowledgment(input: { postId: string; reason?: string }): Promise<PostRecord>;
+    roster(postId: string): Promise<PostRoster>;
   };
   readonly kudos: {
     give(input: GiveKudosInput): Promise<GiveKudosResult>;
@@ -93,17 +132,43 @@ export interface SynomemDomainService {
     revise(input: ReviseNoteInput): Promise<NoteRecord>;
     archive(input: { noteId: string; idempotencyKey?: string }): Promise<NoteRecord>;
   };
+  readonly tasks: {
+    create(input: CreateTaskInput): Promise<CreateTaskResult>;
+    list(input?: Omit<ItemListInput, 'kinds'>): Promise<Page<ItemSummary>>;
+    get(id: string): Promise<TaskRecord>;
+    update(input: UpdateTaskInput): Promise<TaskRecord>;
+    accept(input: {
+      taskId: string;
+      /** Optional: conditions, timing, or partial capability. */
+      response?: string;
+      idempotencyKey?: string;
+    }): Promise<TaskRecord>;
+    reject(input: {
+      taskId: string;
+      /** Required: a refusal the assigner cannot act on is barely an answer. */
+      response: string;
+      idempotencyKey?: string;
+    }): Promise<TaskRecord>;
+    complete(input: {
+      taskId: string;
+      note?: string;
+      idempotencyKey?: string;
+    }): Promise<TaskRecord>;
+    reopen(input: { taskId: string; idempotencyKey?: string }): Promise<TaskRecord>;
+    cancel(input: {
+      taskId: string;
+      reason?: string;
+      idempotencyKey?: string;
+    }): Promise<TaskRecord>;
+  };
+  /**
+   * Private self-reminders. No assignee, no acceptance, owner-only reads.
+   */
   readonly todos: {
     create(input: CreateTodoInput): Promise<CreateTodoResult>;
     list(input?: Omit<ItemListInput, 'kinds'>): Promise<Page<ItemSummary>>;
     get(id: string): Promise<TodoRecord>;
     update(input: UpdateTodoInput): Promise<TodoRecord>;
-    accept(input: { todoId: string; idempotencyKey?: string }): Promise<TodoRecord>;
-    reject(input: {
-      todoId: string;
-      reason?: string;
-      idempotencyKey?: string;
-    }): Promise<TodoRecord>;
     complete(input: {
       todoId: string;
       note?: string;
@@ -115,6 +180,19 @@ export interface SynomemDomainService {
       reason?: string;
       idempotencyKey?: string;
     }): Promise<TodoRecord>;
+    archive(input: { todoId: string; idempotencyKey?: string }): Promise<TodoRecord>;
+  };
+  /**
+   * Unanswered and overdue discovery. Derived from durable events; never a
+   * statement about whether an agent is reachable.
+   */
+  readonly discovery: {
+    unanswered(
+      input?: Omit<ItemListInput, 'awaitingResponse' | 'pending'> & { olderThanHours?: number },
+    ): Promise<Page<ItemSummary>>;
+    overdue(
+      input?: Omit<ItemListInput, 'overdueAsOf'> & { asOf?: string },
+    ): Promise<Page<ItemSummary>>;
   };
   readonly items: {
     list(input?: ItemListInput): Promise<Page<ItemSummary>>;

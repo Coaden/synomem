@@ -24,6 +24,30 @@ export const agentIdSchema = z
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Use lowercase ASCII letters, digits, and hyphens')
   .refine((id) => !reservedIds.has(id), 'Reserved agent ID');
 
+/**
+ * An alias as written, folded to the canonical lowercase form.
+ *
+ * People type `Mike` and `mike` interchangeably, so accepting either and
+ * storing one keeps a single alias from being claimed twice in two casings.
+ */
+export const agentAliasSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(63)
+  .regex(/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/, 'Use ASCII letters, digits, and hyphens')
+  .transform((alias) => alias.toLowerCase())
+  .refine((alias) => !reservedIds.has(alias), 'Reserved agent ID');
+
+/**
+ * A name offered for lookup, which may be an ID or an alias in any casing.
+ *
+ * Lookups are deliberately more permissive than writes: rejecting `Mycroft`
+ * for its capital letter would tell the caller nothing useful about whether
+ * that agent exists.
+ */
+export const agentLookupSchema = z.string().trim().min(1).max(100);
+
 export const actorSchema = z.object({
   kind: z.enum(['human', 'agent', 'system']),
   id: agentIdSchema,
@@ -88,7 +112,7 @@ export const evidenceSchema = z
 export const profileSchema = z.object({
   id: agentIdSchema,
   displayName: z.string().trim().min(1).max(200),
-  aliases: z.array(agentIdSchema).max(50).optional(),
+  aliases: z.array(agentAliasSchema).max(50).optional(),
   description: z.string().trim().max(2000).optional(),
   createdAt: z.string().datetime({ offset: true }),
   metadata: metadataSchema.optional(),
@@ -96,6 +120,21 @@ export const profileSchema = z.object({
 
 export const createAgentSchema = profileSchema.omit({ createdAt: true });
 export const updateAgentSchema = createAgentSchema.omit({ id: true }).partial();
+
+/**
+ * A runtime binding is a claim about where an agent runs, so the fields stay
+ * deliberately loose: Synomem should record a runtime it has never heard of
+ * rather than reject an install it cannot classify.
+ */
+export const bindRuntimeSchema = z
+  .object({
+    agentId: z.string().trim().min(1).max(100),
+    runtime: z.string().trim().min(1).max(100),
+    profile: z.string().trim().min(1).max(100).optional(),
+    installationId: z.string().trim().min(1).max(100).optional(),
+    capabilities: metadataSchema.optional(),
+  })
+  .strict();
 
 const baseEventSchema = z.object({
   schemaVersion: z.literal(1),
@@ -218,7 +257,48 @@ const noteArchivedSchema = baseEventSchema.extend({
   noteId: z.string().length(26),
 });
 
-const todoDueSchema = z.discriminatedUnion('kind', [
+/**
+ * Post events. A post carries no recipient, assignee or visibility: it is
+ * addressed to the workspace, and workspace membership is the audience. Adding
+ * a visibility field would create a second, weaker way to hide a record.
+ */
+const postFields = {
+  title: z
+    .string()
+    .trim()
+    .min(1)
+    .max(200)
+    .regex(/^[^\r\n]+$/),
+  body: z.string().trim().min(1).max(32_000),
+  tags: z.array(kudosTagSchema).max(20).optional(),
+};
+const postCreatedSchema = baseEventSchema.extend({
+  type: z.literal('post.created'),
+  ...postFields,
+  replyTo: z.string().length(26).optional(),
+});
+const postEditedSchema = baseEventSchema.extend({
+  type: z.literal('post.edited'),
+  postId: z.string().length(26),
+  ...postFields,
+});
+const postArchivedSchema = baseEventSchema.extend({
+  type: z.literal('post.archived'),
+  postId: z.string().length(26),
+  reason: z.string().trim().min(1).max(2000).optional(),
+});
+const postAcknowledgedSchema = baseEventSchema.extend({
+  type: z.literal('post.acknowledged'),
+  postId: z.string().length(26),
+  note: z.string().trim().min(1).max(2000).optional(),
+});
+const postAcknowledgmentWithdrawnSchema = baseEventSchema.extend({
+  type: z.literal('post.acknowledgment.withdrawn'),
+  postId: z.string().length(26),
+  reason: z.string().trim().min(1).max(2000).optional(),
+});
+
+const taskDueSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('date'),
     date: z
@@ -247,7 +327,7 @@ const todoDueSchema = z.discriminatedUnion('kind', [
       }, 'Use a valid IANA time-zone identifier'),
   }),
 ]);
-const todoFields = {
+const taskFields = {
   title: z
     .string()
     .trim()
@@ -256,15 +336,64 @@ const todoFields = {
     .regex(/^[^\r\n]+$/),
   description: z.string().trim().max(16_000).optional(),
   priority: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
-  due: todoDueSchema.optional(),
+  due: taskDueSchema.optional(),
   tags: z.array(kudosTagSchema).max(20).optional(),
   visibility: z.enum(['private', 'workspace', 'public']),
 };
-const todoCreatedSchema = baseEventSchema.extend({
-  type: z.literal('todo.created'),
+const taskCreatedSchema = baseEventSchema.extend({
+  type: z.literal('task.created'),
   assigneeAgentId: agentIdSchema,
   assigneeDisplayName: z.string().trim().min(1).max(200),
   requiresAcceptance: z.boolean(),
+  ...taskFields,
+});
+const taskUpdatedSchema = baseEventSchema.extend({
+  type: z.literal('task.updated'),
+  taskId: z.string().length(26),
+  ...taskFields,
+});
+const taskCompletedSchema = baseEventSchema.extend({
+  type: z.literal('task.completed'),
+  taskId: z.string().length(26),
+  note: z.string().trim().min(1).max(2000).optional(),
+});
+const taskReopenedSchema = baseEventSchema.extend({
+  type: z.literal('task.reopened'),
+  taskId: z.string().length(26),
+});
+const taskAcceptedSchema = baseEventSchema.extend({
+  type: z.literal('task.accepted'),
+  taskId: z.string().length(26),
+  // Optional: accepting without comment is a complete answer on its own.
+  response: z.string().trim().min(1).max(2000).optional(),
+});
+const taskRejectedSchema = baseEventSchema.extend({
+  type: z.literal('task.rejected'),
+  taskId: z.string().length(26),
+  // Required. A refusal with no reason tells the assigner only that the work
+  // will not happen, not whether to reassign it, wait, or change the request.
+  response: z.string().trim().min(1).max(2000),
+});
+const taskCanceledSchema = baseEventSchema.extend({
+  type: z.literal('task.canceled'),
+  taskId: z.string().length(26),
+  reason: z.string().trim().min(1).max(2000).optional(),
+});
+
+/**
+ * A Todo is owner-only, so it carries no assignee and no acceptance lifecycle.
+ * `details` rather than `description` keeps it lexically distinct from a Task in
+ * every payload, which makes a mix-up visible in a log rather than silent.
+ */
+const todoFields = {
+  title: z.string().trim().min(1).max(200),
+  details: z.string().trim().min(1).max(4000).optional(),
+  priority: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
+  due: taskDueSchema.optional(),
+  tags: z.array(kudosTagSchema).max(20).optional(),
+};
+const todoCreatedSchema = baseEventSchema.extend({
+  type: z.literal('todo.created'),
   ...todoFields,
 });
 const todoUpdatedSchema = baseEventSchema.extend({
@@ -281,22 +410,22 @@ const todoReopenedSchema = baseEventSchema.extend({
   type: z.literal('todo.reopened'),
   todoId: z.string().length(26),
 });
-const todoAcceptedSchema = baseEventSchema.extend({
-  type: z.literal('todo.accepted'),
-  todoId: z.string().length(26),
-});
-const todoRejectedSchema = baseEventSchema.extend({
-  type: z.literal('todo.rejected'),
-  todoId: z.string().length(26),
-  reason: z.string().trim().min(1).max(2000).optional(),
-});
 const todoCanceledSchema = baseEventSchema.extend({
   type: z.literal('todo.canceled'),
   todoId: z.string().length(26),
   reason: z.string().trim().min(1).max(2000).optional(),
 });
+const todoArchivedSchema = baseEventSchema.extend({
+  type: z.literal('todo.archived'),
+  todoId: z.string().length(26),
+});
 
 export const eventSchema = z.discriminatedUnion('type', [
+  postCreatedSchema,
+  postEditedSchema,
+  postArchivedSchema,
+  postAcknowledgedSchema,
+  postAcknowledgmentWithdrawnSchema,
   kudosGivenSchema,
   acknowledgedSchema,
   revokedSchema,
@@ -308,13 +437,19 @@ export const eventSchema = z.discriminatedUnion('type', [
   noteCreatedSchema,
   noteRevisedSchema,
   noteArchivedSchema,
+  taskCreatedSchema,
+  taskUpdatedSchema,
+  taskCompletedSchema,
+  taskReopenedSchema,
+  taskAcceptedSchema,
+  taskRejectedSchema,
+  taskCanceledSchema,
   todoCreatedSchema,
   todoUpdatedSchema,
   todoCompletedSchema,
   todoReopenedSchema,
-  todoAcceptedSchema,
-  todoRejectedSchema,
   todoCanceledSchema,
+  todoArchivedSchema,
 ]);
 
 const giveKudosInputSchema = kudosGivenSchema
@@ -388,6 +523,24 @@ export const sendMemoSchema = z
     ...mutationMetadata,
   })
   .strict();
+export const createPostSchema = z
+  .object({
+    ...postFields,
+    replyTo: z.string().length(26).optional(),
+    ...mutationMetadata,
+  })
+  .strict();
+export const updatePostSchema = z
+  .object({
+    postId: z.string().length(26),
+    expectedVersion: z.number().int().min(1),
+    title: postFields.title.optional(),
+    body: postFields.body.optional(),
+    tags: postFields.tags,
+    idempotencyKey: z.string().trim().min(1).max(200).optional(),
+  })
+  .strict();
+
 export const createNoteSchema = z
   .object({
     ownerAgentId: agentIdSchema.optional(),
@@ -407,15 +560,44 @@ export const reviseNoteSchema = z
     ...mutationMetadata,
   })
   .strict();
-export const createTodoSchema = z
+export const createTaskSchema = z
   .object({
     assigneeAgentId: agentIdSchema.optional(),
-    title: todoCreatedSchema.shape.title,
-    description: todoCreatedSchema.shape.description,
-    priority: todoCreatedSchema.shape.priority.optional(),
-    due: todoDueSchema.optional(),
+    title: taskCreatedSchema.shape.title,
+    description: taskCreatedSchema.shape.description,
+    priority: taskCreatedSchema.shape.priority.optional(),
+    due: taskDueSchema.optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
     visibility: z.enum(['private', 'workspace', 'public']).optional(),
+    ...mutationMetadata,
+  })
+  .strict();
+export const updateTaskSchema = z
+  .object({
+    taskId: z.string().length(26),
+    expectedVersion: z.number().int().min(1),
+    title: taskCreatedSchema.shape.title.optional(),
+    description: taskCreatedSchema.shape.description,
+    priority: taskCreatedSchema.shape.priority.optional(),
+    due: taskDueSchema.nullable().optional(),
+    tags: z.array(kudosTagSchema).max(20).optional(),
+    visibility: z.enum(['private', 'workspace', 'public']).optional(),
+    ...mutationMetadata,
+  })
+  .strict();
+/**
+ * A Todo takes no assignee and no visibility: it belongs to its author and is
+ * always private. Omitting those fields from the input — rather than accepting
+ * and ignoring them — means an attempt to assign a Todo fails loudly instead of
+ * silently producing a private reminder nobody else can see.
+ */
+export const createTodoSchema = z
+  .object({
+    title: todoCreatedSchema.shape.title,
+    details: todoCreatedSchema.shape.details,
+    priority: todoCreatedSchema.shape.priority.optional(),
+    due: taskDueSchema.optional(),
+    tags: z.array(kudosTagSchema).max(20).optional(),
     ...mutationMetadata,
   })
   .strict();
@@ -424,23 +606,26 @@ export const updateTodoSchema = z
     todoId: z.string().length(26),
     expectedVersion: z.number().int().min(1),
     title: todoCreatedSchema.shape.title.optional(),
-    description: todoCreatedSchema.shape.description,
+    details: todoCreatedSchema.shape.details,
     priority: todoCreatedSchema.shape.priority.optional(),
-    due: todoDueSchema.nullable().optional(),
+    due: taskDueSchema.nullable().optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
-    visibility: z.enum(['private', 'workspace', 'public']).optional(),
     ...mutationMetadata,
   })
   .strict();
+
 export const itemListInputSchema = z
   .object({
     kinds: z
-      .array(z.enum(['kudos', 'memo', 'note', 'todo']))
-      .max(4)
+      .array(z.enum(['kudos', 'memo', 'note', 'post', 'task', 'todo']))
+      .max(5)
       .optional(),
     participantAgentId: agentIdSchema.optional(),
     actorId: agentIdSchema.optional(),
     actorKind: z.enum(['human', 'agent', 'system']).optional(),
+    awaitingResponse: z.boolean().optional(),
+    awaitingSince: z.string().datetime({ offset: true }).optional(),
+    overdueAsOf: z.string().datetime({ offset: true }).optional(),
     tag: kudosTagSchema.optional(),
     status: z.string().trim().min(1).max(50).optional(),
     pending: z.boolean().optional(),
