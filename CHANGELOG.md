@@ -3,6 +3,19 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
+## [Unreleased]
+
+### Fixed
+
+- CI could not install the project at all. A dependency bump moved TypeScript to
+  7, which is outside `typescript-eslint`'s peer range, so every `npm ci` failed
+  on resolution while local runs kept working against an older `node_modules`.
+  TypeScript is pinned to 6 until `typescript-eslint` supports 7.
+
+### Changed
+
+- Commander 15.
+
 ## [0.5.0] - 2026-09-07
 
 ### Added
