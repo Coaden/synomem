@@ -720,7 +720,15 @@ export interface KudosStats {
   byTag: Record<string, number>;
 }
 export interface Diagnostic {
-  level: 'ok' | 'warning' | 'error';
+  /**
+   * `skipped` is not a failure.
+   *
+   * A check the caller lacks permission to run says so and leaves the overall
+   * result healthy. Failing the whole diagnostic because an ordinary agent
+   * cannot read workspace administration would make `doctor` useless to the
+   * callers who need it most.
+   */
+  level: 'ok' | 'warning' | 'error' | 'skipped';
   code: string;
   message: string;
   path?: string;
