@@ -1,10 +1,27 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Command, CommanderError, Option } from 'commander';
 import { configuredServiceFactory, readSynomemConfig, writeSynomemBackend } from './backend.js';
+import { cloudApiUrl } from './cloud.js';
+import { resolveHome } from './config.js';
+import {
+  assertInteractive,
+  confirmPlan,
+  credentialFingerprint,
+  credentialStoreChoices,
+  environmentInstructions,
+  readAccessToken,
+  runConfigWizard,
+  writeCredentialFile,
+  type AuthChoice,
+  type BackendChoice,
+  type ConfigPlan,
+  type CredentialStoreChoice,
+} from './configure.js';
+import { defaultPromptIo, type PromptIo } from './prompt.js';
 import { credentialReference, OsCredentialStore, type CredentialStore } from './credentials.js';
 import { asSynomemError, SynomemError, type SynomemErrorCode } from './errors.js';
 import { atomicWriteFile } from './fs-utils.js';
@@ -45,6 +62,8 @@ export interface CliIo {
 }
 
 export interface CliDependencies {
+  /** Injected so the wizard can be driven by a test without a terminal. */
+  promptIo?: PromptIo;
   credentialStore?: CredentialStore;
   oauthLogin?: (options: OAuthLoginOptions) => Promise<void>;
   env?: NodeJS.ProcessEnv;
@@ -281,6 +300,7 @@ export function createCli(
   const env = dependencies.env ?? process.env;
   const credentialStore = dependencies.credentialStore ?? new OsCredentialStore();
   const oauthLogin = dependencies.oauthLogin ?? loginWithOAuth;
+  const promptIo = dependencies.promptIo ?? defaultPromptIo();
   const verifyRemoteCredential =
     dependencies.verifyRemoteCredential ??
     (async (options) => {
@@ -416,6 +436,263 @@ export function createCli(
       });
     });
 
+  /*
+   * `synomem config` is the canonical entry point. `configure` and `setup` are
+   * accepted because people reach for them, and a setup program that rejects
+   * the word somebody guessed is needlessly unhelpful.
+   */
+  const configCommand = program
+    .command('config')
+    .aliases(['configure', 'setup'])
+    .description('Set up Synomem, interactively or deterministically');
+
+  const applyPlan = async (
+    plan: ConfigPlan,
+    token: string | undefined,
+    global: { home?: string; json: boolean },
+  ): Promise<void> => {
+    const home = plan.home;
+    const config = writeSynomemBackend(
+      plan.backend === 'local'
+        ? { kind: 'local' }
+        : {
+            kind: 'remote',
+            baseUrl: plan.serviceUrl ?? cloudApiUrl(env),
+            workspaceId: plan.workspaceId!,
+          },
+      home,
+    );
+
+    let credentialLocation: string | undefined;
+    if (token) {
+      if (plan.credentialStore === 'environment') {
+        io.stdout(`${environmentInstructions(token)}\n`);
+        credentialLocation = 'environment';
+      } else if (plan.credentialStore === 'file') {
+        credentialLocation = writeCredentialFile(home, token);
+      } else {
+        // The platform store is the default, and a failure falls back to the
+        // restricted file rather than leaving the credential nowhere.
+        try {
+          await credentialStore.set(`synomem:${plan.workspaceId}`, {
+            kind: 'installation-key',
+            accessToken: token,
+          });
+          credentialLocation = 'platform credential store';
+        } catch {
+          credentialLocation = writeCredentialFile(home, token);
+        }
+      }
+    }
+
+    // Diagnostics run before success is claimed: a configuration that cannot
+    // open its own database is not a finished setup.
+    const diagnostics = await withClient(home, defaultActor(env, 'system', 'cli'), (client) =>
+      client.doctor(),
+    );
+
+    output(
+      io,
+      global.json,
+      {
+        backend: config.backend,
+        home,
+        ...(credentialLocation ? { credentialSource: credentialLocation } : {}),
+        ...(token ? { credential: credentialFingerprint(token) } : {}),
+        healthy: diagnostics.healthy,
+      },
+      [
+        '',
+        'Synomem is ready.',
+        '',
+        `  Backend:  ${config.backend.kind === 'local' ? 'Local SQLite' : 'Synomem Cloud'}`,
+        `  Home:     ${home}`,
+        ...(config.backend.kind === 'remote'
+          ? [`  Service:  ${config.backend.baseUrl}`, `  Workspace: ${config.backend.workspaceId}`]
+          : []),
+        ...(credentialLocation ? [`  Credential: ${credentialLocation}`] : []),
+        `  Database: ${diagnostics.healthy ? 'Healthy' : 'Needs attention — run synomem doctor'}`,
+      ].join('\n'),
+    );
+  };
+
+  configCommand.action(async (_options, command: Command) => {
+    const global = globals(command);
+    assertInteractive(promptIo);
+    const plan = await runConfigWizard(promptIo, {
+      ...(global.home ? { home: global.home } : {}),
+      env,
+    });
+    const token = plan.auth === 'access-key' ? await readAccessToken(promptIo) : undefined;
+    if (!(await confirmPlan(promptIo, plan))) {
+      output(io, global.json, { applied: false }, 'Nothing was changed.');
+      return;
+    }
+    await applyPlan(plan, token, global);
+  });
+
+  configCommand
+    .command('init')
+    .description('Configure Synomem without prompting')
+    .option('--backend <kind>', 'local or remote')
+    .option('--auth <method>', 'browser or access-key')
+    .option('--workspace <id>', 'remote workspace ID')
+    .option('--credential-store <where>', 'auto, keychain, file, or environment', 'auto')
+    // The token is read from stdin, never taken as an argument: an argument is
+    // kept by the shell history and visible in the process list.
+    .option('--access-token-stdin', 'read the installation access key from stdin', false)
+    .option('--yes', 'apply without confirming', false)
+    .action(
+      async (
+        options: {
+          backend?: string;
+          auth?: string;
+          workspace?: string;
+          credentialStore: string;
+          accessTokenStdin: boolean;
+          yes: boolean;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        if (options.backend !== 'local' && options.backend !== 'remote') {
+          throw new SynomemError('INVALID_INPUT', 'Pass --backend local or --backend remote.');
+        }
+        const backend: BackendChoice = options.backend;
+        if (backend === 'remote' && !options.workspace) {
+          throw new SynomemError('INVALID_INPUT', 'Remote setup requires --workspace.');
+        }
+        const token = options.accessTokenStdin ? await readAccessToken(promptIo) : undefined;
+        if (backend === 'remote' && options.auth === 'access-key' && !token) {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            'Access-key setup requires --access-token-stdin so the key is not passed as an argument.',
+          );
+        }
+        const plan: ConfigPlan = {
+          backend,
+          home: resolveHome(global.home),
+          ...(backend === 'remote'
+            ? {
+                serviceUrl: cloudApiUrl(env),
+                auth: (options.auth as AuthChoice | undefined) ?? 'access-key',
+                workspaceId: options.workspace,
+                credentialStore: options.credentialStore as CredentialStoreChoice,
+              }
+            : {}),
+        };
+        if (!options.yes) {
+          throw new SynomemError('INVALID_INPUT', 'Re-run with --yes to apply this configuration.');
+        }
+        await applyPlan(plan, token, global);
+      },
+    );
+
+  configCommand
+    .command('show')
+    .description('Show the current configuration without revealing secrets')
+    .action(async (_options, command: Command) => {
+      const global = globals(command);
+      const home = resolveHome(global.home);
+      const config = readSynomemConfig(global.home, env);
+      const backend = config?.backend ?? { kind: 'local' as const };
+      const credentialSource = env.SYNOMEM_ACCESS_TOKEN
+        ? 'environment (SYNOMEM_ACCESS_TOKEN)'
+        : existsSync(join(home, 'credentials', 'installation.json'))
+          ? 'restricted file'
+          : 'platform credential store or none';
+      output(
+        io,
+        global.json,
+        // Never the secret itself, only where it comes from.
+        { backend, home, credentialSource, stores: credentialStoreChoices().map((c) => c.value) },
+        [
+          `Backend:    ${backend.kind === 'local' ? 'Local SQLite' : 'Synomem Cloud'}`,
+          `Home:       ${home}`,
+          ...(backend.kind === 'remote'
+            ? [`Service:    ${backend.baseUrl}`, `Workspace:  ${backend.workspaceId}`]
+            : []),
+          `Credential: ${credentialSource}`,
+        ].join('\n'),
+      );
+    });
+
+  program
+    .command('reset')
+    .description('Remove Synomem configuration, database and credentials')
+    // Integrations are opt-in because they live in other tools' directories.
+    // Removing somebody's harness configuration as a side effect of resetting
+    // Synomem would be a surprise with no undo.
+    .option('--integrations', 'also remove installed skills and MCP registrations', false)
+    .option('--yes', 'apply the displayed plan', false)
+    .action(async (options: { integrations: boolean; yes: boolean }, command: Command) => {
+      const global = globals(command);
+      const home = resolveHome(global.home);
+
+      /*
+       * Every target is an exact path, listed before anything is touched. No
+       * recursive delete is ever derived from a variable that might be empty:
+       * a reset that computes `rm -rf $HOME/` from an unset home is the
+       * failure this shape exists to make impossible.
+       */
+      const targets = [
+        join(home, 'config.json'),
+        join(home, 'synomem.sqlite3'),
+        join(home, 'synomem.sqlite3-wal'),
+        join(home, 'synomem.sqlite3-shm'),
+        join(home, 'credentials', 'installation.json'),
+      ].filter((path) => existsSync(path));
+
+      const skillPlan = options.integrations ? uninstallSkill({ apply: false }) : undefined;
+      const skillTargets =
+        skillPlan?.locations
+          // Installed Synomem-owned copies only; an unowned directory at
+          // the same path is not ours to remove.
+          .filter((location) => location.state === 'current' || location.state === 'stale')
+          .map((location) => location.target) ?? [];
+
+      if (!options.yes) {
+        output(
+          io,
+          global.json,
+          { targets, skillTargets, applied: false },
+          [
+            'This will remove:',
+            ...(targets.length ? targets.map((path) => `  ${path}`) : ['  (nothing found)']),
+            ...(skillTargets.length ? ['', 'And these Synomem-owned skills:'] : []),
+            ...skillTargets.map((path) => `  ${path}`),
+            '',
+            ...(options.integrations
+              ? []
+              : ['Installed skills and MCP registrations are left alone.', '']),
+            'Run with --yes to continue.',
+          ].join('\n'),
+        );
+        return;
+      }
+
+      const removed: string[] = [];
+      for (const path of targets) {
+        rmSync(path, { force: true });
+        removed.push(path);
+      }
+      // Only ownership-stamped Synomem skills are removed, which uninstall
+      // already enforces — an unowned directory at the same path is left.
+      const skillResult = options.integrations ? uninstallSkill({ apply: true }) : undefined;
+
+      output(
+        io,
+        global.json,
+        { removed, skills: skillResult?.locations ?? [] },
+        [
+          `Removed ${removed.length} file(s).`,
+          ...(skillResult
+            ? [`Skill locations processed: ${skillResult.locations.length}.`]
+            : ['Installed skills and MCP registrations were left alone.']),
+        ].join('\n'),
+      );
+    });
+
   const backendCommand = program
     .command('backend')
     .description('Inspect or select the canonical backend');
@@ -436,23 +713,28 @@ export function createCli(
     .command('use')
     .description('Select local or remote canonical state')
     .argument('<kind>', 'local or remote')
-    .option('--url <url>', 'remote HTTPS origin')
+    // --url is for development and private deployments. It stays out of the
+    // README, the public docs and the packaged skill: public onboarding must
+    // never ask for a service address, because a person has no way to tell a
+    // real one from a phished one.
+    .option('--url <url>', 'internal: alternate HTTPS origin')
     .option('--workspace <id>', 'remote workspace ID')
     .action((kind: string, options: { url?: string; workspace?: string }, command: Command) => {
       const global = globals(command);
       if (kind !== 'local' && kind !== 'remote') {
         throw new SynomemError('INVALID_INPUT', 'Backend kind must be local or remote.');
       }
-      if (kind === 'remote' && (!options.url || !options.workspace)) {
-        throw new SynomemError(
-          'INVALID_INPUT',
-          'Remote backend selection requires --url and --workspace.',
-        );
+      if (kind === 'remote' && !options.workspace) {
+        throw new SynomemError('INVALID_INPUT', 'Remote backend selection requires --workspace.');
       }
       const config = writeSynomemBackend(
         kind === 'local'
           ? { kind: 'local' }
-          : { kind: 'remote', baseUrl: options.url!, workspaceId: options.workspace! },
+          : {
+              kind: 'remote',
+              baseUrl: options.url ?? cloudApiUrl(env),
+              workspaceId: options.workspace!,
+            },
         global.home,
       );
       output(

@@ -5,7 +5,7 @@ import { SynomemClient } from '../src/client.js';
 import { runCli, type CliIo } from '../src/cli.js';
 import type { SynomemServiceFactory } from '../src/service.js';
 import { tempHome } from './helpers.js';
-import type { CredentialStore, StoredOAuthCredential } from '../src/credentials.js';
+import type { CredentialStore, StoredCredential } from '../src/credentials.js';
 import type { OAuthLoginOptions } from '../src/oauth.js';
 import { createLocalImportBundle } from '../src/import.js';
 
@@ -162,7 +162,7 @@ describe('CLI', () => {
 
   it('logs in, reports, and removes an OS-stored actor credential without printing it', async () => {
     const home = tempHome();
-    const values = new Map<string, StoredOAuthCredential>();
+    const values = new Map<string, StoredCredential>();
     const store: CredentialStore = {
       async get(reference) {
         return values.get(reference);

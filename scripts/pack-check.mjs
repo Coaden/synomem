@@ -163,7 +163,7 @@ try {
   run(synomemBin, ['skill', 'uninstall', '--runtime', 'codex', '--yes'], consumer, skillEnv);
   if (existsSync(installedSkill)) throw new Error('Skill uninstall left installed files behind.');
 
-  const acceptanceHome = join(temporary, 'acceptance', '.agents');
+  const acceptanceHome = join(temporary, 'acceptance', '.synomem');
   const acceptanceEnv = { ...process.env, SYNOMEM_HOME: acceptanceHome };
   run(synomemBin, ['init'], consumer, acceptanceEnv);
   run(
@@ -295,7 +295,8 @@ try {
   if (!retry.deduplicated || retry.record?.event?.id !== kudosId) {
     throw new Error('Acceptance retry did not return the original kudos.');
   }
-  if (!existsSync(join(acceptanceHome, 'synomem', 'synomem.sqlite3'))) {
+  // The home IS the storage directory: no `<home>/synomem` nesting.
+  if (!existsSync(join(acceptanceHome, 'synomem.sqlite3'))) {
     throw new Error('Acceptance database is missing.');
   }
   if (!readFileSync(join(acceptanceHome, 'codex', 'WINS.md'), 'utf8').includes(kudosId)) {

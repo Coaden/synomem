@@ -182,10 +182,10 @@ describe('SQLite storage and projections', () => {
     const client = await testClient(home);
     await client.agents.create({ handle: 'codex', displayName: 'Codex' });
     if (process.platform !== 'win32') {
-      const files = readdirSync(join(home, 'synomem')).filter((name) => name.includes('sqlite3'));
+      const files = readdirSync(home).filter((name) => name.includes('sqlite3'));
       expect(files.length).toBeGreaterThan(0);
       for (const file of files) {
-        expect(statSync(join(home, 'synomem', file)).mode & 0o777).toBe(0o600);
+        expect(statSync(join(home, file)).mode & 0o777).toBe(0o600);
       }
     }
     await client.close();

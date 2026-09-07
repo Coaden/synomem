@@ -6,6 +6,21 @@ import type { ActorIdentity } from './types.js';
 const serviceName = 'ai.synomem.credentials';
 const maximumOutputBytes = 128 * 1024;
 
+/**
+ * An installation access key.
+ *
+ * Not an OAuth credential: it has no refresh, no token endpoint and no client,
+ * and it authorizes a MACHINE rather than a person. Keeping it a distinct shape
+ * stops code treating it as refreshable, which would mean silently failing to
+ * renew something that never expires that way.
+ */
+export interface StoredInstallationKey {
+  kind: 'installation-key';
+  accessToken: string;
+}
+
+export type StoredCredential = StoredOAuthCredential | StoredInstallationKey;
+
 export interface StoredOAuthCredential {
   accessToken: string;
   refreshToken?: string;
@@ -17,8 +32,8 @@ export interface StoredOAuthCredential {
 }
 
 export interface CredentialStore {
-  get(reference: string): Promise<StoredOAuthCredential | undefined>;
-  set(reference: string, credential: StoredOAuthCredential): Promise<void>;
+  get(reference: string): Promise<StoredCredential | undefined>;
+  set(reference: string, credential: StoredCredential): Promise<void>;
   delete(reference: string): Promise<boolean>;
 }
 

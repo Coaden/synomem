@@ -8,15 +8,32 @@ All notable changes will be documented here. The format follows
 ### Changed
 
 - **Agents have an opaque canonical ID and a separate handle.** `agent create
-  <handle>` generates a ULID; the handle is what people type and can be renamed
+<handle>` generates a ULID; the handle is what people type and can be renamed
   with `agent rename` without orphaning the events written under the old name.
   Events, rosters and statistics key on the canonical ID.
+- The home IS the storage directory. It was `<home>/synomem`, which produced
+  `~/.synomem/synomem` once the home moved — a path the layout rules out.
 - The default home is `~/.synomem`. There is no detection of or migration from
   `~/.agents`, per the greenfield policy.
 - Projection directories are named by handle, since they exist to be read.
 
 ### Added
 
+- **`synomem config`** — the onboarding wizard, with `configure` and `setup` as
+  aliases. It refuses to run without a terminal and names the deterministic
+  flags instead of blocking forever on a pipe.
+- **`synomem config init`** — the non-interactive equivalent, including
+  `--access-token-stdin` so an installation key is never passed as an argument
+  where the shell history and process list would keep it.
+- **`synomem config show`** — reports where a credential comes from, never the
+  credential.
+- **`synomem reset`** — lists every exact target before removing anything.
+  Installed skills and MCP registrations are left alone unless
+  `--integrations` is passed.
+- Synomem Cloud is implicit: `backend use remote` needs only `--workspace`.
+  `--url` remains for private deployments and stays out of the public docs.
+- A discriminated credential model, so an installation key is no longer treated
+  as a refreshable OAuth credential.
 - `agent rename`, `agent archive`, `agent restore`, and `agent alias add` /
   `alias remove`, which add and remove aliases without replacing the set.
 - The MCP server reports the canonical actor rather than the requested name, so

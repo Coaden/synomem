@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   createConfiguredService,
@@ -56,7 +56,7 @@ describe('configuration and cancellation', () => {
     const workspaceId = first.storage.config.workspaceId;
     expect(workspaceId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
     await first.close();
-    const stored = JSON.parse(readFileSync(join(home, 'synomem', 'config.json'), 'utf8')) as {
+    const stored = JSON.parse(readFileSync(join(home, 'config.json'), 'utf8')) as {
       workspaceId: string;
     };
     expect(stored.workspaceId).toBe(workspaceId);
@@ -76,8 +76,8 @@ describe('configuration and cancellation', () => {
 
   it('persists a schema version 2 configuration migration after local initialization', async () => {
     const home = tempHome();
-    const storageDirectory = join(home, 'synomem');
-    mkdirSync(storageDirectory);
+    // The home is the storage directory now, and tempHome already made it.
+    const storageDirectory = home;
     const legacy = { ...defaultConfig, schemaVersion: 2 } as Record<string, unknown>;
     delete legacy.backend;
     writeFileSync(join(storageDirectory, 'config.json'), `${JSON.stringify(legacy)}\n`);
@@ -118,7 +118,7 @@ describe('configuration and cancellation', () => {
     });
 
     await expect(client.init()).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
-    expect(existsSync(join(home, 'synomem', 'synomem.sqlite3'))).toBe(false);
+    expect(existsSync(join(home, 'synomem.sqlite3'))).toBe(false);
   });
 
   it('persists backend selection without storing credentials', () => {
@@ -132,7 +132,7 @@ describe('configuration and cancellation', () => {
       home,
     );
     expect(config.backend.kind).toBe('remote');
-    const serialized = readFileSync(join(home, 'synomem', 'config.json'), 'utf8');
+    const serialized = readFileSync(join(home, 'config.json'), 'utf8');
     expect(serialized).not.toContain('token');
     expect(readSynomemConfig(home, {})).toMatchObject({ backend: config.backend });
   });
@@ -152,7 +152,7 @@ describe('configuration and cancellation', () => {
       { SYNOMEM_ACCESS_TOKEN: 'test-only-token' },
     );
     expect(service).toBeInstanceOf(RemoteSynomemService);
-    expect(existsSync(join(home, 'synomem', 'synomem.sqlite3'))).toBe(false);
+    expect(existsSync(join(home, 'synomem.sqlite3'))).toBe(false);
   });
 
   it('rejects non-loopback plaintext remote origins before persisting them', () => {

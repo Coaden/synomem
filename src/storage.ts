@@ -445,7 +445,8 @@ export class SynomemStorage implements SynomemRepository {
 
   constructor(options: StorageOptions) {
     this.home = resolve(options.home);
-    this.storageDirectory = join(this.home, 'synomem');
+    // The home is the storage directory; see configLocation in backend.ts.
+    this.storageDirectory = this.home;
     this.databasePath = join(this.storageDirectory, 'synomem.sqlite3');
     this.configPath = join(this.storageDirectory, 'config.json');
     this.readOnly = options.readOnly;
