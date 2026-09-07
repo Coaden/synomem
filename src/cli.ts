@@ -22,6 +22,7 @@ import {
   type CredentialStoreChoice,
 } from './configure.js';
 import { discoverBoundWorkspace, discoverOrganizations, workspaceChoices } from './discover.js';
+import { DEFAULT_WORKSPACE, listLocalWorkspaces, localWorkspaceHome } from './workspaces.js';
 import { defaultPromptIo, type PromptIo } from './prompt.js';
 import { credentialReference, OsCredentialStore, type CredentialStore } from './credentials.js';
 import { asSynomemError, SynomemError, type SynomemErrorCode } from './errors.js';
@@ -148,10 +149,18 @@ function defaultActor(
   env: NodeJS.ProcessEnv,
   fallbackKind: string,
   fallbackId: string,
+  /** `--actor`, which outranks the environment: it is said on this invocation. */
+  override?: string,
 ): ActorIdentity {
-  const id = env.SYNOMEM_ACTOR_ID?.trim();
+  const id = override?.trim() || env.SYNOMEM_ACTOR_ID?.trim();
   if (!id) return actor(fallbackKind, fallbackId);
-  return actor(env.SYNOMEM_ACTOR_KIND?.trim() || fallbackKind, id, env.SYNOMEM_ACTOR_NAME?.trim());
+  const kind = override?.trim()
+    ? // An explicit --actor names an agent unless told otherwise; the historical
+      // fallbacks here are `system`/`cli`, which is not what somebody means when
+      // they name one.
+      env.SYNOMEM_ACTOR_KIND?.trim() || 'agent'
+    : env.SYNOMEM_ACTOR_KIND?.trim() || fallbackKind;
+  return actor(kind, id, env.SYNOMEM_ACTOR_NAME?.trim());
 }
 
 function taskDue(options: {
@@ -245,9 +254,57 @@ function output(io: CliIo, json: boolean, value: unknown, human: string): void {
   io.stdout(json ? `${JSON.stringify(value, null, 2)}\n` : `${human}\n`);
 }
 
-function globals(command: Command): { home?: string; json: boolean } {
-  return command.optsWithGlobals<{ home?: string; json: boolean }>();
+/**
+ * The resolved global options for a command.
+ *
+ * `--workspace` is turned into a home HERE, before any service exists, which is
+ * the whole reason it costs nothing downstream: a local workspace is a separate
+ * database in its own home, and choosing one is choosing a home. Nothing in the
+ * domain, the commands, or the MCP tools learns that a workspace was selected.
+ *
+ * On a remote backend the name means a hosted workspace instead, which
+ * `backend use remote --workspace` already handles; passing both here would be
+ * two different answers to the same question, so it is refused.
+ */
+function globals(command: Command): {
+  home?: string;
+  json: boolean;
+  actor?: string;
+  workspace?: string;
+} {
+  const options = command.optsWithGlobals<{
+    home?: string;
+    json: boolean;
+    workspace?: string;
+    actor?: string;
+  }>();
+  if (!options.workspace) return options;
+  /*
+   * One flag, one meaning — "which workspace" — resolved differently by the
+   * handful of commands that CONFIGURE a backend rather than act inside one.
+   * For those, the value is a hosted workspace ID to be written to the config,
+   * so it is passed through raw and they read `workspace`. Everywhere else it
+   * names a local workspace, which is a home.
+   *
+   * These commands used to declare their own `--workspace`, which does not
+   * work: Commander gives a duplicated long flag to the parent, so the
+   * subcommand never received it at all.
+   */
+  if (CONFIGURES_BACKEND.has(commandPath(command))) return options;
+  return { ...options, home: localWorkspaceHome(options.workspace, options.home) };
 }
+
+/** `parent child`, so a subcommand name cannot be confused with another's. */
+function commandPath(command: Command): string {
+  const parent = command.parent?.name();
+  return parent && parent !== 'synomem' ? `${parent} ${command.name()}` : command.name();
+}
+
+/**
+ * Commands where `--workspace` names a HOSTED workspace being configured,
+ * rather than a local one to act in.
+ */
+const CONFIGURES_BACKEND = new Set(['config init', 'backend use', 'remote import']);
 
 async function withService<T>(
   serviceFactory: SynomemServiceFactory,
@@ -302,12 +359,34 @@ function listInput(options: Record<string, string>): KudosListInput {
   };
 }
 
+/**
+ * The value `--actor` should supply to commands that name an actor.
+ *
+ * Read from argv directly, before the commands are built, because Commander
+ * evaluates option defaults at DECLARATION time: a `--as` declared without one
+ * is required, and a `--as` declared with one is already satisfied. Supplying
+ * it here is a single change point instead of a fallback threaded through
+ * twenty action bodies, and `--as` still wins when both are given because an
+ * explicitly passed option overrides its default.
+ */
+function actorDefault(argv: string[], env: NodeJS.ProcessEnv): string | undefined {
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index]!;
+    if (argument === '--actor') return argv[index + 1]?.trim() || undefined;
+    if (argument.startsWith('--actor='))
+      return argument.slice('--actor='.length).trim() || undefined;
+  }
+  return env.SYNOMEM_ACTOR_ID?.trim() || undefined;
+}
+
 export function createCli(
   io: CliIo = defaultIo,
   serviceFactory: SynomemServiceFactory = configuredServiceFactory,
   dependencies: CliDependencies = {},
+  argv: string[] = process.argv,
 ): Command {
   const env = dependencies.env ?? process.env;
+  const actingDefault = actorDefault(argv, env);
   const credentialStore = dependencies.credentialStore ?? new OsCredentialStore();
   const oauthLogin = dependencies.oauthLogin ?? loginWithOAuth;
   const discoverWorkspace = dependencies.discoverBoundWorkspace ?? discoverBoundWorkspace;
@@ -346,9 +425,71 @@ export function createCli(
     )
     .version(packageVersion())
     .option('--home <path>', 'storage root (defaults to SYNOMEM_HOME or ~/.synomem)')
+    // A local workspace is its own database under the root, so this selects a
+    // home. On a remote backend the hosted workspace is chosen by
+    // `backend use remote --workspace` instead.
+    .option('--workspace <name>', 'local workspace to act in (see `synomem workspace list`)')
+    .option('--actor <id>', 'act as this agent (overrides SYNOMEM_ACTOR_ID)')
     .option('--json', 'emit stable machine-readable JSON', false)
     .showSuggestionAfterError()
     .configureOutput({ writeOut: io.stdout, writeErr: io.stderr });
+
+  /*
+   * Local workspaces.
+   *
+   * Each is a separate database in its own home, which is what makes the
+   * isolation real: SQLite has no row-level security, so a shared file would
+   * rest on every query remembering to filter, with nothing to catch a miss.
+   * Separate files mean cross-workspace leakage is not something anybody can
+   * write by accident.
+   */
+  const workspaceCommand = program
+    .command('workspace')
+    .description('Work in a separate local store, isolated from the others');
+
+  workspaceCommand
+    .command('list')
+    .description('List the local workspaces on this machine')
+    .action((_options, command: Command) => {
+      const global = globals(command);
+      // Read from disk, so nothing is listed that does not exist.
+      const workspaces = listLocalWorkspaces(global.home);
+      const human = workspaces
+        .map(
+          (workspace) =>
+            `${workspace.name === DEFAULT_WORKSPACE ? '*' : ' '} ${workspace.name.padEnd(24)} ${
+              workspace.initialized ? workspace.home : `${workspace.home} (not initialized)`
+            }`,
+        )
+        .join('\n');
+      output(
+        io,
+        global.json,
+        { workspaces },
+        `${human}\n\nAct in one with --workspace <name>. A local workspace is a separate store on this machine; a hosted workspace is shared, and is selected with \`backend use remote --workspace\`.`,
+      );
+    });
+
+  workspaceCommand
+    .command('create <name>')
+    .description('Create a local workspace and initialize its store')
+    .action(async (name: string, _options, command: Command) => {
+      const global = globals(command);
+      const home = localWorkspaceHome(name, global.home);
+      if (readSynomemConfig(home)) {
+        throw new SynomemError('INVALID_INPUT', `Workspace already exists: ${name}`);
+      }
+      writeSynomemBackend({ kind: 'local' }, home);
+      // Opening it once creates the database, so `list` does not report a
+      // workspace that exists in name only.
+      await withClient(home, defaultActor(env, 'system', 'cli'), async () => undefined);
+      output(
+        io,
+        global.json,
+        { name, home },
+        `Created workspace ${name} at ${home}.\nAct in it with --workspace ${name}.`,
+      );
+    });
 
   const remoteCommand = program.command('remote').description('Administer a remote workspace');
 
@@ -631,7 +772,6 @@ export function createCli(
     .description('Configure Synomem without prompting')
     .option('--backend <kind>', 'local or remote')
     .option('--auth <method>', 'browser or access-key')
-    .option('--workspace <id>', 'remote workspace ID')
     .option('--credential-store <where>', 'auto, keychain, file, or environment', 'auto')
     // The token is read from stdin, never taken as an argument: an argument is
     // kept by the shell history and visible in the process list.
@@ -642,7 +782,6 @@ export function createCli(
         options: {
           backend?: string;
           auth?: string;
-          workspace?: string;
           credentialStore: string;
           accessTokenStdin: boolean;
           yes: boolean;
@@ -656,7 +795,7 @@ export function createCli(
         const backend: BackendChoice = options.backend;
         // An access key names its own workspace, so --workspace is only
         // required when there is no key to ask.
-        if (backend === 'remote' && !options.workspace && !options.accessTokenStdin) {
+        if (backend === 'remote' && !global.workspace && !options.accessTokenStdin) {
           throw new SynomemError(
             'INVALID_INPUT',
             'Remote setup requires --workspace, or --access-token-stdin so the key can name its own.',
@@ -676,7 +815,7 @@ export function createCli(
             ? {
                 serviceUrl: cloudApiUrl(env),
                 auth: (options.auth as AuthChoice | undefined) ?? 'access-key',
-                workspaceId: options.workspace,
+                workspaceId: global.workspace,
                 credentialStore: options.credentialStore as CredentialStoreChoice,
               }
             : {}),
@@ -818,13 +957,12 @@ export function createCli(
     // never ask for a service address, because a person has no way to tell a
     // real one from a phished one.
     .option('--url <url>', 'internal: alternate HTTPS origin')
-    .option('--workspace <id>', 'remote workspace ID')
-    .action((kind: string, options: { url?: string; workspace?: string }, command: Command) => {
+    .action((kind: string, options: { url?: string }, command: Command) => {
       const global = globals(command);
       if (kind !== 'local' && kind !== 'remote') {
         throw new SynomemError('INVALID_INPUT', 'Backend kind must be local or remote.');
       }
-      if (kind === 'remote' && !options.workspace) {
+      if (kind === 'remote' && !global.workspace) {
         throw new SynomemError('INVALID_INPUT', 'Remote backend selection requires --workspace.');
       }
       const config = writeSynomemBackend(
@@ -833,7 +971,7 @@ export function createCli(
           : {
               kind: 'remote',
               baseUrl: options.url ?? cloudApiUrl(env),
-              workspaceId: options.workspace!,
+              workspaceId: global.workspace!,
             },
         global.home,
       );
@@ -1493,7 +1631,7 @@ export function createCli(
   postCommand
     .command('create')
     .description('Publish a post the whole workspace can read')
-    .requiredOption('--as <actor-id>')
+    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .requiredOption('--title <title>')
     .requiredOption('--body <body>')
@@ -1530,7 +1668,7 @@ export function createCli(
   postCommand
     .command('list')
     .description('List posts in this workspace')
-    .requiredOption('--as <actor-id>')
+    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .option('--limit <n>', 'default 10, maximum 50')
     .action(
@@ -1549,7 +1687,7 @@ export function createCli(
   postCommand
     .command('show <post-id>')
     .description('Show one post with its acknowledgements')
-    .requiredOption('--as <actor-id>')
+    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .action(
       async (postId: string, options: { as: string; actorKind: string }, command: Command) => {
@@ -1576,7 +1714,7 @@ export function createCli(
   postCommand
     .command('acknowledge <post-id>')
     .description('Say you have seen a post')
-    .requiredOption('--as <actor-id>')
+    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .option('--note <text>', 'optional context for the author')
     .action(
@@ -1602,7 +1740,7 @@ export function createCli(
   postCommand
     .command('roster <post-id>')
     .description('Who has acknowledged a post, and who has not')
-    .requiredOption('--as <actor-id>')
+    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .action(
       async (postId: string, options: { as: string; actorKind: string }, command: Command) => {
@@ -1634,7 +1772,7 @@ export function createCli(
   postCommand
     .command('archive <post-id>')
     .description('Archive a post you wrote')
-    .requiredOption('--as <actor-id>')
+    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .option('--reason <text>')
     .action(
@@ -1659,7 +1797,11 @@ export function createCli(
   kudosCommand
     .command('give <recipient>')
     .description('Give specific, evidence-based kudos to an agent')
-    .requiredOption('--from <actor-id>', 'stable ID of the giver')
+    .requiredOption(
+      '--from <actor-id>',
+      'stable ID of the giver (defaults to --actor)',
+      actingDefault,
+    )
     .requiredOption('--actor-kind <kind>', 'human, agent, or system')
     .option('--actor-name <display-name>')
     .requiredOption('--title <title>')
@@ -1828,7 +1970,7 @@ export function createCli(
   const memoCommand = program.command('memo').description('Send and manage durable messages');
   memoCommand
     .command('send <recipient>')
-    .requiredOption('--from <actor-id>')
+    .requiredOption('--from <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .option('--actor-name <name>')
     .requiredOption('--subject <subject>')
@@ -1945,7 +2087,7 @@ export function createCli(
     .description('Retain and revise agent-owned knowledge');
   noteCommand
     .command('create')
-    .requiredOption('--as <actor-id>')
+    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'agent or human', 'agent')
     .option('--owner <agent-id>')
     .requiredOption('--title <title>')
@@ -2023,7 +2165,7 @@ export function createCli(
   });
   noteCommand
     .command('revise <note-id>')
-    .requiredOption('--as <actor-id>')
+    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'agent or human', 'agent')
     .requiredOption('--expected-version <number>')
     .option('--title <title>')
@@ -2063,7 +2205,7 @@ export function createCli(
     );
   noteCommand
     .command('archive <note-id>')
-    .requiredOption('--as <actor-id>')
+    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'agent or human', 'agent')
     .option('--idempotency-key <key>')
     .action(
@@ -2091,7 +2233,7 @@ export function createCli(
     .description('Create and manage your own private reminders');
   todoCommand
     .command('create')
-    .requiredOption('--as <actor-id>')
+    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .requiredOption('--title <title>')
     .option('--details <text>', 'private working detail')
@@ -2141,7 +2283,7 @@ export function createCli(
     );
   todoCommand
     .command('list')
-    .requiredOption('--as <actor-id>')
+    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .option('--status <status>')
     .option('--limit <number>', 'maximum results', '10')
@@ -2171,7 +2313,7 @@ export function createCli(
     );
   todoCommand
     .command('show <todo-id>')
-    .requiredOption('--as <actor-id>')
+    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .action(async (id: string, options: { as: string; actorKind: string }, command: Command) => {
       const global = globals(command);
@@ -2188,7 +2330,7 @@ export function createCli(
   for (const operation of ['complete', 'reopen', 'cancel', 'archive'] as const) {
     todoCommand
       .command(`${operation} <todo-id>`)
-      .requiredOption('--as <actor-id>')
+      .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
       .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
       .option('--note <text>')
       .option('--reason <text>')
@@ -2244,7 +2386,7 @@ export function createCli(
   const taskCommand = program.command('task').description('Create and manage agent tasks');
   taskCommand
     .command('create <assignee>')
-    .requiredOption('--from <actor-id>')
+    .requiredOption('--from <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .requiredOption('--title <title>')
     .option('--description <text>')
@@ -2334,7 +2476,7 @@ export function createCli(
   });
   taskCommand
     .command('update <task-id>')
-    .requiredOption('--as <actor-id>')
+    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'agent or human', 'agent')
     .requiredOption('--expected-version <number>')
     .option('--title <title>')
@@ -2388,7 +2530,7 @@ export function createCli(
   for (const operation of ['accept', 'reject', 'complete', 'reopen', 'cancel'] as const) {
     const command_ = taskCommand
       .command(`${operation} <task-id>`)
-      .requiredOption('--as <actor-id>')
+      .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
       .option('--actor-kind <kind>', 'agent or human', 'agent')
       .option('--note <text>')
       .option('--reason <text>')
@@ -2497,7 +2639,7 @@ export function createCli(
   kudosCommand
     .command('revoke <kudos-id>')
     .description('Record a revocation while preserving history')
-    .requiredOption('--as <actor-id>')
+    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
     .option('--actor-kind <kind>', 'human, agent, or system', 'human')
     .requiredOption('--reason <reason>')
     .option('--administrative', 'mark as an administrative revocation', false)
@@ -2727,7 +2869,7 @@ export async function runCli(
   serviceFactory: SynomemServiceFactory = configuredServiceFactory,
   dependencies: CliDependencies = {},
 ): Promise<number> {
-  const program = createCli(io, serviceFactory, dependencies);
+  const program = createCli(io, serviceFactory, dependencies, argv);
   program.exitOverride();
   try {
     await program.parseAsync(argv);

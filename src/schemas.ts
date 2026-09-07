@@ -9,6 +9,10 @@ const reservedIds = new Set([
   'synomem',
   'exports',
   'inbox',
+  // Named local workspaces live at `<home>/workspaces/<name>`, and projected
+  // agent directories at `<home>/<handle>` — so an agent called `workspaces`
+  // would collide with them.
+  'workspaces',
   'con',
   'prn',
   'aux',

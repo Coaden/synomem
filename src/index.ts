@@ -41,6 +41,14 @@ export type {
 } from './service.js';
 export { defaultConfig, resolveHome } from './config.js';
 export { cloudApiUrl, SYNOMEM_CLOUD_API_URL } from './cloud.js';
+export {
+  DEFAULT_WORKSPACE,
+  listLocalWorkspaces,
+  localWorkspaceHome,
+  WORKSPACES_DIRECTORY,
+  workspaceNameSchema,
+} from './workspaces.js';
+export type { LocalWorkspace } from './workspaces.js';
 export { discoverBoundWorkspace, discoverOrganizations, workspaceChoices } from './discover.js';
 export type { DiscoveredOrganization, DiscoveredWorkspace, DiscoveryOptions } from './discover.js';
 export { asSynomemError, errorCodes, SynomemError } from './errors.js';

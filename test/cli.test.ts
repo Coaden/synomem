@@ -462,6 +462,66 @@ describe('CLI', () => {
     expect((await invoke(['agent', 'runtime', 'list'])).stdout).toContain('codex');
   });
 
+  /*
+   * The isolation claim, exercised rather than asserted.
+   *
+   * Two workspaces on one machine, each with an agent of the SAME handle, must
+   * see only their own records. This is the property that makes a workspace
+   * per repository or per topic worth having, and locally it comes from the
+   * databases being separate files rather than from a filtered column.
+   */
+  it('keeps local workspaces isolated, including agents of the same name', async () => {
+    const root = tempHome();
+    const invoke = async (args: string[]) => {
+      const captured = capture();
+      const code = await runCli(['node', 'synomem', '--home', root, ...args], captured.io);
+      return { code, out: captured.stdout.join(''), err: captured.stderr.join('') };
+    };
+
+    expect((await invoke(['config', 'init', '--backend', 'local', '--yes'])).code).toBe(0);
+    expect((await invoke(['workspace', 'create', 'lumina'])).code).toBe(0);
+
+    // The same handle in both, which a shared database would have refused.
+    expect((await invoke(['agent', 'create', 'claude', '--name', 'Claude'])).code).toBe(0);
+    expect(
+      (await invoke(['--workspace', 'lumina', 'agent', 'create', 'claude', '--name', 'Claude']))
+        .code,
+    ).toBe(0);
+
+    await invoke(['--actor', 'claude', 'note', 'create', '--title', 'Root note', '--body', 'Here']);
+    await invoke([
+      '--workspace',
+      'lumina',
+      '--actor',
+      'claude',
+      'note',
+      'create',
+      '--title',
+      'Lumina note',
+      '--body',
+      'There',
+    ]);
+
+    const root_notes = await invoke(['note', 'list']);
+    expect(root_notes.out).toContain('Root note');
+    expect(root_notes.out).not.toContain('Lumina note');
+
+    const lumina_notes = await invoke(['--workspace', 'lumina', 'note', 'list']);
+    expect(lumina_notes.out).toContain('Lumina note');
+    expect(lumina_notes.out).not.toContain('Root note');
+
+    // Both are listed, and the default is the root itself so nothing moved.
+    const listed = await invoke(['workspace', 'list', '--json']);
+    expect(
+      JSON.parse(listed.out) as { workspaces: Array<{ name: string; home: string }> },
+    ).toMatchObject({
+      workspaces: [
+        { name: 'default', home: root, initialized: true },
+        { name: 'lumina', initialized: true },
+      ],
+    });
+  });
+
   it('exercises the complete local administration and recognition workflow', async () => {
     const home = tempHome();
     const invoke = async (args: string[]) => {
