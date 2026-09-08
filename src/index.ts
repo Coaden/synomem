@@ -49,6 +49,15 @@ export {
   workspaceNameSchema,
 } from './workspaces.js';
 export type { LocalWorkspace } from './workspaces.js';
+export {
+  findProjectSelection,
+  PROJECT_CONFIG_FILE,
+  PROJECT_DIRECTORY,
+  projectConfigSchema,
+  resolveWorkspaceSelection,
+  writeProjectSelection,
+} from './project.js';
+export type { ProjectConfig, ProjectSelection } from './project.js';
 export { discoverBoundWorkspace, discoverOrganizations, workspaceChoices } from './discover.js';
 export type { DiscoveredOrganization, DiscoveredWorkspace, DiscoveryOptions } from './discover.js';
 export { asSynomemError, errorCodes, SynomemError } from './errors.js';

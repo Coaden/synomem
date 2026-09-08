@@ -23,6 +23,11 @@ import {
 } from './configure.js';
 import { discoverBoundWorkspace, discoverOrganizations, workspaceChoices } from './discover.js';
 import { DEFAULT_WORKSPACE, listLocalWorkspaces, localWorkspaceHome } from './workspaces.js';
+import {
+  findProjectSelection,
+  resolveWorkspaceSelection,
+  writeProjectSelection,
+} from './project.js';
 import { defaultPromptIo, type PromptIo } from './prompt.js';
 import { credentialReference, OsCredentialStore, type CredentialStore } from './credentials.js';
 import { asSynomemError, SynomemError, type SynomemErrorCode } from './errors.js';
@@ -266,34 +271,6 @@ function output(io: CliIo, json: boolean, value: unknown, human: string): void {
  * `backend use remote --workspace` already handles; passing both here would be
  * two different answers to the same question, so it is refused.
  */
-function globals(command: Command): {
-  home?: string;
-  json: boolean;
-  actor?: string;
-  workspace?: string;
-} {
-  const options = command.optsWithGlobals<{
-    home?: string;
-    json: boolean;
-    workspace?: string;
-    actor?: string;
-  }>();
-  if (!options.workspace) return options;
-  /*
-   * One flag, one meaning — "which workspace" — resolved differently by the
-   * handful of commands that CONFIGURE a backend rather than act inside one.
-   * For those, the value is a hosted workspace ID to be written to the config,
-   * so it is passed through raw and they read `workspace`. Everywhere else it
-   * names a local workspace, which is a home.
-   *
-   * These commands used to declare their own `--workspace`, which does not
-   * work: Commander gives a duplicated long flag to the parent, so the
-   * subcommand never received it at all.
-   */
-  if (CONFIGURES_BACKEND.has(commandPath(command))) return options;
-  return { ...options, home: localWorkspaceHome(options.workspace, options.home) };
-}
-
 /** `parent child`, so a subcommand name cannot be confused with another's. */
 function commandPath(command: Command): string {
   const parent = command.parent?.name();
@@ -376,7 +353,20 @@ function actorDefault(argv: string[], env: NodeJS.ProcessEnv): string | undefine
     if (argument.startsWith('--actor='))
       return argument.slice('--actor='.length).trim() || undefined;
   }
-  return env.SYNOMEM_ACTOR_ID?.trim() || undefined;
+  if (env.SYNOMEM_ACTOR_ID?.trim()) return env.SYNOMEM_ACTOR_ID.trim();
+  /*
+   * Last, the project's own binding. `workspace use --as` exists so a
+   * repository can settle both questions once — which workspace, and as whom —
+   * and a command run there needs neither flag afterwards.
+   */
+  try {
+    return findProjectSelection()?.actor;
+  } catch {
+    // A malformed project file is reported by the resolver when the command
+    // actually runs, with the path in the message. Failing here would turn it
+    // into an error before any command had been parsed.
+    return undefined;
+  }
 }
 
 export function createCli(
@@ -387,6 +377,46 @@ export function createCli(
 ): Command {
   const env = dependencies.env ?? process.env;
   const actingDefault = actorDefault(argv, env);
+
+  const globals = (
+    command: Command,
+  ): { home?: string; json: boolean; actor?: string; workspace?: string } => {
+    const options = command.optsWithGlobals<{
+      home?: string;
+      json: boolean;
+      workspace?: string;
+      actor?: string;
+    }>();
+    if (CONFIGURES_BACKEND.has(commandPath(command))) return options;
+    /*
+     * Resolution runs even with no `--workspace`, because a project's
+     * `.synomem/config.json` selects one without anybody passing a flag — that is
+     * the whole point of it. `--home` still wins outright: it names a home
+     * directly rather than a workspace within one.
+     */
+    if (!options.home) {
+      const selection = resolveWorkspaceSelection({
+        ...(options.workspace ? { flag: options.workspace } : {}),
+        ...(options.actor ? { actorFlag: options.actor } : {}),
+        env,
+      });
+      return { ...options, home: selection.home, actor: selection.actor ?? options.actor };
+    }
+    if (!options.workspace) return options;
+    /*
+     * One flag, one meaning — "which workspace" — resolved differently by the
+     * handful of commands that CONFIGURE a backend rather than act inside one.
+     * For those, the value is a hosted workspace ID to be written to the config,
+     * so it is passed through raw and they read `workspace`. Everywhere else it
+     * names a local workspace, which is a home.
+     *
+     * These commands used to declare their own `--workspace`, which does not
+     * work: Commander gives a duplicated long flag to the parent, so the
+     * subcommand never received it at all.
+     */
+    return { ...options, home: localWorkspaceHome(options.workspace, options.home) };
+  };
+
   const credentialStore = dependencies.credentialStore ?? new OsCredentialStore();
   const oauthLogin = dependencies.oauthLogin ?? loginWithOAuth;
   const discoverWorkspace = dependencies.discoverBoundWorkspace ?? discoverBoundWorkspace;
@@ -454,6 +484,9 @@ export function createCli(
       const global = globals(command);
       // Read from disk, so nothing is listed that does not exist.
       const workspaces = listLocalWorkspaces(global.home);
+      // Which one is in effect here, and what decided it — a flag, the
+      // environment, a project file, or nothing.
+      const selection = resolveWorkspaceSelection({ env });
       const human = workspaces
         .map(
           (workspace) =>
@@ -465,8 +498,46 @@ export function createCli(
       output(
         io,
         global.json,
-        { workspaces },
-        `${human}\n\nAct in one with --workspace <name>. A local workspace is a separate store on this machine; a hosted workspace is shared, and is selected with \`backend use remote --workspace\`.`,
+        { workspaces, active: selection.workspace ?? DEFAULT_WORKSPACE, source: selection.source },
+        [
+          human,
+          '',
+          `Acting in: ${selection.workspace ?? DEFAULT_WORKSPACE}  (from ${selection.source})`,
+          '',
+          'Bind a directory with `synomem workspace use <name>`, or pass --workspace once.',
+          'A local workspace is a separate store on this machine; a hosted workspace is shared,',
+          'and is selected with `backend use remote --workspace`.',
+        ].join('\n'),
+      );
+    });
+
+  workspaceCommand
+    .command('use <name>')
+    .description('Bind this directory to a workspace, for every session opened here')
+    .option('--as <actor-id>', 'also always write as this agent', actingDefault)
+    .action((name: string, options: { as?: string }, command: Command) => {
+      const global = globals(command);
+      // Validated by resolving it, so a name that could never work is refused
+      // before a file claiming it is written.
+      const home = localWorkspaceHome(name, undefined);
+      const path = writeProjectSelection(process.cwd(), {
+        workspace: name,
+        ...(options.as ? { actor: options.as } : {}),
+      });
+      output(
+        io,
+        global.json,
+        { path, workspace: name, home, ...(options.as ? { actor: options.as } : {}) },
+        [
+          `Wrote ${path}`,
+          '',
+          `Every Synomem command and MCP server started in this directory now acts in ${name}${
+            options.as ? ` as ${options.as}` : ''
+          }, with no flag.`,
+          `Records live in ${home} — nothing is stored in this directory.`,
+          '',
+          'Commit it to share the choice with the repository, or ignore it to keep it yours.',
+        ].join('\n'),
       );
     });
 
