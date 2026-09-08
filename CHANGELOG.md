@@ -3,6 +3,49 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
+## [0.6.0] - 2026-09-07
+
+### Added
+
+- Local workspace isolation is now real. A local workspace used to be a
+  `--workspace` label with nothing behind it — only `events` carried
+  `workspace_id`, reads never filtered on it, and several tables had no such
+  column at all. A local workspace is now a separate SQLite database in its
+  own home, the safer design given SQLite has no row-level security: on
+  Postgres a query that forgets to filter by workspace returns nothing
+  instead of another workspace's rows, and separate files make the local
+  equivalent of that mistake unwritable rather than merely unlikely.
+- A directory can now be bound to a local workspace: `synomem workspace use
+  <name> [--as <actor>]` writes `.synomem/config.json`, found by walking up
+  from the working directory the same way `.git` or `.nvmrc` is. Every command
+  and every stdio MCP server started in that directory afterward resolves the
+  workspace — and, unless overridden per launch, the default actor — with no
+  flag repeated. This is what makes several harnesses opened in the same
+  repository share one workspace while each still writes as its own actor:
+  `--workspace`, `SYNOMEM_WORKSPACE`, and `--home` all still win outright, in
+  that order, over the project file, and each harness's own `--agent-id` or
+  `--actor-id` always wins over the file's default actor.
+- `synomem_agent_archive` and `synomem_agent_restore` MCP tools, closing the
+  gap where the CLI could archive or restore an agent identity but MCP could
+  not. Gated by a new `allowAgentArchiveViaMcp` capability
+  (`SYNOMEM_ALLOW_AGENT_ARCHIVE_VIA_MCP`), off by default and mirroring
+  `agentCreationViaMcp` exactly, so runtime agents cannot silently disable
+  each other unless an operator opts in.
+
+### Fixed
+
+- An agent created before handles existed (schema 7) made every write in its
+  workspace fail with `UNSUPPORTED_EVENT`: its stored `agent.created` event
+  carries an id and no handle, and the compatibility check that runs before
+  each write refused the whole event stream on that missing field. The reader
+  now widens to accept it — the id is the correct handle for those records —
+  rather than the append-only log being rewritten.
+- Renaming an agent's handle left its old projection directory behind,
+  stranding `NOTES.md`, the one file in there that belongs to the reader
+  rather than to Synomem and that a rebuild will never delete. The directory
+  is now moved to the new handle before projections are regenerated, so
+  hand-written notes arrive intact instead of being stranded.
+
 ## [0.5.3] - 2026-09-07
 
 ### Documentation
