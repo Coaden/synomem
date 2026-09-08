@@ -12,6 +12,7 @@ export const defaultConfig: SynomemConfig = {
   allowSelfAwards: false,
   allowCrossAgentTasks: true,
   allowAgentCreationViaMcp: false,
+  allowAgentArchiveViaMcp: false,
   allowRebuildViaMcp: false,
   includePrivateInStats: false,
   projection: {
@@ -55,6 +56,7 @@ const policySchema = z.object({
   allowSelfAwards: z.boolean(),
   allowCrossAgentTasks: z.boolean(),
   allowAgentCreationViaMcp: z.boolean(),
+  allowAgentArchiveViaMcp: z.boolean(),
   allowRebuildViaMcp: z.boolean(),
   includePrivateInStats: z.boolean(),
   projection: z.object({
@@ -156,6 +158,7 @@ function environmentConfig(env: NodeJS.ProcessEnv): SynomemConfigOverrides {
   const allowSelfAwards = optionalBoolean(env, 'SYNOMEM_ALLOW_SELF_AWARDS');
   const allowCrossAgentTasks = optionalBoolean(env, 'SYNOMEM_ALLOW_CROSS_AGENT_TODOS');
   const allowAgentCreationViaMcp = optionalBoolean(env, 'SYNOMEM_ALLOW_AGENT_CREATION_VIA_MCP');
+  const allowAgentArchiveViaMcp = optionalBoolean(env, 'SYNOMEM_ALLOW_AGENT_ARCHIVE_VIA_MCP');
   const allowRebuildViaMcp = optionalBoolean(env, 'SYNOMEM_ALLOW_REBUILD_VIA_MCP');
   const includePrivateInStats = optionalBoolean(env, 'SYNOMEM_INCLUDE_PRIVATE_IN_STATS');
   const projection = {
@@ -170,6 +173,7 @@ function environmentConfig(env: NodeJS.ProcessEnv): SynomemConfigOverrides {
     ...(allowSelfAwards !== undefined ? { allowSelfAwards } : {}),
     ...(allowCrossAgentTasks !== undefined ? { allowCrossAgentTasks } : {}),
     ...(allowAgentCreationViaMcp !== undefined ? { allowAgentCreationViaMcp } : {}),
+    ...(allowAgentArchiveViaMcp !== undefined ? { allowAgentArchiveViaMcp } : {}),
     ...(allowRebuildViaMcp !== undefined ? { allowRebuildViaMcp } : {}),
     ...(includePrivateInStats !== undefined ? { includePrivateInStats } : {}),
     ...(Object.keys(projection).length ? { projection } : {}),

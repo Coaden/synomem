@@ -770,6 +770,7 @@ export interface SynomemConfig {
   allowSelfAwards: boolean;
   allowCrossAgentTasks: boolean;
   allowAgentCreationViaMcp: boolean;
+  allowAgentArchiveViaMcp: boolean;
   allowRebuildViaMcp: boolean;
   includePrivateInStats: boolean;
   projection: {

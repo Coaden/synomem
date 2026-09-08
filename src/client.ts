@@ -1924,6 +1924,7 @@ export class SynomemClient extends SynomemCore implements SynomemService {
       binding: { workspaceId: this.storage.config.workspaceId, actor: this.actor },
       administration: {
         agentCreationViaMcp: this.storage.config.allowAgentCreationViaMcp,
+        agentArchiveViaMcp: this.storage.config.allowAgentArchiveViaMcp,
         rebuildViaMcp: this.storage.config.allowRebuildViaMcp,
       },
       projections: { ...this.storage.config.projection },

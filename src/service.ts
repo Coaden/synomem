@@ -53,6 +53,7 @@ export interface SynomemServiceCapabilities {
   };
   administration: {
     agentCreationViaMcp: boolean;
+    agentArchiveViaMcp: boolean;
     rebuildViaMcp: boolean;
   };
   projections: {

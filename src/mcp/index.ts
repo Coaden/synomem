@@ -322,6 +322,68 @@ export async function createSynomemMcpServer(
   );
 
   server.registerTool(
+    'synomem_agent_archive',
+    {
+      title: 'Archive an agent identity',
+      description:
+        'Administrative tool for archiving an agent identity, not deleting it. Everything it authored keeps its name and stays exactly as it is; the agent simply cannot act again until restored with synomem_agent_restore. Disabled by default so runtime agents cannot silently disable each other.',
+      inputSchema: z.object({
+        idOrAlias: z.string().min(1).describe('An agent ID or alias, in any casing.'),
+      }),
+      outputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ idOrAlias }) => {
+      try {
+        const capabilities = await client.capabilities();
+        if (!capabilities.administration.agentArchiveViaMcp) {
+          throw new SynomemError(
+            'POLICY_FORBIDDEN',
+            'Agent archiving via MCP is disabled by configuration.',
+          );
+        }
+        const profile = await client.agents.archive(idOrAlias);
+        return success(actor, `Archived agent ${profile.displayName} (${profile.id}).`, {
+          profile,
+        });
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
+    'synomem_agent_restore',
+    {
+      title: 'Restore an archived agent identity',
+      description:
+        'Administrative tool for letting a previously archived agent act again, using the same agent ID it always had. Disabled by default alongside synomem_agent_archive.',
+      inputSchema: z.object({
+        idOrAlias: z.string().min(1).describe('An agent ID or alias, in any casing.'),
+      }),
+      outputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ idOrAlias }) => {
+      try {
+        const capabilities = await client.capabilities();
+        if (!capabilities.administration.agentArchiveViaMcp) {
+          throw new SynomemError(
+            'POLICY_FORBIDDEN',
+            'Agent restoring via MCP is disabled by configuration.',
+          );
+        }
+        const profile = await client.agents.restore(idOrAlias);
+        return success(actor, `Restored agent ${profile.displayName} (${profile.id}).`, {
+          profile,
+        });
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
     'synomem_agent_list',
     {
       title: 'List agent identities',

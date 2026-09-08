@@ -82,6 +82,8 @@ describe('MCP protocol integration', () => {
         'synomem_task_reopen',
         'synomem_task_cancel',
         'synomem_agent_create',
+        'synomem_agent_archive',
+        'synomem_agent_restore',
         'synomem_agent_list',
         'synomem_rebuild',
         'synomem_doctor',
@@ -205,6 +207,18 @@ describe('MCP protocol integration', () => {
       arguments: { handle: 'mycroft', displayName: 'Mycroft' },
     });
     expect(createAgent.structuredContent).toMatchObject({ errorCode: 'POLICY_FORBIDDEN' });
+
+    const archiveAgent = await protocolClient.callTool({
+      name: 'synomem_agent_archive',
+      arguments: { idOrAlias: 'gracie' },
+    });
+    expect(archiveAgent.structuredContent).toMatchObject({ errorCode: 'POLICY_FORBIDDEN' });
+
+    const restoreAgent = await protocolClient.callTool({
+      name: 'synomem_agent_restore',
+      arguments: { idOrAlias: 'gracie' },
+    });
+    expect(restoreAgent.structuredContent).toMatchObject({ errorCode: 'POLICY_FORBIDDEN' });
 
     const rebuild = await protocolClient.callTool({ name: 'synomem_rebuild', arguments: {} });
     expect(rebuild.structuredContent).toMatchObject({ errorCode: 'POLICY_FORBIDDEN' });
