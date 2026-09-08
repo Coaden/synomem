@@ -647,6 +647,15 @@ export class RemoteSynomemService implements SynomemService {
         headers: {
           accept: 'application/json',
           authorization: `Bearer ${accessToken}`,
+          /*
+           * Harmless for an OAuth actor token (its workspace and identity are
+           * already bound into the token itself), and required for an access
+           * key: an access key authenticates the member who owns it, not a
+           * machine or a workspace, so which workspace and which agent are
+           * meant have to be named on every request.
+           */
+          'synomem-workspace-id': this.workspaceId,
+          ...(this.actor.kind === 'agent' ? { 'synomem-agent-id': this.actor.id } : {}),
           ...(body ? { 'content-type': 'application/json' } : {}),
           ...(idempotencyKey ? { 'idempotency-key': idempotencyKey } : {}),
         },

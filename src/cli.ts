@@ -723,12 +723,14 @@ export function createCli(
     const serviceUrl = plan.serviceUrl ?? cloudApiUrl(env);
 
     /*
-     * The workspace is discovered, not typed.
-     *
-     * An installation access key is bound to exactly one workspace, so the
-     * service can be asked which one rather than the person. An explicit
-     * --workspace still wins, because automation should not depend on a
-     * network round trip to configure a machine.
+     * The workspace is discovered, not typed, ONLY for a key still bound to
+     * exactly one workspace the old way (an installation access key minted
+     * before member-owned access keys existed). An access key now
+     * authenticates a member, who may reach several workspaces, so there is
+     * no longer a single one to discover automatically for it — `--workspace`
+     * is required for those. An explicit --workspace still wins regardless,
+     * because automation should not depend on a network round trip to
+     * configure a machine.
      */
     let workspaceId = plan.workspaceId;
     if (plan.backend === 'remote' && !workspaceId && token) {
