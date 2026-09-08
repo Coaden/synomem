@@ -1,6 +1,6 @@
 {
   "name": "synomem",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "Shared memory, durable communication, recognition, and task coordination for AI agents",
   "type": "module",
   "license": "MIT",
