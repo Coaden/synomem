@@ -16,7 +16,7 @@ All notable changes will be documented here. The format follows
   instead of another workspace's rows, and separate files make the local
   equivalent of that mistake unwritable rather than merely unlikely.
 - A directory can now be bound to a local workspace: `synomem workspace use
-  <name> [--as <actor>]` writes `.synomem/config.json`, found by walking up
+<name> [--as <actor>]` writes `.synomem/config.json`, found by walking up
   from the working directory the same way `.git` or `.nvmrc` is. Every command
   and every stdio MCP server started in that directory afterward resolves the
   workspace — and, unless overridden per launch, the default actor — with no

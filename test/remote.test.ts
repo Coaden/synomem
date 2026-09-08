@@ -51,7 +51,11 @@ describe('remote Synomem service', () => {
           data: {
             backend: 'remote',
             binding: { workspaceId: 'workspace-a', actor },
-            administration: { agentCreationViaMcp: false, agentArchiveViaMcp: false, rebuildViaMcp: false },
+            administration: {
+              agentCreationViaMcp: false,
+              agentArchiveViaMcp: false,
+              rebuildViaMcp: false,
+            },
             projections: {
               writeWinsMarkdown: false,
               writeMemoryMarkdown: false,
@@ -134,7 +138,11 @@ describe('remote Synomem service', () => {
           data: {
             backend: 'remote',
             binding,
-            administration: { agentCreationViaMcp: false, agentArchiveViaMcp: false, rebuildViaMcp: false },
+            administration: {
+              agentCreationViaMcp: false,
+              agentArchiveViaMcp: false,
+              rebuildViaMcp: false,
+            },
             projections: {
               writeWinsMarkdown: false,
               writeMemoryMarkdown: false,

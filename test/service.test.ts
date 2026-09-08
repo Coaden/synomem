@@ -74,7 +74,11 @@ describe('domain service boundary', () => {
     expect(info).toMatchObject({ backend: 'local', home });
     expect(await service.capabilities()).toMatchObject({
       backend: 'local',
-      administration: { agentCreationViaMcp: false, agentArchiveViaMcp: false, rebuildViaMcp: false },
+      administration: {
+        agentCreationViaMcp: false,
+        agentArchiveViaMcp: false,
+        rebuildViaMcp: false,
+      },
       projections: { writeWinsMarkdown: true },
     });
 
