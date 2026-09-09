@@ -58,7 +58,11 @@ export {
   writeProjectSelection,
 } from './project.js';
 export type { ProjectConfig, ProjectSelection } from './project.js';
-export { discoverAccessKeyWorkspaces, discoverOrganizations, workspaceChoices } from './discover.js';
+export {
+  discoverAccessKeyWorkspaces,
+  discoverOrganizations,
+  workspaceChoices,
+} from './discover.js';
 export type { DiscoveredOrganization, DiscoveredWorkspace, DiscoveryOptions } from './discover.js';
 export { asSynomemError, errorCodes, SynomemError } from './errors.js';
 export {

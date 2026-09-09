@@ -769,7 +769,9 @@ export function createCli(
             'This access key can reach more than one workspace, so a non-interactive',
             'setup needs to be told which one:',
             '',
-            ...discovered.workspaces.map((workspace) => `  ${workspace.id}  ${workspace.displayName}`),
+            ...discovered.workspaces.map(
+              (workspace) => `  ${workspace.id}  ${workspace.displayName}`,
+            ),
             '',
             'Re-run with --workspace <workspace-id>.',
           ].join('\n'),
