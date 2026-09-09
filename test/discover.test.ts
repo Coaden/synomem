@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  discoverBoundWorkspace,
+  discoverAccessKeyWorkspaces,
   discoverOrganizations,
   workspaceChoices,
 } from '../src/discover.js';
@@ -27,30 +27,42 @@ function router(routes: Record<string, unknown>): typeof globalThis.fetch {
 }
 
 describe('workspace discovery', () => {
-  it('reads the single workspace an installation key is bound to', async () => {
+  it('lists every workspace a member-owned access key can reach', async () => {
     await expect(
-      discoverBoundWorkspace({
+      discoverAccessKeyWorkspaces({
         baseUrl: 'https://api.synomem.example.test',
         accessToken: 'access-secret',
         fetch: router({
-          '/v1/identity': {
-            workspaceId: 'ws-04psqx2rkt8ttft7a1t2z69r97',
-            actor: { kind: 'agent', id: '01M1Y0000000000000000CODEX', displayName: 'Codex' },
+          '/v1/access-keys/workspaces': {
+            organizationId: 'org-1',
+            workspaces: [
+              { id: 'ws-04psqx2rkt8ttft7a1t2z69r97', displayName: 'Production' },
+              { id: 'ws-2', displayName: 'Staging' },
+            ],
           },
         }),
       }),
-    ).resolves.toMatchObject({ workspaceId: 'ws-04psqx2rkt8ttft7a1t2z69r97' });
+    ).resolves.toMatchObject({
+      organizationId: 'org-1',
+      workspaces: [{ id: 'ws-04psqx2rkt8ttft7a1t2z69r97' }, { id: 'ws-2' }],
+    });
   });
 
   it('keeps a base URL with no trailing slash and one with it interchangeable', async () => {
-    const identity = { '/v1/identity': { workspaceId: 'ws-1', actor: { kind: 'agent', id: 'a' } } };
+    const workspaces = {
+      '/v1/access-keys/workspaces': { organizationId: 'org-1', workspaces: [{ id: 'ws-1' }] },
+    };
     for (const baseUrl of [
       'https://api.synomem.example.test',
       'https://api.synomem.example.test/',
     ]) {
       await expect(
-        discoverBoundWorkspace({ baseUrl, accessToken: 'access-secret', fetch: router(identity) }),
-      ).resolves.toMatchObject({ workspaceId: 'ws-1' });
+        discoverAccessKeyWorkspaces({
+          baseUrl,
+          accessToken: 'access-secret',
+          fetch: router(workspaces),
+        }),
+      ).resolves.toMatchObject({ workspaces: [{ id: 'ws-1' }] });
     }
   });
 
@@ -61,7 +73,7 @@ describe('workspace discovery', () => {
         error: { code: 'AUTH_REQUIRED', message: 'Access token is invalid.' },
       })) as typeof globalThis.fetch;
     await expect(
-      discoverBoundWorkspace({
+      discoverAccessKeyWorkspaces({
         baseUrl: 'https://api.synomem.example.test',
         accessToken: 'expired',
         fetch: unauthorized,
@@ -74,7 +86,7 @@ describe('workspace discovery', () => {
       throw new Error('connect ECONNREFUSED');
     }) as typeof globalThis.fetch;
     await expect(
-      discoverBoundWorkspace({
+      discoverAccessKeyWorkspaces({
         baseUrl: 'https://api.synomem.example.test',
         accessToken: 'access-secret',
         fetch: offline,

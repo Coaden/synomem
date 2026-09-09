@@ -113,27 +113,79 @@ describe('onboarding configuration', () => {
 
 /*
  * Remote setup used to ask a person to type `ws-04psqx2rkt8ttft7a1t2z69r97`
- * from memory. An installation access key is bound to exactly one workspace,
- * so the service can be asked instead.
+ * from memory. A member-owned access key can be asked which workspaces its
+ * organization has instead — and, unlike the installation keys this replaced,
+ * that can be more than one, or none yet.
  */
 describe('remote setup', () => {
-  it('takes the workspace from the access key rather than asking for it', async () => {
+  /** A stub service so the closing diagnostics never reach the network. */
+  const stubFactory: SynomemServiceFactory = () =>
+    ({
+      init: async () => undefined,
+      close: async () => undefined,
+      doctor: async () => ({ healthy: true, diagnostics: [] }),
+    }) as unknown as ReturnType<SynomemServiceFactory>;
+
+  it('picks the workspace on its own when the key reaches only one', async () => {
     const { runCli } = await import('../src/cli.js');
     const home = tempHome();
     const lines: string[] = [];
     const io = { stdout: (t: string) => lines.push(t), stderr: (t: string) => lines.push(t) };
 
     const discovered: string[] = [];
-    /*
-     * A stub service, so the closing diagnostics neither reach the network nor
-     * make the exit code depend on how a given platform fails to connect.
-     */
-    const factory: SynomemServiceFactory = () =>
-      ({
-        init: async () => undefined,
-        close: async () => undefined,
-        doctor: async () => ({ healthy: true, diagnostics: [] }),
-      }) as unknown as ReturnType<SynomemServiceFactory>;
+    const code = await runCli(
+      [
+        'node',
+        'synomem',
+        '--home',
+        home,
+        'config',
+        'init',
+        '--backend',
+        'remote',
+        '--auth',
+        'access-key',
+        '--access-token-stdin',
+        '--credential-store',
+        'file',
+        '--yes',
+      ],
+      io,
+      stubFactory,
+      {
+        // Piped, not typed: `--access-token-stdin` reads the whole stream, so
+        // the key never becomes a shell-history entry or a process argument.
+        promptIo: { ...scriptedIo(['installation-key-secret']), interactive: false },
+        discoverAccessKeyWorkspaces: async ({ accessToken }) => {
+          discovered.push(accessToken);
+          return {
+            organizationId: 'org-1',
+            workspaces: [{ id: 'ws-04psqx2rkt8ttft7a1t2z69r97', displayName: 'Production' }],
+          };
+        },
+      },
+    );
+
+    expect(code).toBe(0);
+    // The key was what answered the question, and it never reached the output.
+    expect(discovered).toEqual(['installation-key-secret']);
+    const printed = lines.join('');
+    expect(printed).toContain('ws-04psqx2rkt8ttft7a1t2z69r97');
+    expect(printed).not.toContain('installation-key-secret');
+    expect(
+      JSON.parse(readFileSync(join(home, 'config.json'), 'utf8')) as {
+        backend: { kind: string; workspaceId: string };
+      },
+    ).toMatchObject({
+      backend: { kind: 'remote', workspaceId: 'ws-04psqx2rkt8ttft7a1t2z69r97' },
+    });
+  });
+
+  it('refuses to guess when several workspaces exist and nobody can answer', async () => {
+    const { runCli } = await import('../src/cli.js');
+    const home = tempHome();
+    const lines: string[] = [];
+    const io = { stdout: (t: string) => lines.push(t), stderr: (t: string) => lines.push(t) };
 
     const code = await runCli(
       [
@@ -153,31 +205,59 @@ describe('remote setup', () => {
         '--yes',
       ],
       io,
-      factory,
+      stubFactory,
       {
-        // Piped, not typed: `--access-token-stdin` reads the whole stream, so
-        // the key never becomes a shell-history entry or a process argument.
-        promptIo: { ...scriptedIo(['installation-key-secret']), interactive: false },
-        discoverBoundWorkspace: async ({ accessToken }) => {
-          discovered.push(accessToken);
-          return { workspaceId: 'ws-04psqx2rkt8ttft7a1t2z69r97' };
-        },
+        promptIo: { ...scriptedIo(['secret-key']), interactive: false },
+        discoverAccessKeyWorkspaces: async () => ({
+          organizationId: 'org-1',
+          workspaces: [
+            { id: 'ws-1', displayName: 'Production' },
+            { id: 'ws-2', displayName: 'Staging' },
+          ],
+        }),
       },
     );
 
-    expect(code).toBe(0);
-    // The key was what answered the question, and it never reached the output.
-    expect(discovered).toEqual(['installation-key-secret']);
+    expect(code).not.toBe(0);
     const printed = lines.join('');
-    expect(printed).toContain('ws-04psqx2rkt8ttft7a1t2z69r97');
-    expect(printed).not.toContain('installation-key-secret');
-    expect(
-      JSON.parse(readFileSync(join(home, 'config.json'), 'utf8')) as {
-        backend: { kind: string; workspaceId: string };
+    expect(printed).toContain('--workspace <workspace-id>');
+    expect(printed).toContain('ws-1');
+    expect(printed).toContain('ws-2');
+  });
+
+  it('says plainly when the organization has no workspaces yet, rather than guessing', async () => {
+    const { runCli } = await import('../src/cli.js');
+    const home = tempHome();
+    const lines: string[] = [];
+    const io = { stdout: (t: string) => lines.push(t), stderr: (t: string) => lines.push(t) };
+
+    const code = await runCli(
+      [
+        'node',
+        'synomem',
+        '--home',
+        home,
+        'config',
+        'init',
+        '--backend',
+        'remote',
+        '--auth',
+        'access-key',
+        '--access-token-stdin',
+        '--credential-store',
+        'file',
+        '--yes',
+      ],
+      io,
+      stubFactory,
+      {
+        promptIo: { ...scriptedIo(['secret-key']), interactive: false },
+        discoverAccessKeyWorkspaces: async () => ({ organizationId: 'org-1', workspaces: [] }),
       },
-    ).toMatchObject({
-      backend: { kind: 'remote', workspaceId: 'ws-04psqx2rkt8ttft7a1t2z69r97' },
-    });
+    );
+
+    expect(code).not.toBe(0);
+    expect(lines.join('')).toContain('no workspaces yet');
   });
 
   it('still requires an explicit workspace when there is no key to ask', async () => {

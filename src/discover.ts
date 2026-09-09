@@ -1,5 +1,5 @@
 /*
- * Finding out which workspace a credential belongs to, so nobody has to type
+ * Finding out which workspaces a credential can reach, so nobody has to type
  * one from memory.
  *
  * A hosted workspace ID looks like `ws-04psqx2rkt8ttft7a1t2z69r97`. Asking a
@@ -9,11 +9,12 @@
  *
  * Two credentials, two routes, because they carry different authority:
  *
- *   An installation access key is bound to exactly one workspace. There is
- *   nothing to choose, so `discoverBoundWorkspace` reads it off the data plane
- *   and setup asks nothing at all.
+ *   A member-owned access key authenticates the ACCOUNT that created it, and
+ *   reaches every workspace in that account's organization -- never just one
+ *   -- so `discoverAccessKeyWorkspaces` lists them off the data plane, with no
+ *   workspace chosen yet, which is exactly what setup cannot supply up front.
  *
- *   A browser sign-in authorizes an ACCOUNT, which may reach several
+ *   A browser sign-in also authorizes an ACCOUNT, which may reach several
  *   organizations, each with several workspaces. `discoverOrganizations` lists
  *   them for selection.
  */
@@ -82,23 +83,21 @@ async function readJson<T>(options: DiscoveryOptions, path: string): Promise<T> 
 }
 
 /**
- * The single workspace an installation access key can address.
+ * Every workspace a member-owned access key can reach, asked before any one
+ * of them has been chosen.
  *
- * Answered by the data plane rather than the control plane: an installation key
- * is not an account principal, so it cannot list organizations, but it can
- * always say where it is bound.
+ * Answered by the data plane rather than the control plane: an access key is
+ * not an account principal the control plane recognizes, but the data plane
+ * already knows which organization owns it and can list that organization's
+ * workspaces without requiring one to be named first.
  */
-export async function discoverBoundWorkspace(
+export async function discoverAccessKeyWorkspaces(
   options: DiscoveryOptions,
-): Promise<{ workspaceId: string; actor: { kind: string; id: string; displayName?: string } }> {
-  const identity = await readJson<{
-    workspaceId: string;
-    actor: { kind: string; id: string; displayName?: string };
-  }>(options, 'v1/identity');
-  if (!identity.workspaceId) {
-    throw new SynomemError('REMOTE_PROTOCOL', 'The service did not report a bound workspace.');
-  }
-  return { workspaceId: identity.workspaceId, actor: identity.actor };
+): Promise<{ organizationId: string; workspaces: DiscoveredWorkspace[] }> {
+  return await readJson<{ organizationId: string; workspaces: DiscoveredWorkspace[] }>(
+    options,
+    'v1/access-keys/workspaces',
+  );
 }
 
 /**

@@ -21,14 +21,19 @@ import {
   type ConfigPlan,
   type CredentialStoreChoice,
 } from './configure.js';
-import { discoverBoundWorkspace, discoverOrganizations, workspaceChoices } from './discover.js';
+import {
+  discoverAccessKeyWorkspaces,
+  discoverOrganizations,
+  workspaceChoices,
+  type DiscoveredWorkspace,
+} from './discover.js';
 import { DEFAULT_WORKSPACE, listLocalWorkspaces, localWorkspaceHome } from './workspaces.js';
 import {
   findProjectSelection,
   resolveWorkspaceSelection,
   writeProjectSelection,
 } from './project.js';
-import { defaultPromptIo, type PromptIo } from './prompt.js';
+import { defaultPromptIo, select, type PromptIo } from './prompt.js';
 import { credentialReference, OsCredentialStore, type CredentialStore } from './credentials.js';
 import { asSynomemError, SynomemError, type SynomemErrorCode } from './errors.js';
 import { atomicWriteFile } from './fs-utils.js';
@@ -84,12 +89,12 @@ export interface CliDependencies {
   }) => Promise<void>;
   /*
    * Injected so setup can be tested without a network. The default asks the
-   * service which workspace an access key is bound to.
+   * service which workspaces an access key can reach.
    */
-  discoverBoundWorkspace?: (options: {
+  discoverAccessKeyWorkspaces?: (options: {
     baseUrl: string;
     accessToken: string;
-  }) => Promise<{ workspaceId: string }>;
+  }) => Promise<{ organizationId: string; workspaces: DiscoveredWorkspace[] }>;
   createImportBundle?: (home: string) => Promise<ImportBundle>;
   remoteImport?: (options: {
     baseUrl: string;
@@ -419,7 +424,8 @@ export function createCli(
 
   const credentialStore = dependencies.credentialStore ?? new OsCredentialStore();
   const oauthLogin = dependencies.oauthLogin ?? loginWithOAuth;
-  const discoverWorkspace = dependencies.discoverBoundWorkspace ?? discoverBoundWorkspace;
+  const discoverWorkspaces =
+    dependencies.discoverAccessKeyWorkspaces ?? discoverAccessKeyWorkspaces;
   const promptIo = dependencies.promptIo ?? defaultPromptIo();
   const verifyRemoteCredential =
     dependencies.verifyRemoteCredential ??
@@ -723,20 +729,52 @@ export function createCli(
     const serviceUrl = plan.serviceUrl ?? cloudApiUrl(env);
 
     /*
-     * The workspace is discovered, not typed, ONLY for a key still bound to
-     * exactly one workspace the old way (an installation access key minted
-     * before member-owned access keys existed). An access key now
-     * authenticates a member, who may reach several workspaces, so there is
-     * no longer a single one to discover automatically for it — `--workspace`
-     * is required for those. An explicit --workspace still wins regardless,
-     * because automation should not depend on a network round trip to
-     * configure a machine.
+     * A member-owned access key reaches every workspace in its organization,
+     * never just one, so the workspace is discovered and then chosen — not
+     * typed from memory, and not assumed. An explicit --workspace still wins
+     * regardless: automation should not depend on a network round trip, and a
+     * person who already knows which one they want should not be asked again.
      */
     let workspaceId = plan.workspaceId;
     if (plan.backend === 'remote' && !workspaceId && token) {
-      const bound = await discoverWorkspace({ baseUrl: serviceUrl, accessToken: token });
-      workspaceId = bound.workspaceId;
-      io.stdout(`Access key is bound to workspace ${workspaceId}.\n`);
+      const discovered = await discoverWorkspaces({ baseUrl: serviceUrl, accessToken: token });
+      if (discovered.workspaces.length === 0) {
+        throw new SynomemError(
+          'INVALID_INPUT',
+          [
+            "This access key's organization has no workspaces yet.",
+            'Create one in the Synomem portal, then re-run this command — or pass',
+            '--workspace <workspace-id> once one exists.',
+          ].join('\n'),
+        );
+      } else if (discovered.workspaces.length === 1) {
+        workspaceId = discovered.workspaces[0]!.id;
+        io.stdout(
+          `Using this key's only workspace: ${discovered.workspaces[0]!.displayName} (${workspaceId}).\n`,
+        );
+      } else if (promptIo.interactive) {
+        workspaceId = await select(
+          promptIo,
+          'Which workspace should this machine use?',
+          discovered.workspaces.map((workspace) => ({
+            value: workspace.id,
+            label: workspace.displayName,
+            detail: workspace.id,
+          })),
+        );
+      } else {
+        throw new SynomemError(
+          'INVALID_INPUT',
+          [
+            'This access key can reach more than one workspace, so a non-interactive',
+            'setup needs to be told which one:',
+            '',
+            ...discovered.workspaces.map((workspace) => `  ${workspace.id}  ${workspace.displayName}`),
+            '',
+            'Re-run with --workspace <workspace-id>.',
+          ].join('\n'),
+        );
+      }
     }
     if (plan.backend === 'remote' && !workspaceId) {
       /*
@@ -866,12 +904,12 @@ export function createCli(
           throw new SynomemError('INVALID_INPUT', 'Pass --backend local or --backend remote.');
         }
         const backend: BackendChoice = options.backend;
-        // An access key names its own workspace, so --workspace is only
-        // required when there is no key to ask.
+        // An access key can be asked which workspaces it reaches, so
+        // --workspace is only required when there is no key to ask.
         if (backend === 'remote' && !global.workspace && !options.accessTokenStdin) {
           throw new SynomemError(
             'INVALID_INPUT',
-            'Remote setup requires --workspace, or --access-token-stdin so the key can name its own.',
+            'Remote setup requires --workspace, or --access-token-stdin so the key can be asked.',
           );
         }
         const token = options.accessTokenStdin ? await readAccessToken(promptIo) : undefined;

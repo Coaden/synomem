@@ -203,10 +203,11 @@ export async function runConfigWizard(
    * Deliberately no workspace prompt here.
    *
    * A hosted workspace ID looks like `ws-04psqx2rkt8ttft7a1t2z69r97`, and the
-   * credential authorized in the next step already knows which workspace it
-   * reaches -- an installation key is bound to exactly one, and a browser
-   * sign-in can list the ones the account belongs to. Asking first means
-   * asking a person to go and look something up that we are about to be told.
+   * credential authorized in the next step already knows the answer -- an
+   * access key can list every workspace its organization has, and a browser
+   * sign-in can list the ones the account belongs to across every
+   * organization. Asking first means asking a person to go and look something
+   * up that we are about to be told.
    */
 
   const credentialStore =
