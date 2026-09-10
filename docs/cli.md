@@ -21,9 +21,10 @@ synomem config init --backend local --yes      # the deterministic equivalent
 synomem config show                            # never prints a secret, only where one comes from
 ```
 
-For Synomem Cloud with an installation access key, the key names its own workspace, so nothing has
-to be looked up. It is piped rather than passed as an argument, because an argument is kept by both
-the shell history and the process list:
+For Synomem Cloud with an access key, setup asks the key which workspaces its organization has and
+picks one automatically when there is only one — nothing has to be looked up by hand. The key is
+piped rather than passed as an argument, because an argument is kept by both the shell history and
+the process list:
 
 ```bash
 printf '%s' "$SYNOMEM_KEY" | synomem config init \

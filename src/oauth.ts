@@ -8,6 +8,7 @@ import {
 import { SynomemError } from './errors.js';
 import type { CredentialStore, StoredOAuthCredential } from './credentials.js';
 import type { SynomemCredentialProvider } from './remote.js';
+import { readCredentialFile } from './configure.js';
 
 const defaultScope = 'synomem:read synomem:write offline_access';
 
@@ -195,6 +196,8 @@ export async function loginWithOAuth(options: OAuthLoginOptions): Promise<void> 
 export class StoredCredentialProvider implements SynomemCredentialProvider {
   private refresh?: Promise<string | undefined>;
   private credential?: StoredOAuthCredential;
+  /** Set when the stored credential is an access key rather than an OAuth grant. */
+  private staticAccessToken?: string;
   private loaded = false;
 
   constructor(
@@ -202,6 +205,12 @@ export class StoredCredentialProvider implements SynomemCredentialProvider {
     private readonly store: CredentialStore,
     private readonly env: NodeJS.ProcessEnv = process.env,
     private readonly fetchImplementation: typeof fetch = fetch,
+    /**
+     * Where `synomem config`'s restricted-file credential store, if chosen,
+     * would have written an access key. Optional because local-only and
+     * environment-only callers have no such file to fall back to.
+     */
+    private readonly home?: string,
   ) {}
 
   async getAccessToken(signal?: AbortSignal): Promise<string | undefined> {
@@ -209,14 +218,20 @@ export class StoredCredentialProvider implements SynomemCredentialProvider {
     if (!this.loaded) {
       const stored = await this.store.get(this.reference);
       /*
-       * An installation key is not an OAuth credential: it cannot be refreshed
-       * and has no client or token endpoint. Treating one as OAuth would mean
-       * trying to renew something that never renews that way, so this path
-       * ignores it and lets the installation-key path handle it.
+       * An access key is not an OAuth credential: it cannot be refreshed and
+       * has no client or token endpoint. It is used exactly as stored,
+       * whichever of the two places it was found.
        */
-      this.credential = stored && 'kind' in stored ? undefined : stored;
+      if (stored && 'kind' in stored) {
+        this.staticAccessToken = stored.accessToken;
+      } else if (stored) {
+        this.credential = stored;
+      } else if (this.home) {
+        this.staticAccessToken = readCredentialFile(this.home);
+      }
       this.loaded = true;
     }
+    if (this.staticAccessToken) return this.staticAccessToken;
     const credential = this.credential;
     if (!credential) return undefined;
     if (!credential.expiresAt || credential.expiresAt > Date.now()) return credential.accessToken;

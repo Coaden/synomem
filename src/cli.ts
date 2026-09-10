@@ -571,12 +571,12 @@ export function createCli(
   const remoteCommand = program.command('remote').description('Administer a remote workspace');
 
   /*
-   * The browser counterpart to an access key naming its own workspace.
-   *
-   * A signed-in account may reach several organizations, each with several
-   * workspaces, so there is a genuine choice to make -- and no way to make it
-   * without seeing the list. Printing the IDs alongside the names is the point:
-   * the ID is what `backend use remote --workspace` takes.
+   * The browser counterpart to `discoverAccessKeyWorkspaces` — same purpose,
+   * different credential: a signed-in account may reach several
+   * organizations, each with several workspaces, so there is a genuine choice
+   * to make, and no way to make it without seeing the list. Printing the IDs
+   * alongside the names is the point: the ID is what `backend use remote
+   * --workspace` takes.
    */
   remoteCommand
     .command('workspaces')
@@ -661,6 +661,8 @@ export function createCli(
                     credentialReference(backend.baseUrl, backend.workspaceId, administrator),
                     credentialStore,
                     env,
+                    fetch,
+                    resolveHome(global.home),
                   );
               const importer = new RemoteImportClient({
                 baseUrl: backend.baseUrl,
@@ -749,8 +751,17 @@ export function createCli(
         );
       } else if (discovered.workspaces.length === 1) {
         workspaceId = discovered.workspaces[0]!.id;
+        /*
+         * The key itself reaches every workspace this organization has —
+         * there is just one to choose from today. Wording this as the key's
+         * own workspace ("this key's workspace") was a repeated, corrected
+         * mistake: it is this MACHINE's choice of which workspace to act in
+         * with the key, not a property of the key.
+         */
         io.stdout(
-          `Using this key's only workspace: ${discovered.workspaces[0]!.displayName} (${workspaceId}).\n`,
+          `This machine will use ${discovered.workspaces[0]!.displayName} (${workspaceId}) — ` +
+            'the only workspace this key currently reaches. Run `synomem backend use ' +
+            'remote --workspace <workspace-id>` to point it at a different one later.\n',
         );
       } else if (promptIo.interactive) {
         workspaceId = await select(
@@ -888,7 +899,7 @@ export function createCli(
     .option('--credential-store <where>', 'auto, keychain, file, or environment', 'auto')
     // The token is read from stdin, never taken as an argument: an argument is
     // kept by the shell history and visible in the process list.
-    .option('--access-token-stdin', 'read the installation access key from stdin', false)
+    .option('--access-token-stdin', 'read the access key from stdin', false)
     .option('--yes', 'apply without confirming', false)
     .action(
       async (

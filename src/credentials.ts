@@ -7,12 +7,19 @@ const serviceName = 'ai.synomem.credentials';
 const maximumOutputBytes = 128 * 1024;
 
 /**
- * An installation access key.
+ * A member-owned access key.
  *
- * Not an OAuth credential: it has no refresh, no token endpoint and no client,
- * and it authorizes a MACHINE rather than a person. Keeping it a distinct shape
- * stops code treating it as refreshable, which would mean silently failing to
- * renew something that never expires that way.
+ * Not an OAuth credential: it has no refresh, no token endpoint and no
+ * client, and it authorizes the MEMBER who created it, reaching every
+ * workspace their organization membership allows -- never a single machine
+ * or a single workspace. Keeping it a distinct shape stops code treating it
+ * as refreshable, which would mean silently failing to renew something that
+ * never expires that way.
+ *
+ * The `kind` value and this type's own name predate member-owned access
+ * keys; both still say "installation" because renaming either changes the
+ * shape already written to disk and the OS keychain on every machine that
+ * has run `synomem config`, for no behavioral gain.
  */
 export interface StoredInstallationKey {
   kind: 'installation-key';

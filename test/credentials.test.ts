@@ -7,6 +7,8 @@ import {
   type StoredOAuthCredential,
 } from '../src/credentials.js';
 import { loginWithOAuth, StoredCredentialProvider } from '../src/oauth.js';
+import { readCredentialFile, writeCredentialFile } from '../src/configure.js';
+import { tempHome } from './helpers.js';
 
 const actor = { kind: 'agent' as const, id: 'codex', displayName: 'Codex' };
 
@@ -92,6 +94,48 @@ describe('remote credential storage', () => {
       'reference',
       expect.objectContaining({ accessToken: 'fresh-token', refreshToken: 'rotated-token' }),
     );
+  });
+
+  /*
+   * `config`'s keychain path stores an access key as {kind, accessToken} and
+   * `getAccessToken` used to discard exactly that shape, deferring to an
+   * "installation-key path" that was never actually built — so a key stored
+   * in the OS keychain was invisible to every later command, which failed
+   * with AUTH_REQUIRED even though `synomem config` had reported success.
+   */
+  it('returns an access key stored in the OS keychain, not just an OAuth grant', async () => {
+    const get = vi.fn<CredentialStore['get']>().mockResolvedValue({
+      kind: 'installation-key',
+      accessToken: 'stored-access-key',
+    });
+    const store: CredentialStore = { get, set: vi.fn(), delete: vi.fn() };
+    const provider = new StoredCredentialProvider('reference', store, {});
+    await expect(provider.getAccessToken()).resolves.toBe('stored-access-key');
+  });
+
+  /*
+   * The restricted-file store (`synomem config`'s other non-keychain choice)
+   * had the identical gap from the other direction: `writeCredentialFile`
+   * wrote the key, but nothing constructing a `StoredCredentialProvider` ever
+   * read the file back — the OS keychain came up empty and that was the end
+   * of it, regardless of which store the person actually chose.
+   */
+  it('falls back to the restricted credential file when the keychain has nothing', async () => {
+    const home = tempHome();
+    writeCredentialFile(home, 'file-stored-access-key');
+    expect(readCredentialFile(home)).toBe('file-stored-access-key');
+
+    const store: CredentialStore = {
+      get: vi.fn().mockResolvedValue(undefined),
+      set: vi.fn(),
+      delete: vi.fn(),
+    };
+    const provider = new StoredCredentialProvider('reference', store, {}, fetch, home);
+    await expect(provider.getAccessToken()).resolves.toBe('file-stored-access-key');
+  });
+
+  it('reports no credential file rather than throwing when none was ever written', () => {
+    expect(readCredentialFile(tempHome())).toBeUndefined();
   });
 
   it.skipIf(process.env.SYNOMEM_LOOPBACK_TEST !== '1')(

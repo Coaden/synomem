@@ -88,6 +88,8 @@ export function createConfiguredService(
           credentialReference(backend.baseUrl, backend.workspaceId, expectedActor),
           new OsCredentialStore(),
           env,
+          fetch,
+          resolveHome(options.home),
         ),
     ...(options.signal ? { signal: options.signal } : {}),
   });

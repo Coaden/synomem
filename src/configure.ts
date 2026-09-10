@@ -7,7 +7,7 @@
  * that blocks forever on a pipe is worse than one that says which flags it
  * needs.
  */
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { cloudApiUrl } from './cloud.js';
 import { SynomemError } from './errors.js';
@@ -117,14 +117,37 @@ export function assertInteractive(io: PromptIo): void {
  * Separate from `config.json` so a configuration file can be read, copied or
  * pasted into an issue without carrying a secret with it.
  */
+function credentialFilePath(home: string): string {
+  return join(home, 'credentials', 'installation.json');
+}
+
 export function writeCredentialFile(home: string, token: string): string {
   const directory = join(home, 'credentials');
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   chmodSync(directory, 0o700);
-  const path = join(directory, 'installation.json');
+  const path = credentialFilePath(home);
   writeFileSync(path, `${JSON.stringify({ accessToken: token }, null, 2)}\n`, { mode: 0o600 });
   chmodSync(path, 0o600);
   return path;
+}
+
+/**
+ * Reads back what `writeCredentialFile` wrote.
+ *
+ * Without this, choosing the restricted-file store at `synomem config` wrote
+ * a credential nothing ever read again: every later command still asked the
+ * OS keychain, found nothing there, and failed with AUTH_REQUIRED even though
+ * the key was sitting right there on disk.
+ */
+export function readCredentialFile(home: string): string | undefined {
+  const path = credentialFilePath(home);
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { accessToken?: unknown };
+    return typeof parsed.accessToken === 'string' ? parsed.accessToken : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** A key's identifying prefix. Never the key. */
@@ -194,8 +217,8 @@ export async function runConfigWizard(
     },
     {
       value: 'access-key',
-      label: 'Use an installation access key',
-      detail: 'Create one at https://portal.synomem.ai/installations',
+      label: 'Use an access key',
+      detail: 'Create one at https://portal.synomem.ai/access-keys/new',
     },
   ]);
 
@@ -224,7 +247,7 @@ export async function runConfigWizard(
 
 /** Reads an access key without ever accepting it as an argument. */
 export async function readAccessToken(io: PromptIo): Promise<string> {
-  const token = await askSecret(io, 'Installation access key');
+  const token = await askSecret(io, 'Access key');
   if (!token) throw new SynomemError('INVALID_INPUT', 'No access key was provided.');
   return token;
 }
