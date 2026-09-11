@@ -862,8 +862,8 @@ export function createCli(
         ]
       : [
           "  An access key can't create an agent — that needs an administrator,",
-          '  which a key never asserts on its own, regardless of the member\'s own',
-          '  role. Create one in the Synomem portal (a workspace\'s Actors page →',
+          "  which a key never asserts on its own, regardless of the member's own",
+          "  role. Create one in the Synomem portal (a workspace's Actors page →",
           '  New agent), then use its ID:',
           '',
           '  synomem skill install --runtime <claude|codex|cursor|...> --agent <agent-id>',
