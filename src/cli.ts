@@ -738,6 +738,10 @@ export function createCli(
      * person who already knows which one they want should not be asked again.
      */
     let workspaceId = plan.workspaceId;
+    // Only known once discovered below — printed in the final summary rather
+    // than the bare ID, so "what did config just do" reads like an answer
+    // instead of a lookup key.
+    let workspaceName: string | undefined;
     if (plan.backend === 'remote' && !workspaceId && token) {
       const discovered = await discoverWorkspaces({ baseUrl: serviceUrl, accessToken: token });
       if (discovered.workspaces.length === 0) {
@@ -751,18 +755,7 @@ export function createCli(
         );
       } else if (discovered.workspaces.length === 1) {
         workspaceId = discovered.workspaces[0]!.id;
-        /*
-         * The key itself reaches every workspace this organization has —
-         * there is just one to choose from today. Wording this as the key's
-         * own workspace ("this key's workspace") was a repeated, corrected
-         * mistake: it is this MACHINE's choice of which workspace to act in
-         * with the key, not a property of the key.
-         */
-        io.stdout(
-          `This machine will use ${discovered.workspaces[0]!.displayName} (${workspaceId}) — ` +
-            'the only workspace this key currently reaches. Run `synomem backend use ' +
-            'remote --workspace <workspace-id>` to point it at a different one later.\n',
-        );
+        workspaceName = discovered.workspaces[0]!.displayName;
       } else if (promptIo.interactive) {
         workspaceId = await select(
           promptIo,
@@ -773,6 +766,7 @@ export function createCli(
             detail: workspace.id,
           })),
         );
+        workspaceName = discovered.workspaces.find((w) => w.id === workspaceId)?.displayName;
       } else {
         throw new SynomemError(
           'INVALID_INPUT',
@@ -851,6 +845,30 @@ export function createCli(
       client.doctor(),
     );
 
+    /*
+     * What to do next differs by exactly one thing: whether an agent can be
+     * created from here at all. An access key never carries the
+     * administrator authority agent creation requires (§ deliberate,
+     * independent of the key owner's own role) — local storage and a human
+     * browser sign-in both can. Telling everyone to just run `agent create`
+     * regardless was the CLI recommending a command guaranteed to fail for
+     * the single most common setup path.
+     */
+    const canCreateAgentHere = config.backend.kind === 'local' || plan.auth !== 'access-key';
+    const nextSteps = canCreateAgentHere
+      ? [
+          '  synomem agent create <handle> --name "<display name>"',
+          '  synomem skill install --runtime <claude|codex|cursor|...> --agent <agent-id>',
+        ]
+      : [
+          "  An access key can't create an agent — that needs an administrator,",
+          '  which a key never asserts on its own, regardless of the member\'s own',
+          '  role. Create one in the Synomem portal (a workspace\'s Actors page →',
+          '  New agent), then use its ID:',
+          '',
+          '  synomem skill install --runtime <claude|codex|cursor|...> --agent <agent-id>',
+        ];
+
     output(
       io,
       global.json,
@@ -860,18 +878,30 @@ export function createCli(
         ...(credentialLocation ? { credentialSource: credentialLocation } : {}),
         ...(token ? { credential: credentialFingerprint(token) } : {}),
         healthy: diagnostics.healthy,
+        canCreateAgentHere,
       },
       [
         '',
         'Synomem is ready.',
         '',
-        `  Backend:  ${config.backend.kind === 'local' ? 'Local SQLite' : 'Synomem Cloud'}`,
-        `  Home:     ${home}`,
+        `  Backend:    ${config.backend.kind === 'local' ? 'Local SQLite' : 'Synomem Cloud'}`,
+        `  Home:       ${home}`,
         ...(config.backend.kind === 'remote'
-          ? [`  Service:  ${config.backend.baseUrl}`, `  Workspace: ${config.backend.workspaceId}`]
+          ? [
+              `  Service:    ${config.backend.baseUrl}`,
+              `  Workspace:  ${workspaceName ? `${workspaceName} (${config.backend.workspaceId})` : config.backend.workspaceId}`,
+            ]
           : []),
         ...(credentialLocation ? [`  Credential: ${credentialLocation}`] : []),
-        `  Database: ${diagnostics.healthy ? 'Healthy' : 'Needs attention — run synomem doctor'}`,
+        `  Database:   ${diagnostics.healthy ? 'Healthy' : 'Needs attention — run synomem doctor'}`,
+        '',
+        'Next: set up an agent for this machine.',
+        '',
+        ...nextSteps,
+        '',
+        'Full walkthrough, including the MCP connector for each platform, and a',
+        'prompt that does all of this for you:',
+        '  https://github.com/Coaden/synomem#let-your-agent-set-it-up',
       ].join('\n'),
     );
   };
