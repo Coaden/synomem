@@ -1527,7 +1527,15 @@ export function createCli(
             .filter((location) => location.state !== 'unavailable')
             .map((location) => location.runtime);
           if (installed.length) {
-            await withClient(global.home, defaultActor(env, 'system', 'cli'), async (client) => {
+            /*
+             * Recording where you yourself run is self-service (§ the
+             * server's own `isSelf` check), but only when the request
+             * actually asserts that agent's identity — recording it as the
+             * generic `system/cli` placeholder looks like binding SOME OTHER
+             * agent's runtime, which is administration and a remote backend
+             * rightly refuses without an admin credential.
+             */
+            await withClient(global.home, actor('agent', agentId), async (client) => {
               for (const runtime of installed) {
                 await client.agents.bindRuntime({ agentId, runtime });
               }
