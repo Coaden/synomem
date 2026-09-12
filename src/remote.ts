@@ -143,7 +143,9 @@ export function environmentCredentialProvider(
 }
 
 export class RemoteSynomemService implements SynomemService {
-  readonly actor: ActorIdentity;
+  // Not `readonly`: `init()` resolves it from the server's response when the
+  // caller didn't assert a real identity up front (see `assertedRealActor`).
+  actor: ActorIdentity;
   private readonly baseUrl: URL;
   private readonly workspaceId: string;
   private readonly credentialProvider: SynomemCredentialProvider;
@@ -512,16 +514,27 @@ export class RemoteSynomemService implements SynomemService {
       throw new SynomemError('REMOTE_PROTOCOL', 'The configured server is not a remote backend.');
     }
     const binding = this.cachedCapabilities.binding;
+    // `kind: 'system'` is this client's own placeholder for "no actor
+    // asserted" — historically the CLI default for commands that run before
+    // any identity exists (`doctor`, `agent list`, `agent create`, …). No
+    // credential the server authenticates ever reports that kind back, so
+    // asserting it here would make every one of those commands fail against
+    // a remote backend no matter who is actually calling — exactly the
+    // bootstrap deadlock the server-side half of this already fixed. Only a
+    // caller that named a real identity (an agent ID, or an actor supplied
+    // via --actor/SYNOMEM_ACTOR_ID) gets its match enforced.
+    const assertedRealActor = this.actor.kind !== 'system';
     if (
       binding.workspaceId !== this.workspaceId ||
-      binding.actor.kind !== this.actor.kind ||
-      binding.actor.id !== this.actor.id
+      (assertedRealActor &&
+        (binding.actor.kind !== this.actor.kind || binding.actor.id !== this.actor.id))
     ) {
       throw new SynomemError(
         'AUTH_FORBIDDEN',
         'The authenticated Synomem actor does not match the configured actor.',
       );
     }
+    if (!assertedRealActor) this.actor = binding.actor;
     this.initialized = true;
   }
 
