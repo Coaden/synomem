@@ -126,6 +126,28 @@ describe('MCP protocol integration', () => {
     await runtime.client.close();
   });
 
+  it('advertises every tool schema without a self-referencing $ref/definitions pair', async () => {
+    // `metadataSchema` is genuinely recursive (arbitrary JSON, any depth),
+    // which every JSON Schema conversion has to express as a self-referencing
+    // $ref/definitions pair — and at least one real MCP client (ChatGPT)
+    // rejects a tool outright the moment its advertised schema contains one,
+    // with no indication of which field caused it. A tool that calls into a
+    // domain method which independently re-validates the full input (every
+    // one of these does) loses nothing real by advertising a flattened
+    // `metadata`/`capabilities` field instead — this locks that in for every
+    // current and future tool, rather than relying on each one remembering to
+    // ask this question separately.
+    const home = tempHome();
+    const { runtime, protocolClient } = await setupRuntime(home);
+    const tools = await protocolClient.listTools();
+    const offenders = tools.tools
+      .filter((tool) => JSON.stringify(tool.inputSchema).includes('$ref'))
+      .map((tool) => tool.name);
+    expect(offenders).toEqual([]);
+    await protocolClient.close();
+    await runtime.client.close();
+  });
+
   it('binds the actor, returns structured content, enforces policy, and exposes resources', async () => {
     const home = tempHome();
     const { runtime, protocolClient } = await setupRuntime(home);

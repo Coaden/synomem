@@ -36,6 +36,33 @@ const outputSchema = z.object({
   errorCode: z.string().optional(),
 });
 
+/**
+ * `metadataSchema` (from `../schemas.js`) is genuinely recursive — arbitrary
+ * JSON, any depth — which every JSON Schema conversion has to express as a
+ * self-referencing `$ref`/`definitions` pair. MCP clients vary in how
+ * strictly they validate an advertised tool schema before trusting it, and a
+ * self-referencing schema is a well-known point of disagreement; a client
+ * that rejects it outright throws the tool away entirely rather than just
+ * the one field.
+ *
+ * Flattening `metadata` to "an object of arbitrary values" for the
+ * ADVERTISED and initially-PARSED schema costs nothing real: every one of
+ * these tools calls straight into a domain method (`client.kudos.give`,
+ * `client.notes.create`, …) that independently re-validates the full input
+ * — recursive `metadata` included — before writing anything. A caller that
+ * genuinely sends deeply-invalid metadata still gets rejected there.
+ */
+const mcpMetadataSchema = z.record(z.string().max(200), z.unknown()).optional();
+
+function withMcpSafeMetadata<T extends z.ZodObject<z.ZodRawShape>>(schema: T): T {
+  const shape = (schema as unknown as { shape: Record<string, unknown> }).shape;
+  const overrides: Record<string, z.ZodTypeAny> = {};
+  if ('metadata' in shape) overrides.metadata = mcpMetadataSchema;
+  if ('capabilities' in shape) overrides.capabilities = mcpMetadataSchema;
+  if (Object.keys(overrides).length === 0) return schema;
+  return schema.safeExtend(overrides) as unknown as T;
+}
+
 function dataRecord(value: unknown): Record<string, unknown> {
   const normalized = JSON.parse(JSON.stringify(value)) as unknown;
   return typeof normalized === 'object' && normalized !== null && !Array.isArray(normalized)
@@ -115,7 +142,7 @@ export async function createSynomemMcpServer(
       title: 'Give kudos',
       description:
         'Use when a human explicitly requests recognition or a peer agent made a concrete, unusually useful contribution. State what the recipient did and why it mattered. Do not use for routine completion, generic politeness, self-congratulation, invented work, secrets, or raw sensitive tool output.',
-      inputSchema: giveKudosMcpSchema,
+      inputSchema: withMcpSafeMetadata(giveKudosMcpSchema),
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
@@ -677,7 +704,7 @@ export async function createSynomemMcpServer(
       title: 'Send a memo',
       description:
         'Send a durable one-to-one memo to an agent or to the configured actor itself. Use for information that should survive the chat, not conversational chatter, transcripts, or secrets.',
-      inputSchema: sendMemoSchema,
+      inputSchema: withMcpSafeMetadata(sendMemoSchema),
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
@@ -724,7 +751,7 @@ export async function createSynomemMcpServer(
       title: 'Create a note',
       description:
         'Retain concise agent-owned knowledge for deliberate later retrieval. Agents may write only their own notes. Do not store secrets, unnecessary private content, or raw transcripts.',
-      inputSchema: createNoteSchema,
+      inputSchema: withMcpSafeMetadata(createNoteSchema),
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
@@ -747,7 +774,7 @@ export async function createSynomemMcpServer(
       title: 'Revise a note',
       description:
         'Append a complete new revision to an owned note. Pass the version last read; stale versions fail with REVISION_CONFLICT.',
-      inputSchema: reviseNoteSchema,
+      inputSchema: withMcpSafeMetadata(reviseNoteSchema),
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
@@ -792,7 +819,7 @@ export async function createSynomemMcpServer(
       title: 'Create a task',
       description:
         'Create a concrete actionable task assigned to an agent, optionally with a date-only or timezone-aware deadline. Do not use as a substitute for a memo when no action is required.',
-      inputSchema: createTaskSchema,
+      inputSchema: withMcpSafeMetadata(createTaskSchema),
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
@@ -815,7 +842,7 @@ export async function createSynomemMcpServer(
       title: 'Update a task',
       description:
         'Append an update to an open task using the version last read. Stale versions fail rather than overwriting concurrent work.',
-      inputSchema: updateTaskSchema,
+      inputSchema: withMcpSafeMetadata(updateTaskSchema),
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
@@ -838,7 +865,7 @@ export async function createSynomemMcpServer(
       title: 'Create a private todo',
       description:
         'Create a private reminder for yourself. A todo has no assignee and nobody else can read it — use synomem_task_create when the work belongs to another agent.',
-      inputSchema: createTodoSchema,
+      inputSchema: withMcpSafeMetadata(createTodoSchema),
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
@@ -861,7 +888,7 @@ export async function createSynomemMcpServer(
       title: 'Update a private todo',
       description:
         'Append an update to one of your own todos using the version last read. Stale versions fail rather than overwriting concurrent work.',
-      inputSchema: updateTodoSchema,
+      inputSchema: withMcpSafeMetadata(updateTodoSchema),
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
