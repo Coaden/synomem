@@ -65,6 +65,7 @@
   "scripts": {
     "prebuild": "npm run clean",
     "build": "tsc -p tsconfig.build.json",
+    "postbuild": "node scripts/set-executable.mjs",
     "clean": "node scripts/clean.mjs",
     "demo": "npm run build && node scripts/demo.mjs",
     "format": "prettier --write .",
