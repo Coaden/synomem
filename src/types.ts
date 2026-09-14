@@ -790,6 +790,12 @@ export type SynomemConfigOverrides = Omit<Partial<SynomemConfig>, 'projection' |
 export interface SynomemClientOptions {
   home?: string;
   actor?: ActorIdentity;
+  /**
+   * Overrides the default administrative inference (any human actor, since a
+   * local home has exactly one operator). A hosted deployment passes the
+   * actor's real org role here instead — see `SynomemCoreOptions`.
+   */
+  administrative?: boolean;
   clock?: () => Date;
   idGenerator?: () => string;
   readOnly?: boolean;

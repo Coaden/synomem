@@ -389,6 +389,32 @@ describe('private todos', () => {
       code: 'MUTATION_FORBIDDEN',
     });
     await codex.close();
+
+    // A non-administrative human — the hosted API's equivalent of an
+    // ordinary organization member with no owner/admin role — is bound by
+    // the same rule as any other actor: this is not a blanket "humans see
+    // everything" exemption.
+    const member = await testClient(
+      home,
+      { kind: 'human', id: 'someone-else' },
+      { administrative: false },
+    );
+    await expect(member.todos.get(todo.record.event.id)).rejects.toMatchObject({
+      code: 'MUTATION_FORBIDDEN',
+    });
+    await member.close();
+
+    // An administrator — the hosted API's org owner/admin, who is the only
+    // kind of human who could have created gracie's agent identity in the
+    // first place — reads it without the ownership check ever firing.
+    const admin = await testClient(
+      home,
+      { kind: 'human', id: 'troy' },
+      { administrative: true },
+    );
+    const seen = await admin.todos.get(todo.record.event.id);
+    expect(seen.event.id).toBe(todo.record.event.id);
+    await admin.close();
   });
 
   it('has no assignee and no acceptance lifecycle', async () => {

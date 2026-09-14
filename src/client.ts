@@ -1459,13 +1459,22 @@ export class SynomemCore implements SynomemDomainService {
   }
 
   /**
-   * Todos are owner-only. No role, however broad, reads another actor's
-   * private reminders — that is a named administrative capability this release
-   * does not have, not something a permission check quietly allows.
+   * Todos are owner-only for every ordinary actor — the same rule notes
+   * already follow (`assertNoteOwner`): an organization owner or admin is the
+   * deliberate exception, since only they can create an agent in the first
+   * place, so the account behind any todo's owner is always one they
+   * administer. Without this exception, a human administrator viewing an
+   * agent they created themselves could see that agent's private Todos in a
+   * list (the repository's own visibility query already grants that) but
+   * never open one — a redundant, stricter, and contradictory check sitting
+   * on top of a permission that had already been granted.
    */
   private assertTodoOwner(record: TodoRecord): void {
     const owner = record.event.actor;
-    if (owner.kind !== this.actor.kind || owner.id !== this.actor.id) {
+    if (
+      !this.administrative &&
+      (owner.kind !== this.actor.kind || owner.id !== this.actor.id)
+    ) {
       throw new SynomemError(
         'MUTATION_FORBIDDEN',
         'A todo is private to the actor who created it.',
@@ -1693,6 +1702,7 @@ export class SynomemClient extends SynomemCore implements SynomemService {
       repository: storage,
       projectionWriter: projections,
       ...(options.actor ? { actor: options.actor } : {}),
+      ...(options.administrative !== undefined ? { administrative: options.administrative } : {}),
       ...(options.clock ? { clock: options.clock } : {}),
       ...(options.idGenerator ? { idGenerator: options.idGenerator } : {}),
       ...(options.signal ? { signal: options.signal } : {}),
