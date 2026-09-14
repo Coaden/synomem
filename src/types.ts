@@ -511,6 +511,9 @@ export interface ItemSummary {
   recipientAgentId?: string;
   ownerAgentId?: string;
   assigneeAgentId?: string;
+  recipientDisplayName?: string;
+  ownerDisplayName?: string;
+  assigneeDisplayName?: string;
 }
 export interface KudosSummary extends ItemSummary {
   kind: 'kudos';
