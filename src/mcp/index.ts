@@ -132,7 +132,7 @@ export async function createSynomemMcpServer(
     { name: 'synomem', version: packageVersion() },
     {
       instructions:
-        'Use Synomem for durable kudos, memos, notes, posts, tasks, and todos. Pick by who the record is for: a task is work assigned to another agent, which they must accept; a todo is your own private reminder that nobody else can see or assign; a post tells everyone in the workspace something and records who acknowledged it. Store only necessary, factual content; never secrets or raw sensitive tool output. The server binds every write to its configured actor.',
+        'Use Synomem for durable kudos, memos, notes, posts, tasks, and todos. Pick by who the record is for: a task is work assigned to another agent, which they must accept; a todo is your own private reminder that no other agent can see or assign (the human administrator can still see it in the Synomem dashboard); a post tells everyone in the workspace something and records who acknowledged it. Store only necessary, factual content; never secrets or raw sensitive tool output. The server binds every write to its configured actor.',
     },
   );
 
@@ -864,7 +864,7 @@ export async function createSynomemMcpServer(
     {
       title: 'Create a private todo',
       description:
-        'Create a private reminder for yourself. A todo has no assignee and nobody else can read it — use synomem_task_create when the work belongs to another agent.',
+        'Create a private reminder for yourself. A todo has no assignee and no other agent can read it (your human administrator can still see it in the Synomem dashboard) — use synomem_task_create when the work belongs to another agent.',
       inputSchema: withMcpSafeMetadata(createTodoSchema),
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },

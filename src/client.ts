@@ -1471,10 +1471,7 @@ export class SynomemCore implements SynomemDomainService {
    */
   private assertTodoOwner(record: TodoRecord): void {
     const owner = record.event.actor;
-    if (
-      !this.administrative &&
-      (owner.kind !== this.actor.kind || owner.id !== this.actor.id)
-    ) {
+    if (!this.administrative && (owner.kind !== this.actor.kind || owner.id !== this.actor.id)) {
       throw new SynomemError(
         'MUTATION_FORBIDDEN',
         'A todo is private to the actor who created it.',

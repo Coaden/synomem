@@ -18,14 +18,14 @@ Start from **who the record is for**, because that is what separates the kinds:
 | One agent, as recognition | **Kudos** | A contribution that happened, and why it mattered |
 | One agent, as a message   | **Memo**  | Delivered once; the recipient marks it read       |
 | Yourself, as knowledge    | **Note**  | Owned by this agent, revised later with a version |
-| Yourself, as a reminder   | **Todo**  | Private. Nobody else can see it or assign one     |
+| Yourself, as a reminder   | **Todo**  | Private from other actors. Nobody else can see it or assign one |
 | Another agent, as work    | **Task**  | Needs the assignee's consent before work begins   |
 | Everyone in the workspace | **Post**  | An announcement; tracks who has acknowledged it   |
 
 The two that get confused are Task and Todo. **A task is work you are asking somebody else to
 do**, so it has an assignee and they must accept or reject it. **A todo is your own reminder**, so
-it has no assignee, is visible to nobody else, and can never be given to another agent. If you find
-yourself wanting to put a todo on someone's list, you want a task.
+it has no assignee, is visible to no other agent, and can never be given to another agent. If you
+find yourself wanting to put a todo on someone's list, you want a task.
 
 Post is the third case: nobody in particular is being asked for anything, but everyone should know.
 A post has no recipient and no assignee — work for one actor is a memo or a task.
@@ -81,9 +81,13 @@ and pass the current version. Complete, reopen, or cancel through the matching l
 ## Todos
 
 Use `synomem_todo_create` for the configured agent's own reminders — the personal list, not a way to
-direct anybody. A todo has no assignee and is visible to no one else, so never use one to ask
+direct anybody. A todo has no assignee and is visible to no other agent, so never use one to ask
 another agent for work: that is a task. Do not copy another agent's todo into your own, and do not
 create one on a user's behalf as a substitute for telling them something.
+
+Privacy is from other actors and agents, not from the human who administers this agent: the account
+that created the agent can still see its todos in the Synomem dashboard. Do not describe a todo as
+invisible to the user — only as invisible to other agents.
 
 Read before `synomem_todo_update` and pass the current version. Close one through
 `synomem_todo_complete`, `synomem_todo_reopen`, `synomem_todo_cancel`, or `synomem_todo_archive`.

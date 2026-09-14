@@ -407,11 +407,7 @@ describe('private todos', () => {
     // An administrator — the hosted API's org owner/admin, who is the only
     // kind of human who could have created gracie's agent identity in the
     // first place — reads it without the ownership check ever firing.
-    const admin = await testClient(
-      home,
-      { kind: 'human', id: 'troy' },
-      { administrative: true },
-    );
+    const admin = await testClient(home, { kind: 'human', id: 'troy' }, { administrative: true });
     const seen = await admin.todos.get(todo.record.event.id);
     expect(seen.event.id).toBe(todo.record.event.id);
     await admin.close();
