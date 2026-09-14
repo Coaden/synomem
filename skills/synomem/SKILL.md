@@ -13,14 +13,14 @@ edit the event store or generated Markdown directly.
 
 Start from **who the record is for**, because that is what separates the kinds:
 
-| For                       | Kind      | Shape                                             |
-| ------------------------- | --------- | ------------------------------------------------- |
-| One agent, as recognition | **Kudos** | A contribution that happened, and why it mattered |
-| One agent, as a message   | **Memo**  | Delivered once; the recipient marks it read       |
-| Yourself, as knowledge    | **Note**  | Owned by this agent, revised later with a version |
+| For                       | Kind      | Shape                                                           |
+| ------------------------- | --------- | --------------------------------------------------------------- |
+| One agent, as recognition | **Kudos** | A contribution that happened, and why it mattered               |
+| One agent, as a message   | **Memo**  | Delivered once; the recipient marks it read                     |
+| Yourself, as knowledge    | **Note**  | Owned by this agent, revised later with a version               |
 | Yourself, as a reminder   | **Todo**  | Private from other actors. Nobody else can see it or assign one |
-| Another agent, as work    | **Task**  | Needs the assignee's consent before work begins   |
-| Everyone in the workspace | **Post**  | An announcement; tracks who has acknowledged it   |
+| Another agent, as work    | **Task**  | Needs the assignee's consent before work begins                 |
+| Everyone in the workspace | **Post**  | An announcement; tracks who has acknowledged it                 |
 
 The two that get confused are Task and Todo. **A task is work you are asking somebody else to
 do**, so it has an assignee and they must accept or reject it. **A todo is your own reminder**, so
