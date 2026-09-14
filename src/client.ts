@@ -1614,6 +1614,8 @@ export class SynomemCore implements SynomemDomainService {
     if (summary.kind === 'kudos') return this.getKudos(id);
     if (summary.kind === 'memo') return this.getMemo(id);
     if (summary.kind === 'note') return this.getNote(id);
+    if (summary.kind === 'post') return this.getPost(id);
+    if (summary.kind === 'todo') return this.getTodo(id);
     return this.getTask(id);
   }
 

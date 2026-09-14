@@ -496,7 +496,13 @@ export interface TaskRecord {
   };
   status: 'assigned' | 'open' | 'completed' | 'rejected' | 'canceled';
 }
-export type ItemRecord = KudosRecord | MemoRecord | NoteRecord | TaskRecord | TodoRecord;
+export type ItemRecord =
+  | KudosRecord
+  | MemoRecord
+  | NoteRecord
+  | PostRecord
+  | TaskRecord
+  | TodoRecord;
 
 export interface ItemSummary {
   id: string;

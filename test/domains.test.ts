@@ -370,6 +370,24 @@ describe('inbox contents', () => {
 });
 
 describe('private todos', () => {
+  it('is reachable through the generic items.get, not just todos.get', async () => {
+    // synomem_list only ever returns compact summaries; synomem_get (items.get)
+    // is the documented way to read a full record from an ID one of those
+    // summaries already returned. getItem() dispatched every kind except
+    // 'post' and 'todo' to getTask -- those two fell through and failed with
+    // a task-store "not found", even though the record plainly exists.
+    const home = tempHome();
+    const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
+    const todo = await gracie.todos.create({ title: 'Draft the migration checklist' });
+    const seen = (await gracie.items.get(todo.record.event.id)) as {
+      event: { type: string };
+      current: { title: string };
+    };
+    expect(seen.event.type).toBe('todo.created');
+    expect(seen.current.title).toBe('Draft the migration checklist');
+    await gracie.close();
+  });
+
   it('is owned by its author and readable by nobody else', async () => {
     const home = tempHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
