@@ -158,6 +158,43 @@ describe('remote Synomem service', () => {
     await expect(service.init()).rejects.toMatchObject({ code: 'AUTH_FORBIDDEN' });
   });
 
+  it('adopts the credential\'s real actor instead of failing when assertActor is false', async () => {
+    // A caller whose "actor" is only a historical fallback guess (the CLI's
+    // list/show commands before this fix) has no business asserting a match
+    // against the credential -- it should defer to whatever the credential
+    // actually names, exactly like the pre-existing kind: 'system' bootstrap
+    // placeholder already does.
+    const binding = { workspaceId: 'workspace', actor: { kind: 'agent' as const, id: 'mycroft' } };
+    const service = new RemoteSynomemService({
+      baseUrl: 'https://api.example.test',
+      workspaceId: 'workspace',
+      expectedActor: { kind: 'human', id: 'local-cli' },
+      assertActor: false,
+      credentialProvider: credentials,
+      fetch: async () =>
+        json({
+          ok: true,
+          data: {
+            backend: 'remote',
+            binding,
+            administration: {
+              agentCreationViaMcp: false,
+              agentArchiveViaMcp: false,
+              rebuildViaMcp: false,
+            },
+            projections: {
+              writeWinsMarkdown: false,
+              writeMemoryMarkdown: false,
+              writeTasksMarkdown: false,
+              writeInboxEntries: false,
+            },
+          },
+        }),
+    });
+    await service.init();
+    expect(service.actor).toEqual(binding.actor);
+  });
+
   it('does not follow redirects and bounds response bytes', async () => {
     let response = new Response('', { status: 307, headers: { location: 'https://evil.test/' } });
     const service = new RemoteSynomemService({

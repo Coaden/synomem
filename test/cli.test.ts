@@ -33,6 +33,59 @@ describe('CLI', () => {
     expect(actors).toEqual(['system:cli']);
   });
 
+  it('wires the global --actor flag into read commands, and marks the fallback unasserted otherwise', async () => {
+    // `memo show` (and the other list/show commands added in this fix) used
+    // to call defaultActor() without the parsed --actor value at all, so the
+    // flag documented as "act as this agent" silently did nothing for them.
+    // It also always fell back to a fixed human:local-cli guess with no way
+    // to tell a remote backend that guess wasn't a real identity -- which is
+    // exactly what made every one of these commands fail against a remote
+    // backend with AUTH_FORBIDDEN unless --actor/SYNOMEM_ACTOR_ID happened to
+    // already be set.
+    const home = tempHome();
+    const seen: Array<{ actor: string; assertActor?: boolean }> = [];
+    const factory: SynomemServiceFactory = (options) => {
+      seen.push({ actor: `${options.actor?.kind}:${options.actor?.id}`, assertActor: options.assertActor });
+      return new SynomemClient(options);
+    };
+    const run = async (args: string[]) => {
+      const captured = capture();
+      const code = await runCli(['node', 'synomem', '--home', home, ...args], captured.io, factory);
+      expect(code, captured.stderr.join('')).toBe(0);
+      return captured.stdout.join('');
+    };
+
+    await run(['agent', 'create', 'codex', '--name', 'Codex']);
+    await run(['agent', 'create', 'gracie', '--name', 'Gracie']);
+    const sent = JSON.parse(
+      await run([
+        'memo',
+        'send',
+        'codex',
+        '--from',
+        'gracie',
+        '--subject',
+        'Review',
+        '--body',
+        'Please review the migration.',
+        '--json',
+      ]),
+    ) as { record: { event: { id: string } } };
+    const memoId = sent.record.event.id;
+    seen.length = 0;
+
+    // No --actor named anywhere: the fallback is a guess, not a real
+    // identity, so it must be marked unasserted (a remote backend adopts
+    // whichever actor the credential actually names instead of failing).
+    await run(['memo', 'show', memoId]);
+    expect(seen.pop()).toEqual({ actor: 'human:local-cli', assertActor: false });
+
+    // --actor is explicit: it must reach the command (previously it never
+    // did), and the resulting actor must be asserted for real.
+    await run(['memo', 'show', memoId, '--actor', 'gracie']);
+    expect(seen.pop()).toEqual({ actor: 'agent:gracie', assertActor: true });
+  });
+
   it('provides useful help', async () => {
     const captured = capture();
     expect(await runCli(['node', 'synomem', '--help'], captured.io)).toBe(0);

@@ -293,8 +293,13 @@ async function withService<T>(
   home: string | undefined,
   configuredActor: ActorIdentity,
   operation: (client: SynomemService) => Promise<T>,
+  assertActor?: boolean,
 ): Promise<T> {
-  const client = serviceFactory({ ...(home ? { home } : {}), actor: configuredActor });
+  const client = serviceFactory({
+    ...(home ? { home } : {}),
+    actor: configuredActor,
+    ...(assertActor !== undefined ? { assertActor } : {}),
+  });
   await client.init();
   try {
     return await operation(client);
@@ -452,7 +457,8 @@ export function createCli(
     home: string | undefined,
     configuredActor: ActorIdentity,
     operation: (client: SynomemService) => Promise<T>,
-  ) => withService(serviceFactory, home, configuredActor, operation);
+    assertActor?: boolean,
+  ) => withService(serviceFactory, home, configuredActor, operation, assertActor);
   cliExitCodes.set(program, 0);
   program
     .name('synomem')
@@ -559,7 +565,11 @@ export function createCli(
       writeSynomemBackend({ kind: 'local' }, home);
       // Opening it once creates the database, so `list` does not report a
       // workspace that exists in name only.
-      await withClient(home, defaultActor(env, 'system', 'cli'), async () => undefined);
+      await withClient(
+        home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        async () => undefined,
+      );
       output(
         io,
         global.json,
@@ -698,18 +708,22 @@ export function createCli(
       if (persisted?.backend.kind === 'remote') {
         throw new SynomemError('INVALID_INPUT', 'The init command requires a local backend.');
       }
-      await withClient(options.home, defaultActor(env, 'system', 'cli'), async (client) => {
-        const info = await client.info();
-        if (info.backend !== 'local') {
-          throw new SynomemError('INVALID_INPUT', 'The init command requires a local backend.');
-        }
-        output(
-          io,
-          options.json,
-          { home: info.home, database: info.databasePath },
-          `Initialized Synomem at ${info.home}`,
-        );
-      });
+      await withClient(
+        options.home,
+        defaultActor(env, 'system', 'cli', options.actor),
+        async (client) => {
+          const info = await client.info();
+          if (info.backend !== 'local') {
+            throw new SynomemError('INVALID_INPUT', 'The init command requires a local backend.');
+          }
+          output(
+            io,
+            options.json,
+            { home: info.home, database: info.databasePath },
+            `Initialized Synomem at ${info.home}`,
+          );
+        },
+      );
     });
 
   /*
@@ -1160,7 +1174,7 @@ export function createCli(
       }
       const result = await withClient(
         global.home,
-        defaultActor(env, 'system', 'cli'),
+        defaultActor(env, 'system', 'cli', global.actor),
         async (client) => ({
           info: await client.info(),
           capabilities: await client.capabilities(),
@@ -1198,15 +1212,19 @@ export function createCli(
     .description('Report whether the generated files match the canonical events')
     .action(async (_options, command: Command) => {
       const global = globals(command);
-      const status = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) => {
-        if (!client.projectionStatus) {
-          throw new SynomemError(
-            'INVALID_INPUT',
-            'The remote backend keeps no filesystem projections, so there is nothing to report.',
-          );
-        }
-        return client.projectionStatus();
-      });
+      const status = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => {
+          if (!client.projectionStatus) {
+            throw new SynomemError(
+              'INVALID_INPUT',
+              'The remote backend keeps no filesystem projections, so there is nothing to report.',
+            );
+          }
+          return client.projectionStatus();
+        },
+      );
       const enabled = Object.entries(status.settings)
         .filter(([, on]) => on)
         .map(([name]) => name);
@@ -1373,7 +1391,7 @@ export function createCli(
         const global = globals(command);
         const profile = await withClient(
           global.home,
-          defaultActor(env, 'system', 'cli'),
+          defaultActor(env, 'system', 'cli', global.actor),
           (client) =>
             client.agents.create({
               handle,
@@ -1402,8 +1420,10 @@ export function createCli(
     .description('Add aliases, keeping the ones already there')
     .action(async (agent: string, aliases: string[], _options, command: Command) => {
       const global = globals(command);
-      const profile = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
-        client.agents.addAliases(agent, aliases),
+      const profile = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.agents.addAliases(agent, aliases),
       );
       output(io, global.json, profile, `Aliases: ${(profile.aliases ?? []).join(', ') || 'none'}`);
     });
@@ -1413,8 +1433,10 @@ export function createCli(
     .description('Remove aliases, keeping the rest')
     .action(async (agent: string, aliases: string[], _options, command: Command) => {
       const global = globals(command);
-      const profile = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
-        client.agents.removeAliases(agent, aliases),
+      const profile = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.agents.removeAliases(agent, aliases),
       );
       output(io, global.json, profile, `Aliases: ${(profile.aliases ?? []).join(', ') || 'none'}`);
     });
@@ -1424,8 +1446,10 @@ export function createCli(
     .description('Change an agent handle. Its canonical ID never changes.')
     .action(async (agent: string, handle: string, _options, command: Command) => {
       const global = globals(command);
-      const profile = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
-        client.agents.update(agent, { handle }),
+      const profile = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.agents.update(agent, { handle }),
       );
       output(
         io,
@@ -1440,8 +1464,10 @@ export function createCli(
     .description('Stop an agent acting, keeping its records and history')
     .action(async (agent: string, _options, command: Command) => {
       const global = globals(command);
-      const profile = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
-        client.agents.archive(agent),
+      const profile = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.agents.archive(agent),
       );
       output(io, global.json, profile, `Archived ${profile.handle} (${profile.id})`);
     });
@@ -1451,8 +1477,10 @@ export function createCli(
     .description('Let an archived agent act again')
     .action(async (agent: string, _options, command: Command) => {
       const global = globals(command);
-      const profile = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
-        client.agents.restore(agent),
+      const profile = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.agents.restore(agent),
       );
       output(io, global.json, profile, `Restored ${profile.handle} (${profile.id})`);
     });
@@ -1493,7 +1521,7 @@ export function createCli(
         if (options.agent) {
           agentId = await withClient(
             global.home,
-            defaultActor(env, 'system', 'cli'),
+            defaultActor(env, 'system', 'cli', global.actor),
             async (client) => {
               const resolution = await client.agents.resolve(options.agent!);
               if (!resolution.match) {
@@ -1582,8 +1610,10 @@ export function createCli(
     .description('List known agent identities')
     .action(async (_options, command: Command) => {
       const global = globals(command);
-      const agents = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
-        client.agents.list(),
+      const agents = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.agents.list(),
       );
       const human = agents.length
         ? agents
@@ -1605,8 +1635,10 @@ export function createCli(
     .description('Show one agent profile, resolving aliases')
     .action(async (id: string, _options, command: Command) => {
       const global = globals(command);
-      const profile = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
-        client.agents.get(id),
+      const profile = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.agents.get(id),
       );
       output(
         io,
@@ -1633,7 +1665,7 @@ export function createCli(
         const hasAliases = options.clearAliases || options.alias.length > 0;
         const profile = await withClient(
           global.home,
-          defaultActor(env, 'system', 'cli'),
+          defaultActor(env, 'system', 'cli', global.actor),
           (client) =>
             client.agents.update(id, {
               ...(options.name ? { displayName: options.name } : {}),
@@ -1652,7 +1684,7 @@ export function createCli(
       const global = globals(command);
       const resolution = await withClient(
         global.home,
-        defaultActor(env, 'system', 'cli'),
+        defaultActor(env, 'system', 'cli', global.actor),
         (client) => client.agents.resolve(name),
       );
       // An ambiguous name is a question, not a failure: exit zero and show the
@@ -1672,8 +1704,10 @@ export function createCli(
     .description('List agents with their runtime bindings')
     .action(async (_options, command: Command) => {
       const global = globals(command);
-      const entries = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
-        client.agents.directory(),
+      const entries = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.agents.directory(),
       );
       const human = entries.length
         ? entries
@@ -1713,7 +1747,7 @@ export function createCli(
         const global = globals(command);
         const binding = await withClient(
           global.home,
-          defaultActor(env, 'system', 'cli'),
+          defaultActor(env, 'system', 'cli', global.actor),
           (client) =>
             client.agents.bindRuntime({
               agentId: agent,
@@ -1744,7 +1778,7 @@ export function createCli(
       const global = globals(command);
       const result = await withClient(
         global.home,
-        defaultActor(env, 'system', 'cli'),
+        defaultActor(env, 'system', 'cli', global.actor),
         async (client) => {
           if (agent) {
             const profile = await client.agents.get(agent);
@@ -1777,8 +1811,10 @@ export function createCli(
     .description('Remove a runtime binding')
     .action(async (bindingId: string, _options, command: Command) => {
       const global = globals(command);
-      const removed = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
-        client.agents.unbindRuntime(bindingId),
+      const removed = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.agents.unbindRuntime(bindingId),
       );
       output(
         io,
@@ -2055,8 +2091,9 @@ export function createCli(
       const global = globals(command);
       const page = await withClient(
         global.home,
-        defaultActor(env, 'human', 'local-cli'),
+        defaultActor(env, 'human', 'local-cli', global.actor),
         (client) => client.kudos.list(listInput(options)),
+        Boolean(global.actor),
       );
       output(
         io,
@@ -2085,8 +2122,9 @@ export function createCli(
       const global = globals(command);
       const page = await withClient(
         global.home,
-        defaultActor(env, 'human', 'local-cli'),
+        defaultActor(env, 'human', 'local-cli', global.actor),
         (client) => client.items.list(itemListInput(options)),
+        Boolean(global.actor),
       );
       output(
         io,
@@ -2109,13 +2147,14 @@ export function createCli(
         const global = globals(command);
         const page = await withClient(
           global.home,
-          defaultActor(env, 'human', 'local-cli'),
+          defaultActor(env, 'human', 'local-cli', global.actor),
           (client) =>
             client.items.changes({
               limit: Number(options.limit),
               ...(options.kind.length ? { kinds: options.kind as ItemListInput['kinds'] } : {}),
               ...(options.after ? { after: options.after } : {}),
             }),
+          Boolean(global.actor),
         );
         const human = page.items.length
           ? `${page.items
@@ -2191,7 +2230,7 @@ export function createCli(
         const global = globals(command);
         const page = await withClient(
           global.home,
-          defaultActor(env, 'human', 'local-cli'),
+          defaultActor(env, 'human', 'local-cli', global.actor),
           (client) =>
             client.memos.list({
               ...(options.participant ? { participantAgentId: options.participant } : {}),
@@ -2199,6 +2238,7 @@ export function createCli(
               limit: Number(options.limit),
               ...(options.cursor ? { cursor: options.cursor } : {}),
             }),
+          Boolean(global.actor),
         );
         output(io, global.json, page, page.items.map(lineForItem).join('\n') || 'No memos found.');
       },
@@ -2207,8 +2247,9 @@ export function createCli(
     const global = globals(command);
     const record = await withClient(
       global.home,
-      defaultActor(env, 'human', 'local-cli'),
+      defaultActor(env, 'human', 'local-cli', global.actor),
       (client) => client.memos.get(id),
+      Boolean(global.actor),
     );
     output(
       io,
@@ -2300,13 +2341,14 @@ export function createCli(
         const global = globals(command);
         const page = await withClient(
           global.home,
-          defaultActor(env, 'human', 'local-cli'),
+          defaultActor(env, 'human', 'local-cli', global.actor),
           (client) =>
             client.notes.list({
               ...(options.owner ? { participantAgentId: options.owner } : {}),
               ...(options.status ? { status: options.status } : {}),
               limit: Number(options.limit),
             }),
+          Boolean(global.actor),
         );
         output(io, global.json, page, page.items.map(lineForItem).join('\n') || 'No notes found.');
       },
@@ -2315,8 +2357,9 @@ export function createCli(
     const global = globals(command);
     const record = await withClient(
       global.home,
-      defaultActor(env, 'human', 'local-cli'),
+      defaultActor(env, 'human', 'local-cli', global.actor),
       (client) => client.notes.get(id),
+      Boolean(global.actor),
     );
     output(
       io,
@@ -2611,13 +2654,14 @@ export function createCli(
         const global = globals(command);
         const page = await withClient(
           global.home,
-          defaultActor(env, 'human', 'local-cli'),
+          defaultActor(env, 'human', 'local-cli', global.actor),
           (client) =>
             client.tasks.list({
               ...(options.assignee ? { participantAgentId: options.assignee } : {}),
               ...(options.status ? { status: options.status } : {}),
               limit: Number(options.limit),
             }),
+          Boolean(global.actor),
         );
         output(io, global.json, page, page.items.map(lineForItem).join('\n') || 'No tasks found.');
       },
@@ -2626,8 +2670,9 @@ export function createCli(
     const global = globals(command);
     const record = await withClient(
       global.home,
-      defaultActor(env, 'human', 'local-cli'),
+      defaultActor(env, 'human', 'local-cli', global.actor),
       (client) => client.tasks.get(id),
+      Boolean(global.actor),
     );
     output(
       io,
@@ -2765,8 +2810,10 @@ export function createCli(
     .description('Show one kudos item and its current state')
     .action(async (id: string, _options, command: Command) => {
       const global = globals(command);
-      const record = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
-        client.kudos.get(id),
+      const record = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.kudos.get(id),
       );
       output(io, global.json, record, showRecord(record));
     });
@@ -2841,7 +2888,7 @@ export function createCli(
         if (!agentId) throw new SynomemError('INVALID_INPUT', 'Specify an agent.');
         const details = await withClient(
           global.home,
-          defaultActor(env, 'system', 'cli'),
+          defaultActor(env, 'system', 'cli', global.actor),
           async (client) => {
             const profile = await client.agents.get(agentId);
             const info = await client.info();
@@ -2885,8 +2932,10 @@ export function createCli(
     kudosCommand.command('stats').description('Show aggregate kudos statistics'),
   ).action(async (options: Record<string, string>, command: Command) => {
     const global = globals(command);
-    const stats = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
-      client.stats(listInput(options)),
+    const stats = await withClient(
+      global.home,
+      defaultActor(env, 'system', 'cli', global.actor),
+      (client) => client.stats(listInput(options)),
     );
     output(
       io,
@@ -2901,8 +2950,10 @@ export function createCli(
     .description('Regenerate current-state and filesystem projections from canonical events')
     .action(async (_options, command: Command) => {
       const global = globals(command);
-      const result = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
-        client.rebuild(),
+      const result = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.rebuild(),
       );
       output(
         io,
@@ -2917,15 +2968,19 @@ export function createCli(
     .description('Create a transactionally consistent SQLite backup')
     .action(async (destination: string, _options, command: Command) => {
       const global = globals(command);
-      const path = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) => {
-        if (!client.backup) {
-          throw new SynomemError(
-            'INVALID_INPUT',
-            'Filesystem backup is available only with the local backend.',
-          );
-        }
-        return client.backup(destination);
-      });
+      const path = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => {
+          if (!client.backup) {
+            throw new SynomemError(
+              'INVALID_INPUT',
+              'Filesystem backup is available only with the local backend.',
+            );
+          }
+          return client.backup(destination);
+        },
+      );
       output(io, global.json, { path }, `Created backup at ${path}`);
     });
 
@@ -2944,7 +2999,7 @@ export function createCli(
         const global = globals(command);
         const content = await withClient(
           global.home,
-          defaultActor(env, 'system', 'cli'),
+          defaultActor(env, 'system', 'cli', global.actor),
           (client) => client.export(options.format),
         );
         if (options.output) {
@@ -2967,8 +3022,10 @@ export function createCli(
     .description('Run safe diagnostics')
     .action(async (_options, command: Command) => {
       const global = globals(command);
-      const result = await withClient(global.home, defaultActor(env, 'system', 'cli'), (client) =>
-        client.doctor(),
+      const result = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.doctor(),
       );
       const human = result.diagnostics
         .map((item) => `${item.level.toUpperCase().padEnd(7)} ${item.code}: ${item.message}`)
@@ -2994,20 +3051,24 @@ export function createCli(
         // the name is written into every event the session appends, and a
         // harness must not be able to sign another agent's name to work.
         const bound = options.agentId
-          ? await withClient(global.home, defaultActor(env, 'system', 'cli'), async (client) => {
-              const resolution = await client.agents.resolve(options.agentId!);
-              if (!resolution.match) {
-                throw new SynomemError(
-                  'AGENT_NOT_FOUND',
-                  resolution.candidates.length
-                    ? `"${options.agentId}" matches ${resolution.candidates.length} agents: ${resolution.candidates
-                        .map((candidate) => candidate.id)
-                        .join(', ')}. Name one of them.`
-                    : `Unknown agent: ${options.agentId}`,
-                );
-              }
-              return actor('agent', resolution.match.id, resolution.match.displayName);
-            })
+          ? await withClient(
+              global.home,
+              defaultActor(env, 'system', 'cli', global.actor),
+              async (client) => {
+                const resolution = await client.agents.resolve(options.agentId!);
+                if (!resolution.match) {
+                  throw new SynomemError(
+                    'AGENT_NOT_FOUND',
+                    resolution.candidates.length
+                      ? `"${options.agentId}" matches ${resolution.candidates.length} agents: ${resolution.candidates
+                          .map((candidate) => candidate.id)
+                          .join(', ')}. Name one of them.`
+                      : `Unknown agent: ${options.agentId}`,
+                  );
+                }
+                return actor('agent', resolution.match.id, resolution.match.displayName);
+              },
+            )
           : undefined;
         if (!bound && !(options.actorId && options.actorKind)) {
           throw new SynomemError(

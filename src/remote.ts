@@ -37,6 +37,17 @@ export interface RemoteSynomemOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
   maximumResponseBytes?: number;
+  /**
+   * False when `expectedActor` is only a historical CLI fallback guess (a
+   * caller named no real identity via `--actor`, `SYNOMEM_ACTOR_ID`, or a
+   * project binding), not an identity the caller actually asserted. Defaults
+   * to true, so every existing caller keeps its current strict behavior.
+   * `kind: 'system'` already bypasses the match unconditionally (its own
+   * historical bootstrap placeholder); this is the same bypass for a
+   * fallback of any other kind, without pretending that fallback IS a real
+   * identity.
+   */
+  assertActor?: boolean;
 }
 
 interface ApiErrorEnvelope {
@@ -153,6 +164,7 @@ export class RemoteSynomemService implements SynomemService {
   private readonly signal?: AbortSignal;
   private readonly timeoutMs: number;
   private readonly maximumResponseBytes: number;
+  private readonly assertActor: boolean;
   private initialized = false;
   private cachedCapabilities?: SynomemServiceCapabilities;
 
@@ -489,6 +501,7 @@ export class RemoteSynomemService implements SynomemService {
       throw asSynomemError(error);
     }
     this.credentialProvider = options.credentialProvider;
+    this.assertActor = options.assertActor ?? true;
     this.fetchImplementation = options.fetch ?? fetch;
     this.signal = options.signal;
     this.timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
@@ -520,10 +533,13 @@ export class RemoteSynomemService implements SynomemService {
     // credential the server authenticates ever reports that kind back, so
     // asserting it here would make every one of those commands fail against
     // a remote backend no matter who is actually calling — exactly the
-    // bootstrap deadlock the server-side half of this already fixed. Only a
-    // caller that named a real identity (an agent ID, or an actor supplied
-    // via --actor/SYNOMEM_ACTOR_ID) gets its match enforced.
-    const assertedRealActor = this.actor.kind !== 'system';
+    // bootstrap deadlock the server-side half of this already fixed.
+    // `assertActor: false` is the same bypass for a fallback of any other
+    // kind: a caller whose "actor" is only a historical guess (never a real
+    // --actor, SYNOMEM_ACTOR_ID, or project binding) that should adopt
+    // whatever the credential actually names rather than fail outright.
+    // Either way, only a caller that named a real identity gets it enforced.
+    const assertedRealActor = this.assertActor && this.actor.kind !== 'system';
     if (
       binding.workspaceId !== this.workspaceId ||
       (assertedRealActor &&

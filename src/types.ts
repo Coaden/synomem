@@ -797,6 +797,14 @@ export interface SynomemClientOptions {
    * actor's real org role here instead — see `SynomemCoreOptions`.
    */
   administrative?: boolean;
+  /**
+   * False when `actor` is only a historical fallback guess, not an identity
+   * the caller actually asserted. A local `SynomemClient` ignores this (a
+   * local home accepts any actor); a remote backend uses it to decide
+   * whether to enforce the credential's bound actor or adopt it — see
+   * `RemoteSynomemOptions.assertActor`.
+   */
+  assertActor?: boolean;
   clock?: () => Date;
   idGenerator?: () => string;
   readOnly?: boolean;

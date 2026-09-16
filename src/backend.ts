@@ -92,6 +92,7 @@ export function createConfiguredService(
           resolveHome(options.home),
         ),
     ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.assertActor !== undefined ? { assertActor: options.assertActor } : {}),
   });
 }
 
