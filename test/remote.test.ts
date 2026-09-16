@@ -158,7 +158,7 @@ describe('remote Synomem service', () => {
     await expect(service.init()).rejects.toMatchObject({ code: 'AUTH_FORBIDDEN' });
   });
 
-  it('adopts the credential\'s real actor instead of failing when assertActor is false', async () => {
+  it("adopts the credential's real actor instead of failing when assertActor is false", async () => {
     // A caller whose "actor" is only a historical fallback guess (the CLI's
     // list/show commands before this fix) has no business asserting a match
     // against the credential -- it should defer to whatever the credential

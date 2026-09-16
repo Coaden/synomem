@@ -45,7 +45,10 @@ describe('CLI', () => {
     const home = tempHome();
     const seen: Array<{ actor: string; assertActor?: boolean }> = [];
     const factory: SynomemServiceFactory = (options) => {
-      seen.push({ actor: `${options.actor?.kind}:${options.actor?.id}`, assertActor: options.assertActor });
+      seen.push({
+        actor: `${options.actor?.kind}:${options.actor?.id}`,
+        assertActor: options.assertActor,
+      });
       return new SynomemClient(options);
     };
     const run = async (args: string[]) => {
