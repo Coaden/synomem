@@ -14,6 +14,7 @@ import type {
   SynomemEvent,
   Page,
   RecordKind,
+  Topic,
 } from '../types.js';
 
 /**
@@ -62,6 +63,13 @@ export interface SynomemRepository {
   }): Awaitable<void>;
   unbindRuntime(bindingId: string): Awaitable<boolean>;
   touchRuntimeBinding(agentId: string, runtime: string, at: string): Awaitable<void>;
+
+  insertTopic(topic: Topic): Awaitable<void>;
+  updateTopic(topic: Topic, updatedAt: string): Awaitable<void>;
+  getTopic(idOrAlias: string): Awaitable<Topic | undefined>;
+  listTopics(status?: 'active' | 'archived'): Awaitable<Topic[]>;
+  /** Resolves a name case-insensitively, reporting ambiguity instead of guessing. */
+  resolveTopic(query: string): Awaitable<{ match?: Topic; candidates: Topic[] }>;
 
   listKudosSummaries(
     input: Required<Pick<KudosListInput, 'limit' | 'offset'>> & KudosListInput,

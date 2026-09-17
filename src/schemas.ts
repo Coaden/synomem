@@ -74,6 +74,15 @@ export const agentAliasSchema = z
  */
 export const agentLookupSchema = z.string().trim().min(1).max(100);
 
+/** A topic's canonical, opaque, immutable ID: a ULID, uppercase Crockford base32. */
+export const topicIdSchema = z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+/**
+ * A record's topics. Deliberately capped far lower than tags: a topic is a
+ * stable subject a record genuinely belongs to, not a place to accumulate
+ * every word that might one day be searched for.
+ */
+const topicIdsFieldSchema = z.array(topicIdSchema).max(10).optional();
+
 export const actorSchema = z.object({
   kind: z.enum(['human', 'agent', 'system']),
   id: agentIdSchema,
@@ -202,6 +211,49 @@ export const updateAgentSchema = z
   .strict();
 
 /**
+ * A topic alias, folded to canonical lowercase the same way an agent alias is
+ * — so `Synomem` and `synomem` cannot be claimed as two different topics.
+ */
+export const topicAliasSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(63)
+  .regex(/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/, 'Use ASCII letters, digits, and hyphens')
+  .transform((alias) => alias.toLowerCase());
+export const topicNameSchema = z.string().trim().min(1).max(80);
+/** A name offered for lookup, which may be an ID or an alias in any casing. */
+export const topicLookupSchema = z.string().trim().min(1).max(100);
+
+export const topicProfileSchema = z.object({
+  id: topicIdSchema,
+  displayName: topicNameSchema,
+  aliases: z.array(topicAliasSchema).max(20).optional(),
+  status: z.enum(['active', 'archived']).default('active'),
+  createdAt: z.string().datetime({ offset: true }),
+});
+
+export const createTopicSchema = z
+  .object({
+    displayName: topicNameSchema,
+    aliases: z.array(topicAliasSchema).max(20).optional(),
+  })
+  .strict();
+
+export const updateTopicSchema = z
+  .object({
+    displayName: topicNameSchema.optional(),
+    aliases: z.array(topicAliasSchema).max(20).optional(),
+  })
+  .strict();
+
+export const topicListInputSchema = z
+  .object({
+    status: z.enum(['active', 'archived']).optional(),
+  })
+  .strict();
+
+/**
  * A runtime binding is a claim about where an agent runs, so the fields stay
  * deliberately loose: Synomem should record a runtime it has never heard of
  * rather than reject an install it cannot classify.
@@ -251,6 +303,7 @@ const kudosGivenSchema = baseEventSchema.extend({
   reason: z.string().trim().min(1).max(5000),
   evidence: z.array(evidenceSchema).max(50).optional(),
   tags: z.array(kudosTagSchema).max(50).optional(),
+  topicIds: topicIdsFieldSchema,
   visibility: z.enum(['private', 'workspace', 'public']),
 });
 
@@ -286,6 +339,19 @@ const agentUpdatedSchema = baseEventSchema.extend({
   }),
 });
 
+const topicCreatedSchema = baseEventSchema.extend({
+  type: z.literal('topic.created'),
+  topic: topicProfileSchema,
+});
+
+const topicUpdatedSchema = baseEventSchema.extend({
+  type: z.literal('topic.updated'),
+  topicId: topicIdSchema,
+  changes: updateTopicSchema.extend({
+    status: z.enum(['active', 'archived']).optional(),
+  }),
+});
+
 const memoSentSchema = baseEventSchema.extend({
   type: z.literal('memo.sent'),
   recipientAgentId: agentIdSchema,
@@ -298,6 +364,7 @@ const memoSentSchema = baseEventSchema.extend({
     .regex(/^[^\r\n]+$/),
   body: z.string().trim().min(1).max(16_000),
   tags: z.array(kudosTagSchema).max(20).optional(),
+  topicIds: topicIdsFieldSchema,
   visibility: z.enum(['private', 'workspace', 'public']),
 });
 
@@ -324,6 +391,7 @@ const noteCreatedSchema = baseEventSchema.extend({
     .regex(/^[^\r\n]+$/),
   body: z.string().trim().min(1).max(32_000),
   tags: z.array(kudosTagSchema).max(20).optional(),
+  topicIds: topicIdsFieldSchema,
   visibility: z.literal('private'),
 });
 const noteRevisedSchema = baseEventSchema.extend({
@@ -337,6 +405,7 @@ const noteRevisedSchema = baseEventSchema.extend({
     .regex(/^[^\r\n]+$/),
   body: z.string().trim().min(1).max(32_000),
   tags: z.array(kudosTagSchema).max(20).optional(),
+  topicIds: topicIdsFieldSchema,
   visibility: z.literal('private'),
 });
 const noteArchivedSchema = baseEventSchema.extend({
@@ -358,6 +427,7 @@ const postFields = {
     .regex(/^[^\r\n]+$/),
   body: z.string().trim().min(1).max(32_000),
   tags: z.array(kudosTagSchema).max(20).optional(),
+  topicIds: topicIdsFieldSchema,
 };
 const postCreatedSchema = baseEventSchema.extend({
   type: z.literal('post.created'),
@@ -425,6 +495,7 @@ const taskFields = {
   priority: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
   due: taskDueSchema.optional(),
   tags: z.array(kudosTagSchema).max(20).optional(),
+  topicIds: topicIdsFieldSchema,
   visibility: z.enum(['private', 'workspace', 'public']),
 };
 const taskCreatedSchema = baseEventSchema.extend({
@@ -478,6 +549,7 @@ const todoFields = {
   priority: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
   due: taskDueSchema.optional(),
   tags: z.array(kudosTagSchema).max(20).optional(),
+  topicIds: topicIdsFieldSchema,
 };
 const todoCreatedSchema = baseEventSchema.extend({
   type: z.literal('todo.created'),
@@ -518,6 +590,8 @@ export const eventSchema = z.discriminatedUnion('type', [
   revokedSchema,
   agentCreatedSchema,
   agentUpdatedSchema,
+  topicCreatedSchema,
+  topicUpdatedSchema,
   memoSentSchema,
   memoReadSchema,
   memoArchivedSchema,
@@ -555,6 +629,7 @@ const giveKudosInputSchema = kudosGivenSchema
     title: kudosTitleSchema,
     evidence: z.array(evidenceSchema).max(10).optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
+    topicIds: topicIdsFieldSchema,
   });
 
 function enforceKudosPayloadSize(value: unknown, context: z.RefinementCtx): void {
@@ -575,6 +650,7 @@ export const listInputSchema = z
     actorId: agentIdSchema.optional(),
     actorKind: z.enum(['human', 'agent', 'system']).optional(),
     tag: z.string().trim().min(1).max(64).optional(),
+    topicId: topicIdSchema.optional(),
     status: z.enum(['acknowledged', 'unacknowledged']).optional(),
     visibility: z.enum(['private', 'workspace', 'public']).optional(),
     revoked: z.boolean().optional(),
@@ -606,6 +682,7 @@ export const sendMemoSchema = z
     subject: memoSentSchema.shape.subject,
     body: memoSentSchema.shape.body,
     tags: z.array(kudosTagSchema).max(20).optional(),
+    topicIds: topicIdsFieldSchema,
     visibility: z.enum(['private', 'workspace', 'public']).optional(),
     ...mutationMetadata,
   })
@@ -624,6 +701,7 @@ export const updatePostSchema = z
     title: postFields.title.optional(),
     body: postFields.body.optional(),
     tags: postFields.tags,
+    topicIds: postFields.topicIds,
     idempotencyKey: z.string().trim().min(1).max(200).optional(),
   })
   .strict();
@@ -634,6 +712,7 @@ export const createNoteSchema = z
     title: noteCreatedSchema.shape.title,
     body: noteCreatedSchema.shape.body,
     tags: z.array(kudosTagSchema).max(20).optional(),
+    topicIds: topicIdsFieldSchema,
     ...mutationMetadata,
   })
   .strict();
@@ -644,6 +723,7 @@ export const reviseNoteSchema = z
     title: noteCreatedSchema.shape.title.optional(),
     body: noteCreatedSchema.shape.body.optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
+    topicIds: topicIdsFieldSchema,
     ...mutationMetadata,
   })
   .strict();
@@ -655,6 +735,7 @@ export const createTaskSchema = z
     priority: taskCreatedSchema.shape.priority.optional(),
     due: taskDueSchema.optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
+    topicIds: topicIdsFieldSchema,
     visibility: z.enum(['private', 'workspace', 'public']).optional(),
     ...mutationMetadata,
   })
@@ -668,6 +749,7 @@ export const updateTaskSchema = z
     priority: taskCreatedSchema.shape.priority.optional(),
     due: taskDueSchema.nullable().optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
+    topicIds: topicIdsFieldSchema,
     visibility: z.enum(['private', 'workspace', 'public']).optional(),
     ...mutationMetadata,
   })
@@ -685,6 +767,7 @@ export const createTodoSchema = z
     priority: todoCreatedSchema.shape.priority.optional(),
     due: taskDueSchema.optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
+    topicIds: topicIdsFieldSchema,
     ...mutationMetadata,
   })
   .strict();
@@ -697,6 +780,7 @@ export const updateTodoSchema = z
     priority: todoCreatedSchema.shape.priority.optional(),
     due: taskDueSchema.nullable().optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
+    topicIds: topicIdsFieldSchema,
     ...mutationMetadata,
   })
   .strict();
@@ -714,6 +798,7 @@ export const itemListInputSchema = z
     awaitingSince: z.string().datetime({ offset: true }).optional(),
     overdueAsOf: z.string().datetime({ offset: true }).optional(),
     tag: kudosTagSchema.optional(),
+    topicId: topicIdSchema.optional(),
     status: z.string().trim().min(1).max(50).optional(),
     pending: z.boolean().optional(),
     visibility: z.enum(['private', 'workspace', 'public']).optional(),

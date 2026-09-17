@@ -23,7 +23,7 @@ import {
   readJsonFile,
 } from './fs-utils.js';
 import { dueInstant } from './projections.js';
-import { actorSchema, eventSchema, profileSchema } from './schemas.js';
+import { actorSchema, eventSchema, profileSchema, topicProfileSchema } from './schemas.js';
 import type {
   ActorIdentity,
   SynomemConfig,
@@ -39,6 +39,7 @@ import type {
   ItemChange,
   ItemListInput,
   ItemSummary,
+  Topic,
   RecordKind,
   KudosListInput,
   KudosSummary,
@@ -62,6 +63,7 @@ interface CurrentRow {
   actor_display_name: string | null;
   title: string;
   tags_json: string;
+  topic_ids_json: string;
   visibility: KudosSummary['visibility'];
   status: KudosSummary['status'];
   revocation_status: KudosSummary['revocationStatus'];
@@ -80,6 +82,7 @@ interface ItemRow {
   actor_display_name: string | null;
   title: string;
   tags_json: string;
+  topic_ids_json: string;
   visibility: ItemSummary['visibility'];
   status: string;
   recipient_agent_id: string | null;
@@ -98,6 +101,16 @@ export interface EventScan {
 interface ProfileRow {
   profile_json: string;
 }
+
+interface TopicRow {
+  id: string;
+  display_name: string;
+  status: 'active' | 'archived';
+  created_at: string;
+}
+
+/** The schema version this file writes and expects. */
+const SUPPORTED_SCHEMA_VERSION = 8;
 
 const migrationV1 = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -181,6 +194,7 @@ CREATE TABLE kudos_current (
   actor_display_name TEXT,
   title TEXT NOT NULL,
   tags_json TEXT NOT NULL CHECK (json_valid(tags_json)),
+  topic_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(topic_ids_json)),
   visibility TEXT NOT NULL,
   status TEXT NOT NULL,
   revocation_status TEXT NOT NULL,
@@ -270,6 +284,25 @@ CREATE UNIQUE INDEX agents_handle ON agents(handle);
 ALTER TABLE agents ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
 `;
 
+const migrationV8 = `
+-- Topics: a controlled, reusable subject a record can be filed under,
+-- distinct from a free-text tag (§ Topic in types.ts). One canonical display
+-- name and a set of case-folded aliases, so a topic can be renamed without
+-- retagging every record that already carries it.
+CREATE TABLE topics (
+  id TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT;
+CREATE TABLE topic_aliases (
+  alias TEXT PRIMARY KEY,
+  topic_id TEXT NOT NULL REFERENCES topics(id)
+) STRICT;
+CREATE INDEX topic_aliases_topic ON topic_aliases(topic_id);
+`;
+
 const migrationV3 = `
 DROP TRIGGER IF EXISTS events_append_only_update;
 DROP TRIGGER IF EXISTS events_append_only_delete;
@@ -317,6 +350,7 @@ CREATE TABLE items_current (
   actor_display_name TEXT,
   title TEXT NOT NULL,
   tags_json TEXT NOT NULL CHECK (json_valid(tags_json)),
+  topic_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(topic_ids_json)),
   visibility TEXT NOT NULL,
   status TEXT NOT NULL,
   recipient_agent_id TEXT,
@@ -379,6 +413,7 @@ function itemSummaryFromRow(row: ItemRow): ItemSummary {
     },
     title: row.title,
     tags: JSON.parse(row.tags_json) as string[],
+    topicIds: JSON.parse(row.topic_ids_json) as string[],
     visibility: row.visibility,
     status: row.status,
     ...(row.recipient_agent_id ? { recipientAgentId: row.recipient_agent_id } : {}),
@@ -419,6 +454,7 @@ function summaryFromRow(row: CurrentRow): KudosSummary {
     },
     title: row.title,
     tags: JSON.parse(row.tags_json) as string[],
+    topicIds: JSON.parse(row.topic_ids_json) as string[],
     visibility: row.visibility,
     status: row.status,
     revocationStatus: row.revocation_status,
@@ -534,7 +570,7 @@ export class SynomemStorage implements SynomemRepository {
     const version = Number(
       (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
     );
-    if (version > 7) {
+    if (version > SUPPORTED_SCHEMA_VERSION) {
       throw new SynomemError(
         'UNSUPPORTED_SCHEMA',
         `Database schema version ${version} is newer than this package supports.`,
@@ -626,14 +662,38 @@ export class SynomemStorage implements SynomemRepository {
         db.exec('PRAGMA user_version = 7');
       });
     }
+    const afterV7 = Number(
+      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    );
+    if (afterV7 === 7) {
+      this.transactionSync(() => {
+        db.exec(migrationV8);
+        // A database bootstrapped fresh today already gets topic_ids_json
+        // from V1/V3's own CREATE TABLE text, so this only fires for a
+        // database that reached v7 before those columns existed — adding a
+        // column SQLite has no "IF NOT EXISTS" form for.
+        for (const table of ['kudos_current', 'items_current']) {
+          const hasColumn = (
+            db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+          ).some((column) => column.name === 'topic_ids_json');
+          if (!hasColumn) {
+            db.exec(`ALTER TABLE ${table} ADD COLUMN topic_ids_json TEXT NOT NULL DEFAULT '[]'`);
+          }
+        }
+        db.prepare(
+          'INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        ).run(8, new Date().toISOString());
+        db.exec('PRAGMA user_version = 8');
+      });
+    }
   }
 
   private assertSchemaSupported(): void {
     const version = Number(
       (this.db().prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
     );
-    if (version !== 7) {
-      if (version >= 1 && version <= 6) {
+    if (version !== SUPPORTED_SCHEMA_VERSION) {
+      if (version >= 1 && version < SUPPORTED_SCHEMA_VERSION) {
         throw new SynomemError(
           'UNSUPPORTED_SCHEMA',
           `Database schema version ${version} requires migration. Open this home once with readOnly: false, then retry the read-only client.`,
@@ -641,7 +701,7 @@ export class SynomemStorage implements SynomemRepository {
       }
       throw new SynomemError(
         'UNSUPPORTED_SCHEMA',
-        `Expected database schema version 5; found ${version}.`,
+        `Expected database schema version ${SUPPORTED_SCHEMA_VERSION}; found ${version}.`,
       );
     }
   }
@@ -772,9 +832,9 @@ export class SynomemStorage implements SynomemRepository {
         .prepare(
           `INSERT INTO kudos_current(
             kudos_id, given_sequence, created_at, recipient_agent_id, recipient_display_name,
-            actor_kind, actor_id, actor_display_name, title, tags_json, visibility,
+            actor_kind, actor_id, actor_display_name, title, tags_json, topic_ids_json, visibility,
             status, revocation_status, updated_sequence
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unacknowledged', 'active', ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unacknowledged', 'active', ?)`,
         )
         .run(
           event.id,
@@ -787,6 +847,7 @@ export class SynomemStorage implements SynomemRepository {
           event.actor.displayName ?? null,
           event.title,
           JSON.stringify(event.tags ?? []),
+          JSON.stringify(event.topicIds ?? []),
           event.visibility,
           sequence,
         );
@@ -810,6 +871,7 @@ export class SynomemStorage implements SynomemRepository {
       kind: RecordKind;
       title: string;
       tags?: string[];
+      topicIds?: string[];
       visibility: ItemSummary['visibility'];
       status: string;
       recipientAgentId?: string;
@@ -824,10 +886,10 @@ export class SynomemStorage implements SynomemRepository {
         .prepare(
           `INSERT INTO items_current(
           item_id, kind, created_sequence, updated_sequence, created_at, updated_at,
-          actor_kind, actor_id, actor_display_name, title, tags_json, visibility, status,
+          actor_kind, actor_id, actor_display_name, title, tags_json, topic_ids_json, visibility, status,
           recipient_agent_id, recipient_display_name, owner_agent_id, owner_display_name,
           assignee_agent_id, assignee_display_name, due_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           event.aggregateId,
@@ -841,6 +903,7 @@ export class SynomemStorage implements SynomemRepository {
           event.actor.displayName ?? null,
           values.title,
           JSON.stringify(values.tags ?? []),
+          JSON.stringify(values.topicIds ?? []),
           values.visibility,
           values.status,
           values.recipientAgentId ?? null,
@@ -865,6 +928,7 @@ export class SynomemStorage implements SynomemRepository {
         kind: 'kudos',
         title: event.title,
         tags: event.tags,
+        topicIds: event.topicIds,
         visibility: event.visibility,
         status: 'unacknowledged',
         recipientAgentId: event.recipientAgentId,
@@ -877,6 +941,7 @@ export class SynomemStorage implements SynomemRepository {
         kind: 'memo',
         title: event.subject,
         tags: event.tags,
+        topicIds: event.topicIds,
         visibility: event.visibility,
         status: 'unread',
         recipientAgentId: event.recipientAgentId,
@@ -889,6 +954,7 @@ export class SynomemStorage implements SynomemRepository {
         kind: 'note',
         title: event.title,
         tags: event.tags,
+        topicIds: event.topicIds,
         visibility: event.visibility,
         status: 'active',
         ownerAgentId: event.ownerAgentId,
@@ -905,18 +971,20 @@ export class SynomemStorage implements SynomemRepository {
         kind: 'post',
         title: event.title,
         tags: event.tags,
+        topicIds: event.topicIds,
         visibility: 'workspace',
         status: 'active',
       });
     } else if (event.type === 'post.edited') {
       this.db()
         .prepare(
-          `UPDATE items_current SET title = ?, tags_json = ?,
+          `UPDATE items_current SET title = ?, tags_json = ?, topic_ids_json = ?,
          updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
         )
         .run(
           event.title,
           JSON.stringify(event.tags ?? []),
+          JSON.stringify(event.topicIds ?? []),
           sequence,
           event.createdAt,
           event.postId,
@@ -952,12 +1020,13 @@ export class SynomemStorage implements SynomemRepository {
     } else if (event.type === 'note.revised') {
       this.db()
         .prepare(
-          `UPDATE items_current SET title = ?, tags_json = ?, visibility = ?,
+          `UPDATE items_current SET title = ?, tags_json = ?, topic_ids_json = ?, visibility = ?,
          updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
         )
         .run(
           event.title,
           JSON.stringify(event.tags ?? []),
+          JSON.stringify(event.topicIds ?? []),
           event.visibility,
           sequence,
           event.createdAt,
@@ -969,6 +1038,7 @@ export class SynomemStorage implements SynomemRepository {
         kind: 'task',
         title: event.title,
         tags: event.tags,
+        topicIds: event.topicIds,
         visibility: event.visibility,
         status: event.requiresAcceptance ? 'assigned' : 'open',
         assigneeAgentId: event.assigneeAgentId,
@@ -978,12 +1048,13 @@ export class SynomemStorage implements SynomemRepository {
     } else if (event.type === 'task.updated') {
       this.db()
         .prepare(
-          `UPDATE items_current SET title = ?, tags_json = ?, visibility = ?, due_at = ?,
+          `UPDATE items_current SET title = ?, tags_json = ?, topic_ids_json = ?, visibility = ?, due_at = ?,
          updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
         )
         .run(
           event.title,
           JSON.stringify(event.tags ?? []),
+          JSON.stringify(event.topicIds ?? []),
           event.visibility,
           dueInstant(event.due) ?? null,
           sequence,
@@ -1003,6 +1074,7 @@ export class SynomemStorage implements SynomemRepository {
         kind: 'todo',
         title: event.title,
         tags: event.tags,
+        topicIds: event.topicIds,
         visibility: 'private',
         status: 'open',
         ownerAgentId: event.actor.id,
@@ -1012,12 +1084,13 @@ export class SynomemStorage implements SynomemRepository {
     } else if (event.type === 'todo.updated') {
       this.db()
         .prepare(
-          `UPDATE items_current SET title = ?, tags_json = ?, due_at = ?,
+          `UPDATE items_current SET title = ?, tags_json = ?, topic_ids_json = ?, due_at = ?,
          updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
         )
         .run(
           event.title,
           JSON.stringify(event.tags ?? []),
+          JSON.stringify(event.topicIds ?? []),
           dueInstant(event.due) ?? null,
           sequence,
           event.createdAt,
@@ -1084,6 +1157,8 @@ export class SynomemStorage implements SynomemRepository {
     if (input.actorId) add('actor_id = ?', input.actorId);
     if (input.actorKind) add('actor_kind = ?', input.actorKind);
     if (input.tag) add('EXISTS (SELECT 1 FROM json_each(tags_json) WHERE value = ?)', input.tag);
+    if (input.topicId)
+      add('EXISTS (SELECT 1 FROM json_each(topic_ids_json) WHERE value = ?)', input.topicId);
     if (input.status) add('status = ?', input.status);
     if (input.visibility) add('visibility = ?', input.visibility);
     if (input.revoked !== undefined) {
@@ -1269,6 +1344,8 @@ export class SynomemStorage implements SynomemRepository {
     if (input.actorId) add('actor_id = ?', input.actorId);
     if (input.actorKind) add('actor_kind = ?', input.actorKind);
     if (input.tag) add('EXISTS (SELECT 1 FROM json_each(tags_json) WHERE value = ?)', input.tag);
+    if (input.topicId)
+      add('EXISTS (SELECT 1 FROM json_each(topic_ids_json) WHERE value = ?)', input.topicId);
     if (input.status) add('status = ?', input.status);
     if (input.pending) {
       add(`((kind = 'kudos' AND status = 'unacknowledged') OR
@@ -1687,6 +1764,8 @@ export class SynomemStorage implements SynomemRepository {
         const supportedTypes = new Set([
           'agent.created',
           'agent.updated',
+          'topic.created',
+          'topic.updated',
           'kudos.given',
           'kudos.acknowledged',
           'kudos.revoked',
@@ -1828,6 +1907,81 @@ export class SynomemStorage implements SynomemRepository {
       .all(normalized, normalized, normalized) as unknown as ProfileRow[];
     const candidates = rows.map((row) => profileSchema.parse(JSON.parse(row.profile_json)));
     return candidates.length === 1 ? { match: candidates[0]!, candidates } : { candidates };
+  }
+
+  /* -------------------------------------------------------------------- topics */
+
+  insertTopic(topic: Topic): void {
+    const parsed = topicProfileSchema.parse(topic);
+    this.db()
+      .prepare(
+        `INSERT INTO topics(id, display_name, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(parsed.id, parsed.displayName, parsed.status, parsed.createdAt, parsed.createdAt);
+    this.insertTopicAliases(parsed.id, parsed.aliases ?? []);
+  }
+
+  updateTopic(topic: Topic, updatedAt: string): void {
+    const parsed = topicProfileSchema.parse(topic);
+    this.db()
+      .prepare('UPDATE topics SET display_name = ?, status = ?, updated_at = ? WHERE id = ?')
+      .run(parsed.displayName, parsed.status, updatedAt, parsed.id);
+    this.db().prepare('DELETE FROM topic_aliases WHERE topic_id = ?').run(parsed.id);
+    this.insertTopicAliases(parsed.id, parsed.aliases ?? []);
+  }
+
+  getTopic(idOrAlias: string): Topic | undefined {
+    return this.resolveTopic(idOrAlias).match;
+  }
+
+  listTopics(status?: 'active' | 'archived'): Topic[] {
+    const rows = (
+      status
+        ? this.db()
+            .prepare('SELECT * FROM topics WHERE status = ? ORDER BY display_name ASC')
+            .all(status)
+        : this.db().prepare('SELECT * FROM topics ORDER BY display_name ASC').all()
+    ) as unknown as TopicRow[];
+    return rows.map((row) => this.topicFromRow(row));
+  }
+
+  /** Resolves a name case-insensitively, reporting ambiguity instead of guessing. */
+  resolveTopic(query: string): { match?: Topic; candidates: Topic[] } {
+    const normalized = query.trim().toLowerCase();
+    const rows = this.db()
+      .prepare(
+        `SELECT DISTINCT t.*
+           FROM topics t
+           LEFT JOIN topic_aliases x ON x.topic_id = t.id
+          WHERE lower(t.id) = ? OR lower(t.display_name) = ? OR x.alias = ?
+          ORDER BY t.id ASC`,
+      )
+      .all(normalized, normalized, normalized) as unknown as TopicRow[];
+    const candidates = rows.map((row) => this.topicFromRow(row));
+    return candidates.length === 1 ? { match: candidates[0]!, candidates } : { candidates };
+  }
+
+  private topicFromRow(row: TopicRow): Topic {
+    const aliasRows = this.db()
+      .prepare('SELECT alias FROM topic_aliases WHERE topic_id = ? ORDER BY alias ASC')
+      .all(row.id) as unknown as Array<{ alias: string }>;
+    const aliases = aliasRows.map((aliasRow) => aliasRow.alias);
+    return {
+      id: row.id,
+      displayName: row.display_name,
+      ...(aliases.length ? { aliases } : {}),
+      status: row.status,
+      createdAt: row.created_at,
+    };
+  }
+
+  private insertTopicAliases(topicId: string, aliases: string[]): void {
+    for (const alias of aliases) {
+      this.db()
+        .prepare('INSERT INTO topic_aliases(alias, topic_id) VALUES (?, ?)')
+        .run(alias.trim().toLowerCase(), topicId);
+    }
   }
 
   /* -------------------------------------------------------- post acknowledgment */

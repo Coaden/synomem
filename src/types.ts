@@ -117,6 +117,7 @@ export interface KudosGivenEvent extends BaseEvent {
   reason: string;
   evidence?: EvidenceReference[];
   tags?: string[];
+  topicIds?: string[];
   visibility: Visibility;
 }
 export interface KudosAcknowledgedEvent extends BaseEvent {
@@ -139,6 +140,7 @@ export interface MemoSentEvent extends BaseEvent {
   subject: string;
   body: string;
   tags?: string[];
+  topicIds?: string[];
   visibility: Visibility;
 }
 export interface MemoReadEvent extends BaseEvent {
@@ -167,6 +169,7 @@ export interface PostCreatedEvent extends BaseEvent {
   title: string;
   body: string;
   tags?: string[];
+  topicIds?: string[];
   /** The post this replies to. A reply inherits its parent's workspace. */
   replyTo?: string;
 }
@@ -176,6 +179,7 @@ export interface PostEditedEvent extends BaseEvent {
   title: string;
   body: string;
   tags?: string[];
+  topicIds?: string[];
 }
 export interface PostArchivedEvent extends BaseEvent {
   type: 'post.archived';
@@ -207,6 +211,7 @@ export interface NoteCreatedEvent extends BaseEvent {
   title: string;
   body: string;
   tags?: string[];
+  topicIds?: string[];
   visibility: 'private';
 }
 export interface NoteRevisedEvent extends BaseEvent {
@@ -215,6 +220,7 @@ export interface NoteRevisedEvent extends BaseEvent {
   title: string;
   body: string;
   tags?: string[];
+  topicIds?: string[];
   visibility: 'private';
 }
 export interface NoteArchivedEvent extends BaseEvent {
@@ -234,6 +240,7 @@ export interface TaskCreatedEvent extends BaseEvent {
   priority: TaskPriority;
   due?: TaskDue;
   tags?: string[];
+  topicIds?: string[];
   visibility: Visibility;
   requiresAcceptance: boolean;
 }
@@ -245,6 +252,7 @@ export interface TaskUpdatedEvent extends BaseEvent {
   priority: TaskPriority;
   due?: TaskDue;
   tags?: string[];
+  topicIds?: string[];
   visibility: Visibility;
 }
 export interface TaskCompletedEvent extends BaseEvent {
@@ -302,6 +310,7 @@ export interface TodoCreatedEvent extends BaseEvent {
   priority: TaskPriority;
   due?: TaskDue;
   tags?: string[];
+  topicIds?: string[];
 }
 export interface TodoUpdatedEvent extends BaseEvent {
   type: 'todo.updated';
@@ -311,6 +320,7 @@ export interface TodoUpdatedEvent extends BaseEvent {
   priority: TaskPriority;
   due?: TaskDue;
   tags?: string[];
+  topicIds?: string[];
 }
 export interface TodoCompletedEvent extends BaseEvent {
   type: 'todo.completed';
@@ -342,6 +352,7 @@ export interface TodoRecord {
     priority: TaskPriority;
     due?: TaskDue;
     tags: string[];
+    topicIds: string[];
     version: number;
   };
   status: 'open' | 'completed' | 'canceled' | 'archived';
@@ -353,6 +364,7 @@ export interface CreateTodoInput extends MutationInput {
   priority?: TaskPriority;
   due?: TaskDue;
   tags?: string[];
+  topicIds?: string[];
 }
 export interface UpdateTodoInput extends MutationInput {
   todoId: string;
@@ -362,6 +374,7 @@ export interface UpdateTodoInput extends MutationInput {
   priority?: TaskPriority;
   due?: TaskDue | null;
   tags?: string[];
+  topicIds?: string[];
 }
 export type CreateTodoResult = MutationResult<TodoRecord>;
 
@@ -373,6 +386,39 @@ export interface AgentUpdatedEvent extends BaseEvent {
   type: 'agent.updated';
   agentId: string;
   changes: Partial<Omit<AgentProfile, 'id' | 'createdAt'>>;
+}
+
+/**
+ * A controlled, reusable subject a record can be filed under — deliberately
+ * distinct from a tag. A tag is a loose label anyone spells however they
+ * like (`blocked`, `reporting`); a topic is a stable identity with one
+ * canonical display name and a set of aliases, so "all notes about
+ * Synomem" stays a coherent page even as the record count grows and even
+ * if the topic itself is renamed later. A record can carry several topics
+ * at once (§ `topicIds` on every create/update event) — a record picks a
+ * kind, not a single subject.
+ */
+export interface Topic {
+  id: string;
+  displayName: string;
+  aliases?: string[];
+  status: 'active' | 'archived';
+  createdAt: string;
+}
+export interface TopicCreatedEvent extends BaseEvent {
+  type: 'topic.created';
+  topic: Topic;
+}
+export interface TopicUpdatedEvent extends BaseEvent {
+  type: 'topic.updated';
+  topicId: string;
+  changes: Partial<Omit<Topic, 'id' | 'createdAt'>>;
+}
+/** The outcome of resolving a topic name, which may legitimately name no one or several. */
+export interface TopicResolution {
+  query: string;
+  match?: Topic;
+  candidates: Topic[];
 }
 
 export type SynomemEvent =
@@ -404,7 +450,9 @@ export type SynomemEvent =
   | TodoCanceledEvent
   | TodoArchivedEvent
   | AgentCreatedEvent
-  | AgentUpdatedEvent;
+  | AgentUpdatedEvent
+  | TopicCreatedEvent
+  | TopicUpdatedEvent;
 
 export type AcknowledgmentStatus = 'acknowledged' | 'unacknowledged';
 export type RevocationStatus = 'revoked' | 'active';
@@ -436,6 +484,7 @@ export interface PostRecord {
   title: string;
   body: string;
   tags?: string[];
+  topicIds?: string[];
   version: number;
 }
 
@@ -459,7 +508,7 @@ export interface NoteRecord {
   event: NoteCreatedEvent;
   revision?: NoteRevisedEvent;
   archived?: NoteArchivedEvent;
-  current: { title: string; body: string; tags: string[]; visibility: Visibility; version: number };
+  current: { title: string; body: string; tags: string[]; topicIds: string[]; visibility: Visibility; version: number };
   status: 'active' | 'archived';
 }
 /**
@@ -491,6 +540,7 @@ export interface TaskRecord {
     priority: TaskPriority;
     due?: TaskDue;
     tags: string[];
+    topicIds: string[];
     visibility: Visibility;
     version: number;
   };
@@ -507,6 +557,7 @@ export interface ItemSummary {
   actor: ActorIdentity;
   title: string;
   tags: string[];
+  topicIds: string[];
   visibility: Visibility;
   status: string;
   recipientAgentId?: string;
@@ -535,6 +586,8 @@ export interface ItemListInput extends PaginationInput {
   actorId?: string;
   actorKind?: ActorKind;
   tag?: string;
+  /** Only records carrying this topic — the stable, cross-kind grouping tags do not give. */
+  topicId?: string;
   status?: string;
   visibility?: Visibility;
   from?: string;
@@ -563,6 +616,7 @@ export interface KudosListInput extends PaginationInput {
   actorId?: string;
   actorKind?: ActorKind;
   tag?: string;
+  topicId?: string;
   status?: AcknowledgmentStatus;
   visibility?: Visibility;
   revoked?: boolean;
@@ -623,6 +677,7 @@ export interface GiveKudosInput extends MutationInput {
   reason: string;
   evidence?: EvidenceReference[];
   tags?: string[];
+  topicIds?: string[];
   visibility?: Visibility;
 }
 export interface SendMemoInput extends MutationInput {
@@ -630,12 +685,14 @@ export interface SendMemoInput extends MutationInput {
   subject: string;
   body: string;
   tags?: string[];
+  topicIds?: string[];
   visibility?: Visibility;
 }
 export interface CreatePostInput extends MutationInput {
   title: string;
   body: string;
   tags?: string[];
+  topicIds?: string[];
   /** The post being replied to; a reply inherits its parent's workspace. */
   replyTo?: string;
 }
@@ -646,6 +703,7 @@ export interface UpdatePostInput {
   title?: string;
   body?: string;
   tags?: string[];
+  topicIds?: string[];
   idempotencyKey?: string;
 }
 
@@ -654,6 +712,7 @@ export interface CreateNoteInput extends MutationInput {
   title: string;
   body: string;
   tags?: string[];
+  topicIds?: string[];
 }
 export interface ReviseNoteInput extends MutationInput {
   noteId: string;
@@ -661,6 +720,7 @@ export interface ReviseNoteInput extends MutationInput {
   title?: string;
   body?: string;
   tags?: string[];
+  topicIds?: string[];
 }
 export interface CreateTaskInput extends MutationInput {
   assigneeAgentId?: string;
@@ -669,6 +729,7 @@ export interface CreateTaskInput extends MutationInput {
   priority?: TaskPriority;
   due?: TaskDue;
   tags?: string[];
+  topicIds?: string[];
   visibility?: Visibility;
 }
 export interface UpdateTaskInput extends MutationInput {
@@ -679,6 +740,7 @@ export interface UpdateTaskInput extends MutationInput {
   priority?: TaskPriority;
   due?: TaskDue | null;
   tags?: string[];
+  topicIds?: string[];
   visibility?: Visibility;
 }
 export interface MutationResult<T> {
@@ -713,6 +775,17 @@ export interface UpdateAgentInput {
   aliases?: string[];
   description?: string;
   metadata?: Record<string, JsonValue>;
+}
+export interface CreateTopicInput {
+  displayName: string;
+  aliases?: string[];
+}
+export interface UpdateTopicInput {
+  displayName?: string;
+  aliases?: string[];
+}
+export interface TopicListInput {
+  status?: 'active' | 'archived';
 }
 export interface KudosStats {
   total: number;

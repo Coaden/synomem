@@ -8,6 +8,8 @@ export const errorCodes = [
   'AGENT_NOT_FOUND',
   'AGENT_EXISTS',
   'ALIAS_CONFLICT',
+  'TOPIC_NOT_FOUND',
+  'TOPIC_EXISTS',
   'KUDOS_NOT_FOUND',
   'ITEM_NOT_FOUND',
   'MEMO_NOT_FOUND',

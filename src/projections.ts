@@ -334,6 +334,7 @@ export function noteRecordsFromEvents(events: SynomemEvent[]): NoteRecord[] {
           title: event.title,
           body: event.body,
           tags: event.tags ?? [],
+          topicIds: event.topicIds ?? [],
           visibility: event.visibility,
           version: event.aggregateVersion,
         },
@@ -347,6 +348,7 @@ export function noteRecordsFromEvents(events: SynomemEvent[]): NoteRecord[] {
           title: event.title,
           body: event.body,
           tags: event.tags ?? [],
+          topicIds: event.topicIds ?? [],
           visibility: event.visibility,
           version: event.aggregateVersion,
         };
@@ -382,6 +384,7 @@ export function todoRecordsFromEvents(events: SynomemEvent[]): TodoRecord[] {
           priority: event.priority,
           ...(event.due ? { due: event.due } : {}),
           tags: event.tags ?? [],
+          topicIds: event.topicIds ?? [],
           version: event.aggregateVersion,
         },
         status: 'open',
@@ -396,6 +399,7 @@ export function todoRecordsFromEvents(events: SynomemEvent[]): TodoRecord[] {
           priority: event.priority,
           ...(event.due ? { due: event.due } : {}),
           tags: event.tags ?? [],
+          topicIds: event.topicIds ?? [],
           version: event.aggregateVersion,
         };
       }
@@ -440,6 +444,7 @@ export function taskRecordsFromEvents(events: SynomemEvent[]): TaskRecord[] {
           priority: event.priority,
           ...(event.due ? { due: event.due } : {}),
           tags: event.tags ?? [],
+          topicIds: event.topicIds ?? [],
           visibility: event.visibility,
           version: event.aggregateVersion,
         },
@@ -456,6 +461,7 @@ export function taskRecordsFromEvents(events: SynomemEvent[]): TaskRecord[] {
           priority: event.priority,
           ...(event.due ? { due: event.due } : {}),
           tags: event.tags ?? [],
+          topicIds: event.topicIds ?? [],
           visibility: event.visibility,
           version: event.aggregateVersion,
         };
