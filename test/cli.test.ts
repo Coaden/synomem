@@ -715,4 +715,39 @@ describe('CLI', () => {
     expect(list).toContain('note');
     expect(list).toContain('task');
   });
+
+  it('creates a topic, files a todo under it, and filters the generic list by it', async () => {
+    const home = tempHome();
+    const invoke = async (args: string[]) => {
+      const captured = capture();
+      const code = await runCli(['node', 'synomem', '--home', home, ...args], captured.io);
+      expect(code, captured.stderr.join('')).toBe(0);
+      return captured.stdout.join('');
+    };
+    await invoke(['init']);
+    const topic = JSON.parse(
+      await invoke(['topic', 'create', 'Synomem', '--alias', 'syno', '--json']),
+    ) as { id: string; displayName: string };
+    expect(await invoke(['topic', 'resolve', 'SYNO'])).toContain(topic.id);
+
+    await invoke(['agent', 'create', 'gracie', '--name', 'Gracie']);
+    await invoke([
+      'todo',
+      'create',
+      '--as',
+      'gracie',
+      '--title',
+      'File under Synomem',
+      '--topic',
+      topic.id,
+    ]);
+    const filtered = await invoke(['list', '--topic', topic.id, '--actor', 'gracie']);
+    expect(filtered).toContain('File under Synomem');
+
+    const renamed = JSON.parse(
+      await invoke(['topic', 'rename', topic.id, 'Synomem Project', '--json']),
+    ) as { id: string; displayName: string };
+    expect(renamed.id).toBe(topic.id);
+    expect(renamed.displayName).toBe('Synomem Project');
+  });
 });

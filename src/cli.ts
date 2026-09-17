@@ -228,6 +228,7 @@ function itemListInput(options: Record<string, string | string[]>): ItemListInpu
     ...(typeof options.actor === 'string' ? { actorId: options.actor } : {}),
     ...(typeof options.status === 'string' ? { status: options.status } : {}),
     ...(typeof options.tag === 'string' ? { tag: options.tag } : {}),
+    ...(typeof options.topic === 'string' ? { topicId: options.topic } : {}),
     ...(typeof options.visibility === 'string'
       ? { visibility: options.visibility as ItemListInput['visibility'] }
       : {}),
@@ -314,6 +315,7 @@ function addListOptions(command: Command): Command {
     .option('--actor <id>')
     .option('--actor-kind <kind>', 'human, agent, or system')
     .option('--tag <tag>')
+    .option('--topic <id>', 'only records carrying this topic')
     .option('--status <status>', 'acknowledged or unacknowledged')
     .option('--visibility <visibility>', 'private, local, or public')
     .addOption(
@@ -332,6 +334,7 @@ function listInput(options: Record<string, string>): KudosListInput {
     ...(options.actor ? { actorId: options.actor } : {}),
     ...(options.actorKind ? { actorKind: options.actorKind as KudosListInput['actorKind'] } : {}),
     ...(options.tag ? { tag: options.tag } : {}),
+    ...(options.topic ? { topicId: options.topic } : {}),
     ...(options.status ? { status: options.status as KudosListInput['status'] } : {}),
     ...(options.visibility
       ? { visibility: options.visibility as KudosListInput['visibility'] }
@@ -1485,6 +1488,139 @@ export function createCli(
       output(io, global.json, profile, `Restored ${profile.handle} (${profile.id})`);
     });
 
+  const topicCommand = program
+    .command('topic')
+    .description('Create and manage topics — a stable, reusable subject any record can carry');
+
+  topicCommand
+    .command('create <display-name>')
+    .description('Create a topic. Any actor may create one.')
+    .option('--alias <name>', 'alias (repeatable)', collect, [])
+    .action(
+      async (displayName: string, options: { alias: string[] }, command: Command) => {
+        const global = globals(command);
+        const topic = await withClient(
+          global.home,
+          defaultActor(env, 'system', 'cli', global.actor),
+          (client) =>
+            client.topics.create({
+              displayName,
+              ...(options.alias.length ? { aliases: options.alias } : {}),
+            }),
+        );
+        output(
+          io,
+          global.json,
+          topic,
+          `Created ${topic.displayName}\n\nTopic ID: ${topic.id}`,
+        );
+      },
+    );
+
+  topicCommand
+    .command('list')
+    .description('List known topics')
+    .option('--status <status>', 'active or archived')
+    .action(async (options: { status?: string }, command: Command) => {
+      const global = globals(command);
+      const topics = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) =>
+          client.topics.list(
+            options.status ? { status: options.status as 'active' | 'archived' } : {},
+          ),
+      );
+      const human = topics.length
+        ? topics
+            .map(
+              (topic) =>
+                `${topic.displayName}${topic.status === 'archived' ? '  [archived]' : ''}${
+                  topic.aliases?.length ? `  aliases: ${topic.aliases.join(', ')}` : ''
+                }\n  ${topic.id}`,
+            )
+            .join('\n')
+        : 'No topics yet.';
+      output(io, global.json, { topics }, human);
+    });
+
+  topicCommand
+    .command('show <id>')
+    .description('Show one topic, resolving aliases')
+    .action(async (id: string, _options, command: Command) => {
+      const global = globals(command);
+      const topic = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.topics.get(id),
+      );
+      output(
+        io,
+        global.json,
+        topic,
+        `${topic.displayName}\n\nTopic ID: ${topic.id}\nStatus:   ${topic.status}\nAliases:  ${topic.aliases?.join(', ') ?? 'none'}`,
+      );
+    });
+
+  topicCommand
+    .command('resolve <name>')
+    .description('Resolve a name or alias to one topic, or list the candidates')
+    .action(async (name: string, _options, command: Command) => {
+      const global = globals(command);
+      const resolution = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.topics.resolve(name),
+      );
+      const human = resolution.match
+        ? `${resolution.match.displayName} (${resolution.match.id})`
+        : resolution.candidates.length
+          ? `"${resolution.query}" is ambiguous. Candidates:\n${resolution.candidates
+              .map((topic) => `  ${topic.id}  ${topic.displayName}`)
+              .join('\n')}`
+          : `No topic answers to "${resolution.query}".`;
+      output(io, global.json, resolution, human);
+    });
+
+  topicCommand
+    .command('rename <id> <display-name>')
+    .description('Change a topic\'s display name. Its ID never changes.')
+    .action(async (id: string, displayName: string, _options, command: Command) => {
+      const global = globals(command);
+      const topic = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.topics.update(id, { displayName }),
+      );
+      output(io, global.json, topic, `Renamed to ${topic.displayName}\nTopic ID: ${topic.id} (unchanged)`);
+    });
+
+  topicCommand
+    .command('archive <id>')
+    .description('Stop a topic being attached to new records, keeping the ones it already has')
+    .action(async (id: string, _options, command: Command) => {
+      const global = globals(command);
+      const topic = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.topics.archive(id),
+      );
+      output(io, global.json, topic, `Archived ${topic.displayName} (${topic.id})`);
+    });
+
+  topicCommand
+    .command('restore <id>')
+    .description('Let an archived topic be attached to new records again')
+    .action(async (id: string, _options, command: Command) => {
+      const global = globals(command);
+      const topic = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) => client.topics.restore(id),
+      );
+      output(io, global.json, topic, `Restored ${topic.displayName} (${topic.id})`);
+    });
+
   const skillCommand = program
     .command('skill')
     .description('Install and maintain the packaged agent skill');
@@ -1834,6 +1970,7 @@ export function createCli(
     .requiredOption('--title <title>')
     .requiredOption('--body <body>')
     .option('--tag <tag>', 'repeatable', collect, [])
+    .option('--topic <id>', 'topic ID (repeatable)', collect, [])
     .option('--reply-to <post-id>')
     .action(
       async (
@@ -1843,6 +1980,7 @@ export function createCli(
           title: string;
           body: string;
           tag: string[];
+          topic: string[];
           replyTo?: string;
         },
         command: Command,
@@ -1856,6 +1994,7 @@ export function createCli(
               title: options.title,
               body: options.body,
               ...(options.tag.length ? { tags: options.tag } : {}),
+              ...(options.topic.length ? { topicIds: options.topic } : {}),
               ...(options.replyTo ? { replyTo: options.replyTo } : {}),
             }),
         );
@@ -2005,6 +2144,7 @@ export function createCli(
     .requiredOption('--title <title>')
     .requiredOption('--reason <reason>')
     .option('--tag <tag>', 'tag (repeatable)', collect, [])
+    .option('--topic <id>', 'topic ID (repeatable)', collect, [])
     .option('--evidence <kind:value>', 'sanitized evidence (repeatable)', collect, [])
     .option('--visibility <visibility>', 'private, local, or public', 'workspace')
     .option('--idempotency-key <key>')
@@ -2018,6 +2158,7 @@ export function createCli(
           title: string;
           reason: string;
           tag: string[];
+          topic: string[];
           evidence: string[];
           visibility: 'private' | 'workspace' | 'public';
           idempotencyKey?: string;
@@ -2035,6 +2176,7 @@ export function createCli(
               reason: options.reason,
               visibility: options.visibility,
               ...(options.tag.length ? { tags: options.tag } : {}),
+              ...(options.topic.length ? { topicIds: options.topic } : {}),
               ...(options.evidence.length ? { evidence: options.evidence.map(parseEvidence) } : {}),
               ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
             }),
@@ -2113,6 +2255,7 @@ export function createCli(
     .option('--participant <agent>')
     .option('--actor <id>')
     .option('--tag <tag>')
+    .option('--topic <id>', 'only records carrying this topic')
     .option('--status <status>')
     .option('--visibility <visibility>', 'private, workspace, or public')
     .option('--limit <number>', 'maximum results (default 10, maximum 50)', '10')
@@ -2177,6 +2320,7 @@ export function createCli(
     .requiredOption('--subject <subject>')
     .requiredOption('--body <body>')
     .option('--tag <tag>', 'tag (repeatable)', collect, [])
+    .option('--topic <id>', 'topic ID (repeatable)', collect, [])
     .option('--visibility <visibility>', 'private, workspace, or public', 'workspace')
     .option('--idempotency-key <key>')
     .action(
@@ -2189,6 +2333,7 @@ export function createCli(
           subject: string;
           body: string;
           tag: string[];
+          topic: string[];
           visibility: 'private' | 'workspace' | 'public';
           idempotencyKey?: string;
         },
@@ -2205,6 +2350,7 @@ export function createCli(
               body: options.body,
               visibility: options.visibility,
               ...(options.tag.length ? { tags: options.tag } : {}),
+              ...(options.topic.length ? { topicIds: options.topic } : {}),
               ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
             }),
         );
@@ -2296,6 +2442,7 @@ export function createCli(
     .requiredOption('--title <title>')
     .requiredOption('--body <body>')
     .option('--tag <tag>', 'tag (repeatable)', collect, [])
+    .option('--topic <id>', 'topic ID (repeatable)', collect, [])
     .option('--idempotency-key <key>')
     .action(
       async (
@@ -2306,6 +2453,7 @@ export function createCli(
           title: string;
           body: string;
           tag: string[];
+          topic: string[];
           idempotencyKey?: string;
         },
         command: Command,
@@ -2320,6 +2468,7 @@ export function createCli(
               title: options.title,
               body: options.body,
               ...(options.tag.length ? { tags: options.tag } : {}),
+              ...(options.topic.length ? { topicIds: options.topic } : {}),
               ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
             }),
         );
@@ -2447,6 +2596,7 @@ export function createCli(
     .option('--due-at <datetime>')
     .option('--time-zone <iana-zone>')
     .option('--tag <tag>', 'tag (repeatable)', collect, [])
+    .option('--topic <id>', 'topic ID (repeatable)', collect, [])
     .option('--idempotency-key <key>')
     .action(
       async (
@@ -2460,6 +2610,7 @@ export function createCli(
           dueAt?: string;
           timeZone?: string;
           tag: string[];
+          topic: string[];
           idempotencyKey?: string;
         },
         command: Command,
@@ -2475,6 +2626,7 @@ export function createCli(
               priority: Number(options.priority) as 1 | 2 | 3 | 4,
               ...((due) => (due ? { due } : {}))(taskDue(options)),
               ...(options.tag.length ? { tags: options.tag } : {}),
+              ...(options.topic.length ? { topicIds: options.topic } : {}),
               ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
             }),
         );
@@ -2600,6 +2752,7 @@ export function createCli(
     .option('--due-at <datetime>')
     .option('--time-zone <iana-zone>')
     .option('--tag <tag>', 'tag (repeatable)', collect, [])
+    .option('--topic <id>', 'topic ID (repeatable)', collect, [])
     .option('--visibility <visibility>', 'private, workspace, or public', 'workspace')
     .option('--idempotency-key <key>')
     .action(
@@ -2615,6 +2768,7 @@ export function createCli(
           dueAt?: string;
           timeZone?: string;
           tag: string[];
+          topic: string[];
           visibility: 'private' | 'workspace' | 'public';
           idempotencyKey?: string;
         },
@@ -2632,6 +2786,7 @@ export function createCli(
               priority: Number(options.priority) as 1 | 2 | 3 | 4,
               ...((due) => (due ? { due } : {}))(taskDue(options)),
               ...(options.tag.length ? { tags: options.tag } : {}),
+              ...(options.topic.length ? { topicIds: options.topic } : {}),
               visibility: options.visibility,
               ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
             }),
