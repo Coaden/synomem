@@ -612,7 +612,10 @@ export class SynomemCore implements SynomemDomainService {
     await this.repository.assertEventCompatibility();
     const parsed = this.validate(() => createTopicSchema.parse(input));
     if (await this.repository.getTopic(parsed.displayName)) {
-      throw new SynomemError('TOPIC_EXISTS', `Topic or alias already exists: ${parsed.displayName}`);
+      throw new SynomemError(
+        'TOPIC_EXISTS',
+        `Topic or alias already exists: ${parsed.displayName}`,
+      );
     }
     const aliases = [...new Set(parsed.aliases ?? [])].sort();
     for (const alias of aliases) {

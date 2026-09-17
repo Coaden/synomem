@@ -1496,26 +1496,19 @@ export function createCli(
     .command('create <display-name>')
     .description('Create a topic. Any actor may create one.')
     .option('--alias <name>', 'alias (repeatable)', collect, [])
-    .action(
-      async (displayName: string, options: { alias: string[] }, command: Command) => {
-        const global = globals(command);
-        const topic = await withClient(
-          global.home,
-          defaultActor(env, 'system', 'cli', global.actor),
-          (client) =>
-            client.topics.create({
-              displayName,
-              ...(options.alias.length ? { aliases: options.alias } : {}),
-            }),
-        );
-        output(
-          io,
-          global.json,
-          topic,
-          `Created ${topic.displayName}\n\nTopic ID: ${topic.id}`,
-        );
-      },
-    );
+    .action(async (displayName: string, options: { alias: string[] }, command: Command) => {
+      const global = globals(command);
+      const topic = await withClient(
+        global.home,
+        defaultActor(env, 'system', 'cli', global.actor),
+        (client) =>
+          client.topics.create({
+            displayName,
+            ...(options.alias.length ? { aliases: options.alias } : {}),
+          }),
+      );
+      output(io, global.json, topic, `Created ${topic.displayName}\n\nTopic ID: ${topic.id}`);
+    });
 
   topicCommand
     .command('list')
@@ -1584,7 +1577,7 @@ export function createCli(
 
   topicCommand
     .command('rename <id> <display-name>')
-    .description('Change a topic\'s display name. Its ID never changes.')
+    .description("Change a topic's display name. Its ID never changes.")
     .action(async (id: string, displayName: string, _options, command: Command) => {
       const global = globals(command);
       const topic = await withClient(
@@ -1592,7 +1585,12 @@ export function createCli(
         defaultActor(env, 'system', 'cli', global.actor),
         (client) => client.topics.update(id, { displayName }),
       );
-      output(io, global.json, topic, `Renamed to ${topic.displayName}\nTopic ID: ${topic.id} (unchanged)`);
+      output(
+        io,
+        global.json,
+        topic,
+        `Renamed to ${topic.displayName}\nTopic ID: ${topic.id} (unchanged)`,
+      );
     });
 
   topicCommand

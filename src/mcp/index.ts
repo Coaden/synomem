@@ -582,7 +582,7 @@ export async function createSynomemMcpServer(
     {
       title: 'Rename a topic or change its aliases',
       description:
-        'Rename a topic or replace its aliases without changing its ID — every record already filed under it stays filed under it. Only the topic\'s creator or an administrator may do this.',
+        "Rename a topic or replace its aliases without changing its ID — every record already filed under it stays filed under it. Only the topic's creator or an administrator may do this.",
       inputSchema: z.object({
         idOrAlias: z.string().min(1).describe('A topic ID or alias, in any casing.'),
         displayName: topicNameSchema.optional(),
@@ -652,7 +652,7 @@ export async function createSynomemMcpServer(
     {
       title: 'Archive a topic',
       description:
-        'Archive a topic so it can no longer be attached to new records; records already carrying it keep it. Only the topic\'s creator or an administrator may do this.',
+        "Archive a topic so it can no longer be attached to new records; records already carrying it keep it. Only the topic's creator or an administrator may do this.",
       inputSchema: z.object({
         idOrAlias: z.string().min(1).describe('A topic ID or alias, in any casing.'),
       }),

@@ -1936,13 +1936,13 @@ export class SynomemStorage implements SynomemRepository {
   }
 
   listTopics(status?: 'active' | 'archived'): Topic[] {
-    const rows = (
-      status
-        ? this.db()
-            .prepare('SELECT * FROM topics WHERE status = ? ORDER BY display_name ASC')
-            .all(status)
-        : this.db().prepare('SELECT * FROM topics ORDER BY display_name ASC').all()
-    ) as unknown as TopicRow[];
+    const rows = (status
+      ? this.db()
+          .prepare('SELECT * FROM topics WHERE status = ? ORDER BY display_name ASC')
+          .all(status)
+      : this.db()
+          .prepare('SELECT * FROM topics ORDER BY display_name ASC')
+          .all()) as unknown as TopicRow[];
     return rows.map((row) => this.topicFromRow(row));
   }
 

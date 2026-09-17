@@ -508,7 +508,14 @@ export interface NoteRecord {
   event: NoteCreatedEvent;
   revision?: NoteRevisedEvent;
   archived?: NoteArchivedEvent;
-  current: { title: string; body: string; tags: string[]; topicIds: string[]; visibility: Visibility; version: number };
+  current: {
+    title: string;
+    body: string;
+    tags: string[];
+    topicIds: string[];
+    visibility: Visibility;
+    version: number;
+  };
   status: 'active' | 'archived';
 }
 /**

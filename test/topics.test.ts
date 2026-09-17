@@ -78,9 +78,7 @@ describe('topics', () => {
       title: 'File under two topics',
       topicIds: [synomem.id, docMatching.id],
     });
-    expect(todo.record.event.topicIds?.slice().sort()).toEqual(
-      [synomem.id, docMatching.id].sort(),
-    );
+    expect(todo.record.event.topicIds?.slice().sort()).toEqual([synomem.id, docMatching.id].sort());
 
     const note = await gracie.notes.create({
       title: 'Synomem note',
