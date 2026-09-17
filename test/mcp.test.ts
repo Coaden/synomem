@@ -85,6 +85,12 @@ describe('MCP protocol integration', () => {
         'synomem_agent_archive',
         'synomem_agent_restore',
         'synomem_agent_list',
+        'synomem_topic_create',
+        'synomem_topic_update',
+        'synomem_topic_list',
+        'synomem_topic_resolve',
+        'synomem_topic_archive',
+        'synomem_topic_restore',
         'synomem_rebuild',
         'synomem_doctor',
       ]),
@@ -404,5 +410,41 @@ describe('MCP protocol integration', () => {
     });
     await mycroft.protocolClient.close();
     await mycroft.runtime.client.close();
+  });
+
+  it('creates a topic, resolves it by alias, and files a todo under it through the protocol', async () => {
+    const home = tempHome();
+    const { runtime, protocolClient } = await setupRuntime(home);
+
+    const created = await protocolClient.callTool({
+      name: 'synomem_topic_create',
+      arguments: { displayName: 'Synomem', aliases: ['syno'] },
+    });
+    expect(created.isError).not.toBe(true);
+    const topicId = (created.structuredContent as { data: { topic: { id: string } } }).data.topic
+      .id;
+
+    const resolved = await protocolClient.callTool({
+      name: 'synomem_topic_resolve',
+      arguments: { query: 'SYNO' },
+    });
+    expect(resolved.structuredContent).toMatchObject({ data: { match: { id: topicId } } });
+
+    const todo = await protocolClient.callTool({
+      name: 'synomem_todo_create',
+      arguments: { title: 'File under Synomem', topicIds: [topicId] },
+    });
+    expect(todo.isError).not.toBe(true);
+
+    const filtered = await protocolClient.callTool({
+      name: 'synomem_list',
+      arguments: { kinds: ['todo'], topicId },
+    });
+    expect(
+      (filtered.structuredContent as { data: { items: Array<{ title: string }> } }).data.items,
+    ).toHaveLength(1);
+
+    await protocolClient.close();
+    await runtime.client.close();
   });
 });

@@ -19,6 +19,8 @@ import {
   sendMemoSchema,
   updateTaskSchema,
   updateTodoSchema,
+  topicNameSchema,
+  topicAliasSchema,
 } from '../schemas.js';
 import { packageVersion } from '../version.js';
 import type { SynomemService, SynomemServiceFactory } from '../service.js';
@@ -132,7 +134,7 @@ export async function createSynomemMcpServer(
     { name: 'synomem', version: packageVersion() },
     {
       instructions:
-        'Use Synomem for durable kudos, memos, notes, posts, tasks, and todos. Pick by who the record is for: a task is work assigned to another agent, which they must accept; a todo is your own private reminder that no other agent can see or assign (the human administrator can still see it in the Synomem dashboard); a post tells everyone in the workspace something and records who acknowledged it. Store only necessary, factual content; never secrets or raw sensitive tool output. The server binds every write to its configured actor.',
+        'Use Synomem for durable kudos, memos, notes, posts, tasks, and todos. Pick by who the record is for: a task is work assigned to another agent, which they must accept; a todo is your own private reminder that no other agent can see or assign (the human administrator can still see it in the Synomem dashboard); a post tells everyone in the workspace something and records who acknowledged it. Any record may also carry topicIds — synomem_topic_resolve or synomem_topic_list first, synomem_topic_create only if none already fits — for a stable cross-kind subject (like "Synomem" itself) that tags cannot give, since a tag is a loose free-text label with no identity of its own. Store only necessary, factual content; never secrets or raw sensitive tool output. The server binds every write to its configured actor.',
     },
   );
 
@@ -546,6 +548,143 @@ export async function createSynomemMcpServer(
       try {
         const entries = await client.agents.directory();
         return success(actor, `Found ${entries.length} agent identity or identities.`, { entries });
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
+    'synomem_topic_create',
+    {
+      title: 'Create a topic',
+      description:
+        'Create a controlled, reusable subject records can be filed under — a stable ID, one canonical display name, and optional aliases, distinct from a free-text tag. Any actor may create one. Use synomem_topic_resolve first to check whether the topic you mean already exists, so "Synomem" is not created twice under two different IDs.',
+      inputSchema: z.object({
+        displayName: topicNameSchema,
+        aliases: z.array(topicAliasSchema).max(20).optional(),
+      }),
+      outputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    async (input) => {
+      try {
+        const topic = await client.topics.create(input);
+        return success(actor, `Created topic "${topic.displayName}" (ID ${topic.id}).`, { topic });
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
+    'synomem_topic_update',
+    {
+      title: 'Rename a topic or change its aliases',
+      description:
+        'Rename a topic or replace its aliases without changing its ID — every record already filed under it stays filed under it. Only the topic\'s creator or an administrator may do this.',
+      inputSchema: z.object({
+        idOrAlias: z.string().min(1).describe('A topic ID or alias, in any casing.'),
+        displayName: topicNameSchema.optional(),
+        aliases: z.array(topicAliasSchema).max(20).optional(),
+      }),
+      outputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    async ({ idOrAlias, ...changes }) => {
+      try {
+        const topic = await client.topics.update(idOrAlias, changes);
+        return success(actor, `Updated topic "${topic.displayName}" (ID ${topic.id}).`, { topic });
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
+    'synomem_topic_list',
+    {
+      title: 'List topics',
+      description: 'List known topics. This is read-only.',
+      inputSchema: z.object({ status: z.enum(['active', 'archived']).optional() }),
+      outputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    },
+    async (input) => {
+      try {
+        const topics = await client.topics.list(input);
+        return success(actor, `Found ${topics.length} topic(s).`, { topics });
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
+    'synomem_topic_resolve',
+    {
+      title: 'Resolve a topic name',
+      description:
+        'Resolve a name or alias to exactly one topic. Matching ignores case. When several topics answer to the name, no match is returned and the candidates are listed instead — ask which one is meant, or use synomem_topic_create only once neither the name nor an alias already exists.',
+      inputSchema: z.object({
+        query: z.string().min(1).describe('A topic ID or alias, in any casing.'),
+      }),
+      outputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ query }) => {
+      try {
+        const resolution = await client.topics.resolve(query);
+        const message = resolution.match
+          ? `"${resolution.query}" resolves to ${resolution.match.id}.`
+          : resolution.candidates.length
+            ? `"${resolution.query}" is ambiguous across ${resolution.candidates.length} topics. Ask which one is meant.`
+            : `No topic answers to "${resolution.query}".`;
+        return success(actor, message, resolution);
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
+    'synomem_topic_archive',
+    {
+      title: 'Archive a topic',
+      description:
+        'Archive a topic so it can no longer be attached to new records; records already carrying it keep it. Only the topic\'s creator or an administrator may do this.',
+      inputSchema: z.object({
+        idOrAlias: z.string().min(1).describe('A topic ID or alias, in any casing.'),
+      }),
+      outputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ idOrAlias }) => {
+      try {
+        const topic = await client.topics.archive(idOrAlias);
+        return success(actor, `Archived topic "${topic.displayName}" (${topic.id}).`, { topic });
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
+    'synomem_topic_restore',
+    {
+      title: 'Restore an archived topic',
+      description:
+        'Let an archived topic be attached to new records again, using the same ID it always had.',
+      inputSchema: z.object({
+        idOrAlias: z.string().min(1).describe('A topic ID or alias, in any casing.'),
+      }),
+      outputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ idOrAlias }) => {
+      try {
+        const topic = await client.topics.restore(idOrAlias);
+        return success(actor, `Restored topic "${topic.displayName}" (${topic.id}).`, { topic });
       } catch (error) {
         return failure(actor, error);
       }

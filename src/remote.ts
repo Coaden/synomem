@@ -19,6 +19,9 @@ import type {
   UpdateTaskInput,
   UpdateTodoInput,
   CreateTodoInput,
+  CreateTopicInput,
+  UpdateTopicInput,
+  TopicListInput,
 } from './types.js';
 
 const defaultMaximumResponseBytes = 1024 * 1024;
@@ -237,6 +240,48 @@ export class RemoteSynomemService implements SynomemService {
       this.request<Awaited<ReturnType<SynomemService['agents']['unbindRuntime']>>>(
         'DELETE',
         `agents/runtimes/${encodeURIComponent(bindingId)}`,
+      ),
+  };
+
+  readonly topics = {
+    create: (input: CreateTopicInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['topics']['create']>>>(
+        'POST',
+        'topics',
+        input,
+      ),
+    update: (idOrAlias: string, changes: UpdateTopicInput) =>
+      this.mutation<Awaited<ReturnType<SynomemService['topics']['update']>>>(
+        'PATCH',
+        `topics/${encodeURIComponent(idOrAlias)}`,
+        changes,
+      ),
+    get: (idOrAlias: string) =>
+      this.request<Awaited<ReturnType<SynomemService['topics']['get']>>>(
+        'GET',
+        `topics/${encodeURIComponent(idOrAlias)}`,
+      ),
+    list: (input: TopicListInput = {}) =>
+      this.request<Awaited<ReturnType<SynomemService['topics']['list']>>>(
+        'GET',
+        `topics${queryString(input)}`,
+      ),
+    resolve: (query: string) =>
+      this.request<Awaited<ReturnType<SynomemService['topics']['resolve']>>>(
+        'GET',
+        `topics/resolve?query=${encodeURIComponent(query)}`,
+      ),
+    archive: (idOrAlias: string) =>
+      this.mutation<Awaited<ReturnType<SynomemService['topics']['archive']>>>(
+        'POST',
+        `topics/${encodeURIComponent(idOrAlias)}/archive`,
+        {},
+      ),
+    restore: (idOrAlias: string) =>
+      this.mutation<Awaited<ReturnType<SynomemService['topics']['restore']>>>(
+        'POST',
+        `topics/${encodeURIComponent(idOrAlias)}/restore`,
+        {},
       ),
   };
 

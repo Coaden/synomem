@@ -43,6 +43,11 @@ import type {
   UpdateAgentInput,
   UpdateTaskInput,
   UpdateTodoInput,
+  Topic,
+  CreateTopicInput,
+  UpdateTopicInput,
+  TopicListInput,
+  TopicResolution,
 } from './types.js';
 
 export interface SynomemServiceCapabilities {
@@ -89,6 +94,19 @@ export interface SynomemDomainService {
     bindings(idOrAlias: string): Promise<AgentRuntimeBinding[]>;
     bindRuntime(input: BindRuntimeInput): Promise<AgentRuntimeBinding>;
     unbindRuntime(bindingId: string): Promise<boolean>;
+  };
+  /**
+   * A controlled, reusable subject a record can be filed under — one
+   * canonical display name and a set of aliases, distinct from a tag.
+   */
+  readonly topics: {
+    create(input: CreateTopicInput): Promise<Topic>;
+    update(idOrAlias: string, changes: UpdateTopicInput): Promise<Topic>;
+    get(idOrAlias: string): Promise<Topic>;
+    list(input?: TopicListInput): Promise<Topic[]>;
+    resolve(query: string): Promise<TopicResolution>;
+    archive(idOrAlias: string): Promise<Topic>;
+    restore(idOrAlias: string): Promise<Topic>;
   };
   readonly posts: {
     create(input: CreatePostInput): Promise<{
