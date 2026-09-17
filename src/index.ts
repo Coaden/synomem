@@ -96,5 +96,13 @@ export {
   updateTaskSchema,
   updateTodoSchema,
   updateAgentSchema,
+  topicIdSchema,
+  topicAliasSchema,
+  topicNameSchema,
+  topicLookupSchema,
+  topicProfileSchema,
+  createTopicSchema,
+  updateTopicSchema,
+  topicListInputSchema,
 } from './schemas.js';
 export type * from './types.js';
