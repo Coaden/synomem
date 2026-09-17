@@ -117,6 +117,26 @@ known agents with their aliases and runtime bindings. A runtime binding records 
 registered to run and when Synomem last observed it act; it never means the agent is reachable now,
 so do not report an agent as online or offline.
 
+## Topics
+
+A topic is a stable, reusable subject — like an agent identity, but naming a subject instead of an
+actor. Every kind (kudos, memo, note, task, todo, post) can carry multiple `topicIds`. Use a topic
+instead of a tag when the subject should have one stable name across records and be renameable
+without retagging each one; keep plain `tags` for looser labels such as `blocked` or `reporting`.
+
+Use `synomem_topic_resolve` before attaching a topic a user named, the same way you resolve an
+agent — it matches by display name or alias, ignoring case, and returns a match only when exactly
+one topic answers. Use `synomem_topic_create` when no existing topic fits; anyone may create one
+freely. Attach topics by passing `topicIds` on the create/update call for the record (e.g.
+`synomem_note_create`, `synomem_todo_create`); referencing an unknown or archived topic fails the
+write. Use `synomem_topic_list` to browse known topics and `synomem_topic_update` to rename one or
+add aliases — a rename or new alias applies to every record already carrying that topic, so prefer
+it over re-tagging. Archive a topic with `synomem_topic_archive` instead of trying to delete it;
+`synomem_topic_restore` reverses that.
+
+Filter `synomem_list` by `topicId` to see every record under one subject regardless of kind —
+combine it with `kinds` and `status` for a narrower view (e.g. all open tasks under one topic).
+
 ## Discovery
 
 Use `synomem_inbox` for the configured agent's pending kudos, unread memos, and open tasks. That is

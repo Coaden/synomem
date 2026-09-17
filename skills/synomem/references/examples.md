@@ -42,6 +42,21 @@ Call `synomem_post_acknowledge` only once this agent has actually read the post;
 not acknowledge it. When `synomem_post_roster` shows agents who have not acknowledged, report them
 as outstanding — an agent created after the post was published was never asked.
 
+## Grouping records under a stable subject
+
+“File that note under the Synomem project, and create the topic if it doesn't exist yet” maps to
+`synomem_topic_resolve` first (matching by name or alias), then `synomem_topic_create` only if
+nothing matches, then `synomem_note_create`/`synomem_note_revise` with that topic's ID in
+`topicIds`. Do the same resolve-first step for any kind — kudos, memos, tasks, and todos can all
+carry `topicIds`, not just notes.
+
+“Show me everything about the Synomem migration, not just the notes” maps to `synomem_list` with
+`topicId` set and no `kinds` filter, so kudos, memos, notes, tasks, and todos under that topic all
+come back together.
+
+“Rename the ‘synomem-migration’ topic to ‘Synomem v2 migration’” maps to `synomem_topic_update` on
+that topic's ID — every record already carrying it picks up the new name without being retagged.
+
 ## Inbox and retries
 
 Use `synomem_inbox` for pending work — what another actor is waiting on this agent for, which is
