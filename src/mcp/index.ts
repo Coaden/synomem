@@ -762,7 +762,7 @@ export async function createSynomemMcpServer(
     {
       title: 'List workspaces',
       description:
-        'List every workspace this credential\'s account belongs to, and which are addressable right now. A human session authorizes an organization, not permanently one workspace: any workspace with addressableWithThisToken true can be reached immediately with synomem_workspace_use, no reconnection needed. Only available on a hosted Synomem Cloud backend.',
+        "List every workspace this credential's account belongs to, and which are addressable right now. A human session authorizes an organization, not permanently one workspace: any workspace with addressableWithThisToken true can be reached immediately with synomem_workspace_use, no reconnection needed. Only available on a hosted Synomem Cloud backend.",
       inputSchema: z.object({}),
       outputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },

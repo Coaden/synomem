@@ -766,8 +766,18 @@ describe('CLI', () => {
         return {
           workspaceId: 'ws-current',
           workspaces: [
-            { id: 'ws-current', displayName: 'Current', roles: ['owner'], addressableWithThisToken: true },
-            { id: 'ws-other', displayName: 'Other', roles: ['member'], addressableWithThisToken: true },
+            {
+              id: 'ws-current',
+              displayName: 'Current',
+              roles: ['owner'],
+              addressableWithThisToken: true,
+            },
+            {
+              id: 'ws-other',
+              displayName: 'Other',
+              roles: ['member'],
+              addressableWithThisToken: true,
+            },
             {
               id: 'ws-unreachable',
               displayName: 'Elsewhere',
@@ -801,7 +811,9 @@ describe('CLI', () => {
       'ws-unreachable',
     ]);
     const humanReadable = await invoke(['remote', 'workspace', 'list']);
-    expect(humanReadable).toContain('ws-unreachable  Elsewhere  (not reachable with this credential)');
+    expect(humanReadable).toContain(
+      'ws-unreachable  Elsewhere  (not reachable with this credential)',
+    );
     expect(humanReadable).not.toContain('ws-current  Current  (not reachable');
 
     // Deprecated alias, still working.

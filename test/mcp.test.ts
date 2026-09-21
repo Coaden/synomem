@@ -149,9 +149,7 @@ describe('MCP protocol integration', () => {
       arguments: { workspaceId: 'ws-elsewhere' },
     });
     expect(use.isError).toBe(true);
-    expect((use.structuredContent as { errorCode?: string }).errorCode).toBe(
-      'UNSUPPORTED_BACKEND',
-    );
+    expect((use.structuredContent as { errorCode?: string }).errorCode).toBe('UNSUPPORTED_BACKEND');
 
     await protocolClient.close();
     await runtime.client.close();
@@ -171,7 +169,11 @@ describe('MCP protocol integration', () => {
     const otherAdmin = await testClient(otherHome);
     await otherAdmin.agents.create({ handle: 'gracie', displayName: 'Gracie' });
     await otherAdmin.close();
-    const other = await testClient(otherHome, { kind: 'agent', id: 'gracie', displayName: 'Gracie' });
+    const other = await testClient(otherHome, {
+      kind: 'agent',
+      id: 'gracie',
+      displayName: 'Gracie',
+    });
     await other.notes.create({ title: 'Only in the other workspace', body: 'x' });
     await other.close();
 
@@ -196,8 +198,8 @@ describe('MCP protocol integration', () => {
     const before = await protocolClient.callTool({ name: 'synomem_list', arguments: {} });
     expect(before.isError).toBeFalsy();
     const beforeNotes = (
-      (before.structuredContent as { data: { items: Array<{ title: string }> } }).data.items
-    ).map((item) => item.title);
+      before.structuredContent as { data: { items: Array<{ title: string }> } }
+    ).data.items.map((item) => item.title);
     expect(beforeNotes).not.toContain('Only in the other workspace');
 
     const switched = await protocolClient.callTool({
@@ -211,8 +213,8 @@ describe('MCP protocol integration', () => {
     // reassigns the one client/actor closure every tool handler shares.
     const after = await protocolClient.callTool({ name: 'synomem_list', arguments: {} });
     const afterNotes = (
-      (after.structuredContent as { data: { items: Array<{ title: string }> } }).data.items
-    ).map((item) => item.title);
+      after.structuredContent as { data: { items: Array<{ title: string }> } }
+    ).data.items.map((item) => item.title);
     expect(afterNotes).toContain('Only in the other workspace');
 
     await protocolClient.close();

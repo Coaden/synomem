@@ -625,7 +625,9 @@ export function createCli(
             .map(
               (workspace) =>
                 `${workspace.id}  ${workspace.displayName}` +
-                (workspace.addressableWithThisToken ? '' : '  (not reachable with this credential)'),
+                (workspace.addressableWithThisToken
+                  ? ''
+                  : '  (not reachable with this credential)'),
             )
             .join('\n')
         : 'This credential belongs to no workspaces yet.';
@@ -681,7 +683,9 @@ export function createCli(
             .map(
               (workspace) =>
                 `${workspace.id}  ${workspace.displayName}` +
-                (workspace.addressableWithThisToken ? '' : '  (not reachable with this credential)'),
+                (workspace.addressableWithThisToken
+                  ? ''
+                  : '  (not reachable with this credential)'),
             )
             .join('\n')
         : 'This credential belongs to no workspaces yet.';
