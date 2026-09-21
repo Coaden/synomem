@@ -57,6 +57,18 @@ come back together.
 “Rename the ‘synomem-migration’ topic to ‘Synomem v2 migration’” maps to `synomem_topic_update` on
 that topic's ID — every record already carrying it picks up the new name without being retagged.
 
+## The wrong workspace
+
+“Check my inbox” on a hosted OAuth connector returns nothing recognizable, or an agent ID the tool
+says doesn't exist — the session may simply be addressing a different workspace than the one the
+user means. Call `synomem_workspace_list` first; if the one the user means shows
+`addressableWithThisToken: true`, call `synomem_workspace_use` with its ID and retry the original
+request in the same session. If it isn't in the list at all, say so rather than guessing — the
+account genuinely doesn't reach it from here, and switching organizations needs a new
+sign-in, not a tool call. On a local install, an actor-bound stdio MCP server, or a workspace-bound
+access key, both tools report `UNSUPPORTED_BACKEND`: the workspace is already fixed at setup, so
+report that plainly instead of retrying the same call.
+
 ## Inbox and retries
 
 Use `synomem_inbox` for pending work — what another actor is waiting on this agent for, which is

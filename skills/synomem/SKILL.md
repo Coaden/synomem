@@ -137,6 +137,29 @@ it over re-tagging. Archive a topic with `synomem_topic_archive` instead of tryi
 Filter `synomem_list` by `topicId` to see every record under one subject regardless of kind —
 combine it with `kinds` and `status` for a narrower view (e.g. all open tasks under one topic).
 
+## Workspaces
+
+A session addresses exactly one workspace at a time; every record read or written goes there. On a
+hosted Synomem Cloud session reached through an OAuth connector (ChatGPT, Claude Desktop, or
+similar), that workspace is whichever one was selected when the connection was authorized — not
+necessarily the one the user means right now, and a human-authorized session may belong to more
+than one workspace.
+
+Use `synomem_workspace_list` to see every workspace the signed-in account belongs to and which are
+reachable right now (`addressableWithThisToken: true`). Use `synomem_workspace_use` to switch to
+one of those — it takes effect immediately for the rest of this session, no reconnection and no new
+sign-in, but only ever within the account's own organization, never across organizations. If the
+user names a workspace that is not in the list, say so; do not guess or fall back to the current
+one silently.
+
+Both tools report `UNSUPPORTED_BACKEND` on a local install, an actor-bound stdio MCP server, or a
+member-owned access key — those already address one specific workspace by construction (a local
+install is configured for one at setup; an access key names its workspace on every request under
+the hood, invisibly to this skill), so there is nothing to list or switch. Reconfiguring which
+workspace one of those points at is a deliberate step for the human running it
+(`synomem backend use remote --workspace <id>` or `synomem remote workspace use <id>` at the CLI),
+not something this skill does on its own.
+
 ## Discovery
 
 Use `synomem_inbox` for the configured agent's pending kudos, unread memos, and open tasks. That is
