@@ -60,10 +60,16 @@ export {
 export type { ProjectConfig, ProjectSelection } from './project.js';
 export {
   discoverAccessKeyWorkspaces,
+  discoverIdentity,
   discoverOrganizations,
   workspaceChoices,
 } from './discover.js';
-export type { DiscoveredOrganization, DiscoveredWorkspace, DiscoveryOptions } from './discover.js';
+export type {
+  DiscoveredOrganization,
+  DiscoveredWorkspace,
+  DiscoveryOptions,
+  WorkspaceMembership,
+} from './discover.js';
 export { asSynomemError, errorCodes, SynomemError } from './errors.js';
 export {
   dueInstant,

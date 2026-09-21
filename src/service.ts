@@ -48,6 +48,7 @@ import type {
   UpdateTopicInput,
   TopicListInput,
   TopicResolution,
+  WorkspaceIdentity,
 } from './types.js';
 
 export interface SynomemServiceCapabilities {
@@ -244,6 +245,12 @@ export interface SynomemService extends SynomemDomainService {
   capabilities(): Promise<SynomemServiceCapabilities>;
   info(): Promise<SynomemServiceInfo>;
   getCanonicalEvent(id: string): Promise<SynomemEvent | undefined>;
+  /*
+   * Optional, because only a hosted Synomem Cloud backend has an
+   * organization with more than one workspace an account can belong to.
+   * Local SQLite has no membership model to report on.
+   */
+  workspaces?(): Promise<WorkspaceIdentity>;
 }
 
 export type SynomemServiceFactory = (options: SynomemClientOptions) => SynomemService;

@@ -91,6 +91,8 @@ describe('MCP protocol integration', () => {
         'synomem_topic_resolve',
         'synomem_topic_archive',
         'synomem_topic_restore',
+        'synomem_workspace_list',
+        'synomem_workspace_use',
         'synomem_rebuild',
         'synomem_doctor',
       ]),
@@ -130,6 +132,91 @@ describe('MCP protocol integration', () => {
     );
     await protocolClient.close();
     await runtime.client.close();
+  });
+
+  it('reports workspace tools as unsupported on the local backend, not a crash', async () => {
+    const home = tempHome();
+    const { runtime, protocolClient } = await setupRuntime(home);
+
+    const list = await protocolClient.callTool({ name: 'synomem_workspace_list', arguments: {} });
+    expect(list.isError).toBe(true);
+    expect((list.structuredContent as { errorCode?: string }).errorCode).toBe(
+      'UNSUPPORTED_BACKEND',
+    );
+
+    const use = await protocolClient.callTool({
+      name: 'synomem_workspace_use',
+      arguments: { workspaceId: 'ws-elsewhere' },
+    });
+    expect(use.isError).toBe(true);
+    expect((use.structuredContent as { errorCode?: string }).errorCode).toBe(
+      'UNSUPPORTED_BACKEND',
+    );
+
+    await protocolClient.close();
+    await runtime.client.close();
+  });
+
+  it('switches which workspace every subsequent tool call addresses, in the same session', async () => {
+    const home = tempHome();
+    const setup = await testClient(home);
+    await setup.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await setup.close();
+
+    // A second, independent local store stands in for "a different
+    // workspace" -- switchWorkspace only has to construct and init() a new
+    // SynomemService for the requested ID; what backend it happens to be is
+    // the caller's business, not this tool's.
+    const otherHome = tempHome();
+    const otherAdmin = await testClient(otherHome);
+    await otherAdmin.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await otherAdmin.close();
+    const other = await testClient(otherHome, { kind: 'agent', id: 'gracie', displayName: 'Gracie' });
+    await other.notes.create({ title: 'Only in the other workspace', body: 'x' });
+    await other.close();
+
+    const runtime = await createSynomemMcpServer({
+      home,
+      actor: { kind: 'agent', id: 'gracie', displayName: 'Gracie' },
+      switchWorkspace: async (workspaceId) => {
+        expect(workspaceId).toBe('ws-other');
+        return new SynomemClient({
+          home: otherHome,
+          actor: { kind: 'agent', id: 'gracie', displayName: 'Gracie' },
+        });
+      },
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const protocolClient = new Client({ name: 'synomem-test', version: '1.0.0' });
+    await Promise.all([
+      runtime.server.connect(serverTransport),
+      protocolClient.connect(clientTransport),
+    ]);
+
+    const before = await protocolClient.callTool({ name: 'synomem_list', arguments: {} });
+    expect(before.isError).toBeFalsy();
+    const beforeNotes = (
+      (before.structuredContent as { data: { items: Array<{ title: string }> } }).data.items
+    ).map((item) => item.title);
+    expect(beforeNotes).not.toContain('Only in the other workspace');
+
+    const switched = await protocolClient.callTool({
+      name: 'synomem_workspace_use',
+      arguments: { workspaceId: 'ws-other' },
+    });
+    expect(switched.isError).toBeFalsy();
+
+    // No new session, no reconnection -- the SAME already-open MCP session
+    // now sees the other workspace's data, because synomem_workspace_use
+    // reassigns the one client/actor closure every tool handler shares.
+    const after = await protocolClient.callTool({ name: 'synomem_list', arguments: {} });
+    const afterNotes = (
+      (after.structuredContent as { data: { items: Array<{ title: string }> } }).data.items
+    ).map((item) => item.title);
+    expect(afterNotes).toContain('Only in the other workspace');
+
+    await protocolClient.close();
+    await runtime.close();
   });
 
   it('advertises every tool schema without a self-referencing $ref/definitions pair', async () => {

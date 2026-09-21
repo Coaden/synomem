@@ -750,4 +750,81 @@ describe('CLI', () => {
     expect(renamed.id).toBe(topic.id);
     expect(renamed.displayName).toBe('Synomem Project');
   });
+
+  it('lists reachable workspaces via /v1/identity, not the control-plane-only /v1/me', async () => {
+    // `remote workspaces` used to call discoverOrganizations() -> GET /v1/me,
+    // a control-plane route gated by a service secret the CLI never holds --
+    // guaranteed 401 against the real hosted API. This asserts the fix calls
+    // discoverIdentity() instead, and that the deprecated alias still works.
+    const home = tempHome();
+    let calls = 0;
+    const dependencies = {
+      env: { SYNOMEM_ACCESS_TOKEN: 'test-token' } as NodeJS.ProcessEnv,
+      discoverIdentity: async (options: { baseUrl: string; accessToken: string }) => {
+        calls += 1;
+        expect(options.accessToken).toBe('test-token');
+        return {
+          workspaceId: 'ws-current',
+          workspaces: [
+            { id: 'ws-current', displayName: 'Current', roles: ['owner'], addressableWithThisToken: true },
+            { id: 'ws-other', displayName: 'Other', roles: ['member'], addressableWithThisToken: true },
+            {
+              id: 'ws-unreachable',
+              displayName: 'Elsewhere',
+              roles: ['member'],
+              addressableWithThisToken: false,
+            },
+          ],
+        };
+      },
+    };
+    const invoke = async (args: string[]) => {
+      const captured = capture();
+      const code = await runCli(
+        ['node', 'synomem', '--home', home, ...args],
+        captured.io,
+        undefined,
+        dependencies,
+      );
+      expect(code, captured.stderr.join('')).toBe(0);
+      return captured.stdout.join('');
+    };
+
+    const listed = JSON.parse(await invoke(['remote', 'workspace', 'list', '--json'])) as {
+      workspaceId: string;
+      workspaces: Array<{ id: string; addressableWithThisToken: boolean }>;
+    };
+    expect(listed.workspaceId).toBe('ws-current');
+    expect(listed.workspaces.map((workspace) => workspace.id)).toEqual([
+      'ws-current',
+      'ws-other',
+      'ws-unreachable',
+    ]);
+    const humanReadable = await invoke(['remote', 'workspace', 'list']);
+    expect(humanReadable).toContain('ws-unreachable  Elsewhere  (not reachable with this credential)');
+    expect(humanReadable).not.toContain('ws-current  Current  (not reachable');
+
+    // Deprecated alias, still working.
+    expect(await invoke(['remote', 'workspaces'])).toContain('ws-other  Other');
+    expect(calls).toBe(3);
+  });
+
+  it('switches which workspace a stored remote credential addresses with no re-authentication', async () => {
+    const home = tempHome();
+    const invoke = async (args: string[]) => {
+      const captured = capture();
+      const code = await runCli(['node', 'synomem', '--home', home, ...args], captured.io);
+      expect(code, captured.stderr.join('')).toBe(0);
+      return captured.stdout.join('');
+    };
+    await invoke(['backend', 'use', 'remote', '--workspace', 'ws-a']);
+    expect(JSON.parse(await invoke(['backend', 'show', '--json']))).toMatchObject({
+      backend: { kind: 'remote', workspaceId: 'ws-a' },
+    });
+
+    await invoke(['remote', 'workspace', 'use', 'ws-b']);
+    expect(JSON.parse(await invoke(['backend', 'show', '--json']))).toMatchObject({
+      backend: { kind: 'remote', workspaceId: 'ws-b' },
+    });
+  });
 });

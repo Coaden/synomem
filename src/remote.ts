@@ -3,6 +3,7 @@ import { asSynomemError, errorCodes, SynomemError, type SynomemErrorCode } from 
 import type { SynomemService, SynomemServiceCapabilities, SynomemServiceInfo } from './service.js';
 import type {
   ActorIdentity,
+  WorkspaceIdentity,
   ChangesInput,
   BindRuntimeInput,
   CreateAgentInput,
@@ -639,6 +640,10 @@ export class RemoteSynomemService implements SynomemService {
 
   async info(): Promise<SynomemServiceInfo> {
     return { backend: 'remote', baseUrl: this.baseUrl.href, workspaceId: this.workspaceId };
+  }
+
+  async workspaces(): Promise<WorkspaceIdentity> {
+    return this.request<WorkspaceIdentity>('GET', '../../identity');
   }
 
   getCanonicalEvent(id: string) {

@@ -23,9 +23,9 @@ import {
 } from './configure.js';
 import {
   discoverAccessKeyWorkspaces,
-  discoverOrganizations,
-  workspaceChoices,
+  discoverIdentity,
   type DiscoveredWorkspace,
+  type WorkspaceMembership,
 } from './discover.js';
 import { DEFAULT_WORKSPACE, listLocalWorkspaces, localWorkspaceHome } from './workspaces.js';
 import {
@@ -95,6 +95,11 @@ export interface CliDependencies {
     baseUrl: string;
     accessToken: string;
   }) => Promise<{ organizationId: string; workspaces: DiscoveredWorkspace[] }>;
+  /** Injected so `remote workspace list` can be tested without a network. */
+  discoverIdentity?: (options: {
+    baseUrl: string;
+    accessToken: string;
+  }) => Promise<{ workspaceId: string; workspaces: WorkspaceMembership[] }>;
   createImportBundle?: (home: string) => Promise<ImportBundle>;
   remoteImport?: (options: {
     baseUrl: string;
@@ -434,6 +439,7 @@ export function createCli(
   const oauthLogin = dependencies.oauthLogin ?? loginWithOAuth;
   const discoverWorkspaces =
     dependencies.discoverAccessKeyWorkspaces ?? discoverAccessKeyWorkspaces;
+  const discoverAccountIdentity = dependencies.discoverIdentity ?? discoverIdentity;
   const promptIo = dependencies.promptIo ?? defaultPromptIo();
   const verifyRemoteCredential =
     dependencies.verifyRemoteCredential ??
@@ -583,17 +589,22 @@ export function createCli(
 
   const remoteCommand = program.command('remote').description('Administer a remote workspace');
 
+  const remoteWorkspaceCommand = remoteCommand
+    .command('workspace')
+    .description('List or switch the workspace this credential addresses');
+
   /*
-   * The browser counterpart to `discoverAccessKeyWorkspaces` — same purpose,
-   * different credential: a signed-in account may reach several
-   * organizations, each with several workspaces, so there is a genuine choice
-   * to make, and no way to make it without seeing the list. Printing the IDs
-   * alongside the names is the point: the ID is what `backend use remote
-   * --workspace` takes.
+   * Every workspace this credential's account belongs to, and which are
+   * reachable right now with it — no new token needed for any workspace
+   * flagged reachable, since a human credential authorizes its whole
+   * organization, not permanently one workspace (see `workspace use`). Data
+   * plane (`/v1/identity`), not `/v1/me`: the latter is a first-party
+   * control-plane route gated by a service secret this CLI never holds, and
+   * would 401 unconditionally against the real hosted API.
    */
-  remoteCommand
-    .command('workspaces')
-    .description('List the organizations and workspaces this credential can reach')
+  remoteWorkspaceCommand
+    .command('list')
+    .description("List this credential's account's workspaces, and which are reachable now")
     .option('--url <url>', 'internal: alternate HTTPS origin')
     .action(async (options: { url?: string }, command: Command) => {
       const global = globals(command);
@@ -608,23 +619,73 @@ export function createCli(
           'Set SYNOMEM_ACCESS_TOKEN, or run `synomem auth login` first.',
         );
       }
-      const organizations = await discoverOrganizations({ baseUrl, accessToken });
-      const choices = workspaceChoices(organizations);
-      const human = organizations.length
-        ? organizations
-            .map((organization) =>
-              [
-                `${organization.displayName} (${organization.slug}) — ${organization.role}`,
-                ...(organization.workspaces.length
-                  ? organization.workspaces.map(
-                      (workspace) => `  ${workspace.id}  ${workspace.displayName}`,
-                    )
-                  : ['  (no workspaces yet)']),
-              ].join('\n'),
+      const identity = await discoverAccountIdentity({ baseUrl, accessToken });
+      const human = identity.workspaces.length
+        ? identity.workspaces
+            .map(
+              (workspace) =>
+                `${workspace.id}  ${workspace.displayName}` +
+                (workspace.addressableWithThisToken ? '' : '  (not reachable with this credential)'),
             )
             .join('\n')
-        : 'This account belongs to no organizations yet.';
-      output(io, global.json, { organizations, choices }, human);
+        : 'This credential belongs to no workspaces yet.';
+      output(io, global.json, identity, human);
+    });
+
+  /*
+   * A workspace flagged `addressableWithThisToken` by `workspace list` needs
+   * no new token or re-authentication — the credential already covers it.
+   * This only ever rewrites local config to point at it; see `backend use
+   * remote --workspace`, which this delegates to.
+   */
+  remoteWorkspaceCommand
+    .command('use <workspace-id>')
+    .description('Address a different workspace with the current remote credential')
+    .option('--url <url>', 'internal: alternate HTTPS origin')
+    .action((workspaceId: string, options: { url?: string }, command: Command) => {
+      const global = globals(command);
+      const config = writeSynomemBackend(
+        { kind: 'remote', baseUrl: options.url ?? cloudApiUrl(env), workspaceId },
+        global.home,
+      );
+      output(
+        io,
+        global.json,
+        { backend: config.backend },
+        `Now addressing workspace ${workspaceId}.`,
+      );
+    });
+
+  // Deprecated alias for `remote workspace list`, kept working rather than
+  // breaking anyone who already scripted the old name.
+  remoteCommand
+    .command('workspaces')
+    .description('Deprecated: use `remote workspace list`')
+    .option('--url <url>', 'internal: alternate HTTPS origin')
+    .action(async (options: { url?: string }, command: Command) => {
+      const global = globals(command);
+      const config = readSynomemConfig(global.home, env);
+      const baseUrl =
+        options.url ??
+        (config?.backend.kind === 'remote' ? config.backend.baseUrl : cloudApiUrl(env));
+      const accessToken = env.SYNOMEM_ACCESS_TOKEN;
+      if (!accessToken) {
+        throw new SynomemError(
+          'AUTH_REQUIRED',
+          'Set SYNOMEM_ACCESS_TOKEN, or run `synomem auth login` first.',
+        );
+      }
+      const identity = await discoverAccountIdentity({ baseUrl, accessToken });
+      const human = identity.workspaces.length
+        ? identity.workspaces
+            .map(
+              (workspace) =>
+                `${workspace.id}  ${workspace.displayName}` +
+                (workspace.addressableWithThisToken ? '' : '  (not reachable with this credential)'),
+            )
+            .join('\n')
+        : 'This credential belongs to no workspaces yet.';
+      output(io, global.json, identity, human);
     });
 
   remoteCommand

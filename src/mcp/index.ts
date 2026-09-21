@@ -28,6 +28,17 @@ import type { ActorIdentity, SynomemClientOptions, KudosRecord } from '../types.
 
 export interface SynomemMcpOptions extends Omit<SynomemClientOptions, 'actor'> {
   actor: ActorIdentity;
+  /**
+   * Lets a human session switch which workspace every subsequent tool call
+   * addresses, without a new MCP session — construct and return a new,
+   * already-`init()`-able client for the given workspace ID using this
+   * session's own credential (see `client.workspaces()`/`synomem_workspace_list`
+   * for which IDs are actually reachable). Only meaningful on a hosted
+   * backend that can build such a client (the HTTP MCP gateway supplies
+   * this; the local stdio server and CLI do not, so `synomem_workspace_use`
+   * reports the backend as unsupported there).
+   */
+  switchWorkspace?: (workspaceId: string) => Promise<SynomemService>;
 }
 
 const outputSchema = z.object({
@@ -119,7 +130,14 @@ export async function createSynomemMcpServer(
   serviceFactory: SynomemServiceFactory = configuredServiceFactory,
 ): Promise<SynomemMcpRuntime> {
   const requested = actorSchema.parse(options.actor);
-  const client = serviceFactory({ ...options, actor: requested });
+  /*
+   * `client` and `actor` are deliberately mutable (`let`, not `const`):
+   * every tool handler below is a closure defined in THIS scope, so
+   * reassigning either one here is immediately visible to every
+   * already-registered tool on its next invocation — no rebuild, no new MCP
+   * session. That is exactly what `synomem_workspace_use` below relies on.
+   */
+  let client = serviceFactory({ ...options, actor: requested });
   await client.init();
   /*
    * Every tool reports the CANONICAL actor, not the one that was asked for.
@@ -129,12 +147,12 @@ export async function createSynomemMcpServer(
    * one the events will actually carry. Reporting the requested name would let
    * a misconfigured runtime appear to be acting as somebody it is not.
    */
-  const actor = client.actor;
+  let actor = client.actor;
   const server = new McpServer(
     { name: 'synomem', version: packageVersion() },
     {
       instructions:
-        'Use Synomem for durable kudos, memos, notes, posts, tasks, and todos. Pick by who the record is for: a task is work assigned to another agent, which they must accept; a todo is your own private reminder that no other agent can see or assign (the human administrator can still see it in the Synomem dashboard); a post tells everyone in the workspace something and records who acknowledged it. Any record may also carry topicIds — synomem_topic_resolve or synomem_topic_list first, synomem_topic_create only if none already fits — for a stable cross-kind subject (like "Synomem" itself) that tags cannot give, since a tag is a loose free-text label with no identity of its own. Store only necessary, factual content; never secrets or raw sensitive tool output. The server binds every write to its configured actor.',
+        'Use Synomem for durable kudos, memos, notes, posts, tasks, and todos. Pick by who the record is for: a task is work assigned to another agent, which they must accept; a todo is your own private reminder that no other agent can see or assign (the human administrator can still see it in the Synomem dashboard); a post tells everyone in the workspace something and records who acknowledged it. Any record may also carry topicIds — synomem_topic_resolve or synomem_topic_list first, synomem_topic_create only if none already fits — for a stable cross-kind subject (like "Synomem" itself) that tags cannot give, since a tag is a loose free-text label with no identity of its own. A session addresses one workspace at a time; on a hosted backend, synomem_workspace_list shows every workspace this account belongs to and synomem_workspace_use switches to another one in the same organization immediately, no reconnection needed. Store only necessary, factual content; never secrets or raw sensitive tool output. The server binds every write to its configured actor.',
     },
   );
 
@@ -733,6 +751,71 @@ export async function createSynomemMcpServer(
         return success(actor, result.healthy ? 'Synomem is healthy.' : 'Synomem found problems.', {
           result,
         });
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
+    'synomem_workspace_list',
+    {
+      title: 'List workspaces',
+      description:
+        'List every workspace this credential\'s account belongs to, and which are addressable right now. A human session authorizes an organization, not permanently one workspace: any workspace with addressableWithThisToken true can be reached immediately with synomem_workspace_use, no reconnection needed. Only available on a hosted Synomem Cloud backend.',
+      inputSchema: z.object({}),
+      outputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    },
+    async () => {
+      try {
+        if (!client.workspaces) {
+          throw new SynomemError(
+            'UNSUPPORTED_BACKEND',
+            'Workspace listing is only available on a hosted Synomem Cloud backend.',
+          );
+        }
+        const identity = await client.workspaces();
+        return success(
+          actor,
+          `Found ${identity.workspaces.length} workspace(s); currently addressing "${identity.workspaceId}".`,
+          identity,
+        );
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+
+  server.registerTool(
+    'synomem_workspace_use',
+    {
+      title: 'Switch workspace',
+      description:
+        'Switch which workspace every subsequent tool call in this session addresses, to one this account is a member of in the same organization (see synomem_workspace_list for the ID). Takes effect immediately for this session; no reconnection needed. Only available on a hosted Synomem Cloud backend.',
+      inputSchema: z.object({
+        workspaceId: z.string().min(1).describe('A workspace ID from synomem_workspace_list.'),
+      }),
+      outputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ workspaceId }) => {
+      try {
+        if (!options.switchWorkspace) {
+          throw new SynomemError(
+            'UNSUPPORTED_BACKEND',
+            'Switching workspace is only available on a hosted Synomem Cloud backend.',
+          );
+        }
+        const next = await options.switchWorkspace(workspaceId);
+        await next.init();
+        client = next;
+        actor = next.actor;
+        return success(
+          actor,
+          `Switched to workspace "${workspaceId}". Every tool call from here addresses it.`,
+          { workspaceId },
+        );
       } catch (error) {
         return failure(actor, error);
       }

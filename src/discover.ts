@@ -33,6 +33,19 @@ export interface DiscoveredOrganization {
   workspaces: DiscoveredWorkspace[];
 }
 
+export interface WorkspaceMembership {
+  id: string;
+  displayName: string;
+  roles: string[];
+  /**
+   * Reachable right now, with this same credential, by naming it as
+   * Synomem-Workspace-Id — no new token or re-authentication. A human
+   * credential's own organization is the boundary; an agent credential has
+   * only ever one such entry, its own.
+   */
+  addressableWithThisToken: boolean;
+}
+
 export interface DiscoveryOptions {
   baseUrl: string;
   accessToken: string;
@@ -131,6 +144,23 @@ export async function discoverOrganizations(
     });
   }
   return organizations;
+}
+
+/**
+ * Every workspace this credential's account belongs to, and which are
+ * reachable right now without a new token — the data-plane counterpart to
+ * `discoverOrganizations`, and the one that actually works with an ordinary
+ * bearer token (OAuth or access key alike). `/v1/me` requires a first-party
+ * control-plane credential a CLI never holds; `/v1/identity` requires only
+ * the normal `synomem:read` scope every credential already has.
+ */
+export async function discoverIdentity(
+  options: DiscoveryOptions,
+): Promise<{ workspaceId: string; workspaces: WorkspaceMembership[] }> {
+  return await readJson<{ workspaceId: string; workspaces: WorkspaceMembership[] }>(
+    options,
+    'v1/identity',
+  );
 }
 
 /** Flattens discovery into the choices a person picks from. */

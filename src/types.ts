@@ -822,6 +822,27 @@ export interface DoctorResult {
   diagnostics: Diagnostic[];
 }
 /**
+ * Every workspace this credential's account belongs to, and which of them
+ * are reachable right now without a new token. A human actor's token
+ * authorizes an organization, not permanently one workspace: any
+ * `addressableWithThisToken: true` entry can be reached on the very next
+ * request by sending it as `Synomem-Workspace-Id` — no re-authentication.
+ * An agent-bound token has only ever one such entry, its own.
+ */
+export interface WorkspaceIdentity {
+  actor: ActorIdentity;
+  /** The workspace this credential currently addresses. */
+  workspaceId: string;
+  roles: string[];
+  scopes: string[];
+  workspaces: Array<{
+    id: string;
+    displayName: string;
+    roles: string[];
+    addressableWithThisToken: boolean;
+  }>;
+}
+/**
  * What the projected files on disk look like next to what they should be.
  *
  * Projections are derived, never canonical, so this reports drift rather than
