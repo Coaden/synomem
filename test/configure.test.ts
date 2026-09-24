@@ -1,308 +1,53 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
-import { PassThrough } from 'node:stream';
+import { Readable, Writable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import {
-  assertInteractive,
   credentialFingerprint,
   credentialStoreChoices,
-  environmentInstructions,
-  writeCredentialFile,
+  defaultCredentialBackend,
+  parseCredentialBackend,
+  readAccessKey,
 } from '../src/configure.js';
 import type { PromptIo } from '../src/prompt.js';
-import type { SynomemServiceFactory } from '../src/service.js';
-import { tempHome } from './helpers.js';
 
-function scriptedIo(lines: string[]): PromptIo & { written: string } {
-  const input = new PassThrough();
-  const output = new PassThrough();
-  let written = '';
-  output.on('data', (chunk: Buffer) => {
-    written += chunk.toString();
-  });
-  for (const line of lines) input.write(`${line}\n`);
-  input.end();
+function piped(input: string): PromptIo {
   return {
-    input,
-    output,
-    interactive: true,
-    get written() {
-      return written;
-    },
+    input: Readable.from([input]),
+    output: new Writable({ write: (_chunk, _encoding, done) => done() }),
+    interactive: false,
   };
 }
 
-describe('onboarding configuration', () => {
-  it('refuses to prompt when nobody is there, and says what to run instead', () => {
-    const io = { ...scriptedIo([]), interactive: false };
-    let message = '';
-    try {
-      assertInteractive(io);
-    } catch (error) {
-      message = (error as Error).message;
-    }
-    // A setup program that blocks forever on a pipe is worse than one that
-    // names the flags it needs.
-    expect(message).toContain('needs an interactive terminal');
-    expect(message).toContain('config init --backend local --yes');
-    expect(message).toContain('--access-token-stdin');
+describe('setup helpers', () => {
+  it('offers only stores that can read their credential back on each platform', () => {
+    expect(credentialStoreChoices('darwin').map((c) => c.value)).toEqual([
+      'keychain',
+      'file',
+      'environment',
+    ]);
+    expect(credentialStoreChoices('win32').map((c) => c.value)).toEqual(['file', 'environment']);
   });
 
-  it('stores an access key in a file only the owner can read', () => {
-    const home = tempHome();
-    const path = writeCredentialFile(home, 'syn_abcdef0123456789');
-
-    expect(path).toBe(join(home, 'credentials', 'installation.json'));
-    /*
-     * POSIX modes are a POSIX guarantee. On Windows `chmod` only toggles the
-     * read-only bit, so asserting 0600 there would be asserting something the
-     * platform cannot express -- and passing it off as protection the file does
-     * not have. What Windows does give is the user profile directory's own
-     * access control, which is why the credential lives under the Synomem home
-     * rather than anywhere shared.
-     */
-    if (process.platform === 'win32') {
-      expect(existsSync(path)).toBe(true);
-      expect(statSync(join(home, 'credentials')).isDirectory()).toBe(true);
-    } else {
-      expect(statSync(path).mode & 0o777).toBe(0o600);
-      expect(statSync(join(home, 'credentials')).mode & 0o777).toBe(0o700);
-    }
-
-    // Kept out of config.json so a configuration file can be shared without
-    // carrying a secret with it.
-    expect(existsSync(join(home, 'config.json'))).toBe(false);
-    const stored = JSON.parse(readFileSync(path, 'utf8')) as { accessToken: string };
-    expect(stored.accessToken).toBe('syn_abcdef0123456789');
-  });
-
-  it('identifies a credential by prefix and never in full', () => {
-    const token = 'syn_abcdef0123456789_secret_tail';
-    const shown = credentialFingerprint(token);
-    expect(token.startsWith(shown.replace('\u2026', ''))).toBe(true);
-    expect(shown).not.toContain('secret_tail');
-    expect(shown.length).toBeLessThan(token.length);
-  });
-
-  it('prints environment instructions rather than editing a shell profile', () => {
-    const text = environmentInstructions('syn_token');
-    expect(text).toContain("export SYNOMEM_ACCESS_TOKEN='syn_token'");
-    // Silently rewriting a dotfile is not a thing a setup program should do.
-    expect(text).toContain('will not edit your shell profile');
-  });
-
-  it('offers only credential stores that exist on the platform', () => {
-    expect(credentialStoreChoices('darwin')[0]?.label).toContain('Keychain');
-    // Windows Credential Manager is not implemented in the credential layer,
-    // so the wizard must not offer it: a choice that fails on first use is
-    // worse than a plainly second-best one.
-    expect(credentialStoreChoices('win32').map((choice) => choice.value)).not.toContain('keychain');
-    expect(credentialStoreChoices('win32')[0]?.value).toBe('file');
-    expect(credentialStoreChoices('linux')[0]?.label).toContain('Secret Service');
-    for (const platform of ['darwin', 'win32', 'linux'] as const) {
-      const values = credentialStoreChoices(platform).map((choice) => choice.value);
-      // A restricted file and printed instructions work everywhere, so a
-      // headless machine with no keyring is never left without an option.
-      expect(values).toContain('file');
-      expect(values).toContain('environment');
-      // And each option is offered exactly once, whichever is recommended.
-      expect(new Set(values).size).toBe(values.length);
-    }
-  });
-});
-
-/*
- * Remote setup used to ask a person to type `ws-04psqx2rkt8ttft7a1t2z69r97`
- * from memory. A member-owned access key can be asked which workspaces its
- * organization has instead — and, unlike the installation keys this replaced,
- * that can be more than one, or none yet.
- */
-describe('remote setup', () => {
-  /** A stub service so the closing diagnostics never reach the network. */
-  const stubFactory: SynomemServiceFactory = () =>
-    ({
-      init: async () => undefined,
-      close: async () => undefined,
-      doctor: async () => ({ healthy: true, diagnostics: [] }),
-    }) as unknown as ReturnType<SynomemServiceFactory>;
-
-  it('picks the workspace on its own when the key reaches only one', async () => {
-    const { runCli } = await import('../src/cli.js');
-    const home = tempHome();
-    const lines: string[] = [];
-    const io = { stdout: (t: string) => lines.push(t), stderr: (t: string) => lines.push(t) };
-
-    const discovered: string[] = [];
-    const code = await runCli(
-      [
-        'node',
-        'synomem',
-        '--home',
-        home,
-        'config',
-        'init',
-        '--backend',
-        'remote',
-        '--auth',
-        'access-key',
-        '--access-token-stdin',
-        '--credential-store',
-        'file',
-        '--yes',
-      ],
-      io,
-      stubFactory,
-      {
-        // Piped, not typed: `--access-token-stdin` reads the whole stream, so
-        // the key never becomes a shell-history entry or a process argument.
-        promptIo: { ...scriptedIo(['installation-key-secret']), interactive: false },
-        discoverAccessKeyWorkspaces: async ({ accessToken }) => {
-          discovered.push(accessToken);
-          return {
-            organizationId: 'org-1',
-            workspaces: [{ id: 'ws-04psqx2rkt8ttft7a1t2z69r97', displayName: 'Production' }],
-          };
-        },
-      },
+  it('defaults to the keychain and refuses to guess where none exists', () => {
+    expect(defaultCredentialBackend('darwin')).toBe('keychain');
+    expect(defaultCredentialBackend('linux')).toBe('keychain');
+    expect(() => defaultCredentialBackend('win32')).toThrowError(
+      expect.objectContaining({ code: 'CONFIG_INVALID' }),
     );
+    expect(parseCredentialBackend('file', 'win32')).toBe('file');
+    expect(() => parseCredentialBackend('plaintext')).toThrowError(
+      expect.objectContaining({ code: 'INVALID_INPUT' }),
+    );
+  });
 
-    expect(code).toBe(0);
-    // The key was what answered the question, and it never reached the output.
-    expect(discovered).toEqual(['installation-key-secret']);
-    const printed = lines.join('');
-    expect(printed).toContain('ws-04psqx2rkt8ttft7a1t2z69r97');
-    expect(printed).not.toContain('installation-key-secret');
-    expect(
-      JSON.parse(readFileSync(join(home, 'config.json'), 'utf8')) as {
-        backend: { kind: string; workspaceId: string };
-      },
-    ).toMatchObject({
-      backend: { kind: 'remote', workspaceId: 'ws-04psqx2rkt8ttft7a1t2z69r97' },
+  it('reads an access key from stdin and refuses anything that is not one', async () => {
+    await expect(readAccessKey(piped('syn_abc.def\n'))).resolves.toBe('syn_abc.def');
+    await expect(readAccessKey(piped(''))).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    await expect(readAccessKey(piped('ghp_notours'))).rejects.toMatchObject({
+      code: 'INVALID_INPUT',
     });
   });
 
-  it('refuses to guess when several workspaces exist and nobody can answer', async () => {
-    const { runCli } = await import('../src/cli.js');
-    const home = tempHome();
-    const lines: string[] = [];
-    const io = { stdout: (t: string) => lines.push(t), stderr: (t: string) => lines.push(t) };
-
-    const code = await runCli(
-      [
-        'node',
-        'synomem',
-        '--home',
-        home,
-        'config',
-        'init',
-        '--backend',
-        'remote',
-        '--auth',
-        'access-key',
-        '--access-token-stdin',
-        '--credential-store',
-        'file',
-        '--yes',
-      ],
-      io,
-      stubFactory,
-      {
-        promptIo: { ...scriptedIo(['secret-key']), interactive: false },
-        discoverAccessKeyWorkspaces: async () => ({
-          organizationId: 'org-1',
-          workspaces: [
-            { id: 'ws-1', displayName: 'Production' },
-            { id: 'ws-2', displayName: 'Staging' },
-          ],
-        }),
-      },
-    );
-
-    expect(code).not.toBe(0);
-    const printed = lines.join('');
-    expect(printed).toContain('--workspace <workspace-id>');
-    expect(printed).toContain('ws-1');
-    expect(printed).toContain('ws-2');
-  });
-
-  it('says plainly when the organization has no workspaces yet, rather than guessing', async () => {
-    const { runCli } = await import('../src/cli.js');
-    const home = tempHome();
-    const lines: string[] = [];
-    const io = { stdout: (t: string) => lines.push(t), stderr: (t: string) => lines.push(t) };
-
-    const code = await runCli(
-      [
-        'node',
-        'synomem',
-        '--home',
-        home,
-        'config',
-        'init',
-        '--backend',
-        'remote',
-        '--auth',
-        'access-key',
-        '--access-token-stdin',
-        '--credential-store',
-        'file',
-        '--yes',
-      ],
-      io,
-      stubFactory,
-      {
-        promptIo: { ...scriptedIo(['secret-key']), interactive: false },
-        discoverAccessKeyWorkspaces: async () => ({ organizationId: 'org-1', workspaces: [] }),
-      },
-    );
-
-    expect(code).not.toBe(0);
-    expect(lines.join('')).toContain('no workspaces yet');
-  });
-
-  it('still requires an explicit workspace when there is no key to ask', async () => {
-    const { runCli } = await import('../src/cli.js');
-    const lines: string[] = [];
-    const io = { stdout: (t: string) => lines.push(t), stderr: (t: string) => lines.push(t) };
-    expect(
-      await runCli(
-        ['node', 'synomem', '--home', tempHome(), 'config', 'init', '--backend', 'remote', '--yes'],
-        io,
-      ),
-    ).toBe(2);
-    expect(lines.join('')).toContain('--workspace');
-  });
-});
-
-describe('reset', () => {
-  it('names exact targets, and removes nothing until told', async () => {
-    const { runCli } = await import('../src/cli.js');
-    const home = tempHome();
-    const lines: string[] = [];
-    const io = { stdout: (t: string) => lines.push(t), stderr: (t: string) => lines.push(t) };
-
-    expect(
-      await runCli(
-        ['node', 'synomem', '--home', home, 'config', 'init', '--backend', 'local', '--yes'],
-        io,
-      ),
-    ).toBe(0);
-    const database = join(home, 'synomem.sqlite3');
-    expect(existsSync(database)).toBe(true);
-
-    lines.length = 0;
-    expect(await runCli(['node', 'synomem', '--home', home, 'reset'], io)).toBe(0);
-    const preview = lines.join('');
-    // Every target is shown before anything is touched, and nothing is
-    // derived from a variable that might be empty.
-    expect(preview).toContain(database);
-    expect(preview).toContain('Run with --yes to continue.');
-    expect(preview).toContain('Installed skills and MCP registrations are left alone.');
-    expect(existsSync(database)).toBe(true);
-
-    lines.length = 0;
-    expect(await runCli(['node', 'synomem', '--home', home, 'reset', '--yes'], io)).toBe(0);
-    expect(existsSync(database)).toBe(false);
-    expect(existsSync(join(home, 'config.json'))).toBe(false);
+  it('fingerprints a key without revealing it', () => {
+    expect(credentialFingerprint('syn_0123456789abcdef')).toBe('syn_01234567…');
   });
 });

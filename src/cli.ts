@@ -4,42 +4,30 @@ import { spawn } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Command, CommanderError, Option } from 'commander';
-import { configuredServiceFactory, readSynomemConfig, writeSynomemBackend } from './backend.js';
+import {
+  ensureLocalStore,
+  LOCAL_OPERATOR,
+  localStoreWorkspaceId,
+  openLocalService,
+} from './backend.js';
 import { cloudApiUrl } from './cloud.js';
 import { resolveHome } from './config.js';
 import {
   assertInteractive,
-  confirmPlan,
   credentialFingerprint,
-  credentialStoreChoices,
-  environmentInstructions,
-  readAccessToken,
-  runConfigWizard,
-  writeCredentialFile,
-  type AuthChoice,
-  type BackendChoice,
-  type ConfigPlan,
-  type CredentialStoreChoice,
+  parseCredentialBackend,
+  readAccessKey,
 } from './configure.js';
 import {
-  discoverAccessKeyWorkspaces,
-  discoverIdentity,
-  type DiscoveredWorkspace,
-  type WorkspaceMembership,
-} from './discover.js';
-import { DEFAULT_WORKSPACE, listLocalWorkspaces, localWorkspaceHome } from './workspaces.js';
-import {
-  findProjectSelection,
-  resolveWorkspaceSelection,
-  writeProjectSelection,
-} from './project.js';
-import { defaultPromptIo, select, type PromptIo } from './prompt.js';
-import { credentialReference, OsCredentialStore, type CredentialStore } from './credentials.js';
+  defaultCredentialStores,
+  newSecretReference,
+  type CredentialStores,
+  type StoredCredential,
+  type StoredOAuthCredential,
+} from './credentials.js';
+import { describeIdentity, discoverContexts } from './discover.js';
 import { asSynomemError, SynomemError, type SynomemErrorCode } from './errors.js';
 import { atomicWriteFile } from './fs-utils.js';
-import { startMcpServer } from './mcp/index.js';
-import { loginWithOAuth, StoredCredentialProvider, type OAuthLoginOptions } from './oauth.js';
-import { RemoteSynomemService } from './remote.js';
 import {
   createLocalImportBundle,
   RemoteImportClient,
@@ -47,6 +35,31 @@ import {
   type ImportPreview,
   type ImportResult,
 } from './import.js';
+import { serveStdio } from './mcp/index.js';
+import { loginWithOAuth, secureUrl, type OAuthLoginOptions } from './oauth.js';
+import {
+  assertName,
+  credentialSourceFor,
+  describeContext,
+  describeProfile,
+  isLocalProfile,
+  noSelectionError,
+  presetResolver,
+  profileResolver,
+  ProfileStore,
+  resolveSelection,
+  storeFor,
+  type CredentialEntry,
+  type LocalProfile,
+  type ProfilesConfig,
+  type RemoteProfile,
+  type ResolverDependencies,
+} from './profiles.js';
+import { writeProjectSelection } from './project.js';
+import { defaultPromptIo, ask, select, type PromptIo } from './prompt.js';
+import { localContextId, type ContextResolver } from './resolvers.js';
+import type { createLocalResolver, createRemoteResolver } from './resolvers.js';
+import type { SynomemService } from './service.js';
 import {
   formatSkillResult,
   installSkill,
@@ -56,18 +69,20 @@ import {
   type SkillRuntime,
 } from './skill-install.js';
 import type {
-  ActorIdentity,
   AgentRuntimeBinding,
+  ContextSummary,
+  EffectiveContext,
   EvidenceReference,
+  IdentityDescription,
+  ItemListInput,
+  ItemSummary,
   KudosListInput,
   KudosRecord,
   KudosSummary,
-  ItemListInput,
-  ItemSummary,
   TaskDue,
 } from './types.js';
 import { packageVersion } from './version.js';
-import type { SynomemService, SynomemServiceFactory } from './service.js';
+import { listLocalWorkspaces, localWorkspaceHome } from './workspaces.js';
 
 export interface CliIo {
   stdout: (text: string) => void;
@@ -75,36 +90,23 @@ export interface CliIo {
 }
 
 export interface CliDependencies {
-  /** Injected so the wizard can be driven by a test without a terminal. */
+  /** Injected so interactive steps can be driven by a test without a terminal. */
   promptIo?: PromptIo;
-  credentialStore?: CredentialStore;
-  oauthLogin?: (options: OAuthLoginOptions) => Promise<void>;
   env?: NodeJS.ProcessEnv;
-  verifyRemoteCredential?: (options: {
-    baseUrl: string;
-    workspaceId: string;
-    actor: ActorIdentity;
-    reference: string;
-    credentialStore: CredentialStore;
-  }) => Promise<void>;
-  /*
-   * Injected so setup can be tested without a network. The default asks the
-   * service which workspaces an access key can reach.
-   */
-  discoverAccessKeyWorkspaces?: (options: {
-    baseUrl: string;
-    accessToken: string;
-  }) => Promise<{ organizationId: string; workspaces: DiscoveredWorkspace[] }>;
-  /** Injected so `remote workspace list` can be tested without a network. */
-  discoverIdentity?: (options: {
-    baseUrl: string;
-    accessToken: string;
-  }) => Promise<{ workspaceId: string; workspaces: WorkspaceMembership[] }>;
+  cwd?: string;
+  platform?: NodeJS.Platform;
+  fetch?: typeof fetch;
+  credentialStores?: (home: string) => CredentialStores;
+  profileStore?: (home: string) => ProfileStore;
+  oauthLogin?: (options: OAuthLoginOptions) => Promise<StoredOAuthCredential>;
+  createRemoteResolver?: typeof createRemoteResolver;
+  createLocalResolver?: typeof createLocalResolver;
+  startMcpServer?: (options: { resolver: ContextResolver }) => Promise<void>;
   createImportBundle?: (home: string) => Promise<ImportBundle>;
   remoteImport?: (options: {
     baseUrl: string;
     workspaceId: string;
-    actor: ActorIdentity;
+    contextId: string;
     bundle: ImportBundle;
     planId?: string;
   }) => Promise<ImportPreview | ImportResult>;
@@ -116,6 +118,49 @@ const defaultIo: CliIo = {
 };
 
 const cliExitCodes = new WeakMap<Command, number>();
+
+/**
+ * Identity overrides the profile model replaced. Named here so using one fails
+ * with a message that points at `--profile`, rather than a generic unknown
+ * option or — worse — being silently ignored.
+ */
+const OBSOLETE_FLAGS = [
+  '--actor',
+  '--as',
+  '--from',
+  '--actor-kind',
+  '--actor-id',
+  '--agent-id',
+  '--actor-name',
+];
+const OBSOLETE_ENV = [
+  'SYNOMEM_ACTOR_ID',
+  'SYNOMEM_ACTOR_KIND',
+  'SYNOMEM_ACTOR_NAME',
+  'SYNOMEM_AGENT_ID',
+  'SYNOMEM_WORKSPACE',
+];
+
+function obsoleteIdentityInput(argv: string[], env: NodeJS.ProcessEnv): string | undefined {
+  const args = argv.slice(2);
+  for (const argument of args) {
+    const flag = argument.split('=')[0]!;
+    if (OBSOLETE_FLAGS.includes(flag)) return flag;
+    // `--workspace` survives only as a filter on `profile create`.
+    if (flag === '--workspace' && !(args.includes('profile') && args.includes('create'))) {
+      return flag;
+    }
+  }
+  if (
+    args.length === 0 ||
+    args.includes('--help') ||
+    args.includes('-h') ||
+    args.includes('--version')
+  ) {
+    return undefined;
+  }
+  return OBSOLETE_ENV.find((name) => env[name]?.trim());
+}
 
 function collect(value: string, previous: string[]): string[] {
   return [...previous, value];
@@ -146,38 +191,6 @@ function parseEvidence(value: string): EvidenceReference {
   };
 }
 
-function actor(kind: string, id: string, displayName?: string): ActorIdentity {
-  return {
-    kind: kind as ActorIdentity['kind'],
-    id,
-    ...(displayName ? { displayName } : {}),
-  };
-}
-
-/**
- * The acting identity for commands that do not take an explicit actor.
- * Local storage accepts any actor, so these fall back to the historical CLI defaults; a remote
- * backend binds the credential to one actor, so SYNOMEM_ACTOR_ID/KIND/NAME must be able to
- * override them or those commands cannot authenticate.
- */
-function defaultActor(
-  env: NodeJS.ProcessEnv,
-  fallbackKind: string,
-  fallbackId: string,
-  /** `--actor`, which outranks the environment: it is said on this invocation. */
-  override?: string,
-): ActorIdentity {
-  const id = override?.trim() || env.SYNOMEM_ACTOR_ID?.trim();
-  if (!id) return actor(fallbackKind, fallbackId);
-  const kind = override?.trim()
-    ? // An explicit --actor names an agent unless told otherwise; the historical
-      // fallbacks here are `system`/`cli`, which is not what somebody means when
-      // they name one.
-      env.SYNOMEM_ACTOR_KIND?.trim() || 'agent'
-    : env.SYNOMEM_ACTOR_KIND?.trim() || fallbackKind;
-  return actor(kind, id, env.SYNOMEM_ACTOR_NAME?.trim());
-}
-
 function taskDue(options: {
   dueDate?: string;
   dueAt?: string;
@@ -200,7 +213,8 @@ function exitCode(code: SynomemErrorCode): number {
     code.endsWith('_FORBIDDEN') ||
     code === 'READ_ONLY' ||
     code === 'AUTH_REQUIRED' ||
-    code === 'AUTH_FORBIDDEN'
+    code === 'AUTH_FORBIDDEN' ||
+    code === 'REAUTHORIZATION_REQUIRED'
   )
     return 4;
   if (code.startsWith('DATABASE_') || code === 'UNSUPPORTED_SCHEMA' || code === 'UNSUPPORTED_EVENT')
@@ -230,7 +244,7 @@ function itemListInput(options: Record<string, string | string[]>): ItemListInpu
       ? { kinds: options.kind as ItemListInput['kinds'] }
       : {}),
     ...(typeof options.participant === 'string' ? { participantAgentId: options.participant } : {}),
-    ...(typeof options.actor === 'string' ? { actorId: options.actor } : {}),
+    ...(typeof options.author === 'string' ? { actorId: options.author } : {}),
     ...(typeof options.status === 'string' ? { status: options.status } : {}),
     ...(typeof options.tag === 'string' ? { tag: options.tag } : {}),
     ...(typeof options.topic === 'string' ? { topicId: options.topic } : {}),
@@ -270,59 +284,15 @@ function output(io: CliIo, json: boolean, value: unknown, human: string): void {
   io.stdout(json ? `${JSON.stringify(value, null, 2)}\n` : `${human}\n`);
 }
 
-/**
- * The resolved global options for a command.
- *
- * `--workspace` is turned into a home HERE, before any service exists, which is
- * the whole reason it costs nothing downstream: a local workspace is a separate
- * database in its own home, and choosing one is choosing a home. Nothing in the
- * domain, the commands, or the MCP tools learns that a workspace was selected.
- *
- * On a remote backend the name means a hosted workspace instead, which
- * `backend use remote --workspace` already handles; passing both here would be
- * two different answers to the same question, so it is refused.
- */
-/** `parent child`, so a subcommand name cannot be confused with another's. */
-function commandPath(command: Command): string {
-  const parent = command.parent?.name();
-  return parent && parent !== 'synomem' ? `${parent} ${command.name()}` : command.name();
-}
-
-/**
- * Commands where `--workspace` names a HOSTED workspace being configured,
- * rather than a local one to act in.
- */
-const CONFIGURES_BACKEND = new Set(['config init', 'backend use', 'remote import']);
-
-async function withService<T>(
-  serviceFactory: SynomemServiceFactory,
-  home: string | undefined,
-  configuredActor: ActorIdentity,
-  operation: (client: SynomemService) => Promise<T>,
-  assertActor?: boolean,
-): Promise<T> {
-  const client = serviceFactory({
-    ...(home ? { home } : {}),
-    actor: configuredActor,
-    ...(assertActor !== undefined ? { assertActor } : {}),
-  });
-  await client.init();
-  try {
-    return await operation(client);
-  } finally {
-    await client.close();
-  }
-}
-
 function addListOptions(command: Command): Command {
   return command
     .option('--recipient <agent>')
-    .option('--actor <id>')
-    .option('--actor-kind <kind>', 'human, agent, or system')
+    .option('--author <id>', 'only kudos given by this actor')
+    .option('--author-kind <kind>', 'human, agent, or system')
     .option('--tag <tag>')
     .option('--topic <id>', 'only records carrying this topic')
     .option('--status <status>', 'acknowledged or unacknowledged')
-    .option('--visibility <visibility>', 'private, local, or public')
+    .option('--visibility <visibility>', 'private, workspace, or public')
     .addOption(
       new Option('--revoked <state>').choices(['include', 'only', 'exclude']).default('include'),
     )
@@ -336,8 +306,8 @@ function addListOptions(command: Command): Command {
 function listInput(options: Record<string, string>): KudosListInput {
   return {
     ...(options.recipient ? { recipientAgentId: options.recipient } : {}),
-    ...(options.actor ? { actorId: options.actor } : {}),
-    ...(options.actorKind ? { actorKind: options.actorKind as KudosListInput['actorKind'] } : {}),
+    ...(options.author ? { actorId: options.author } : {}),
+    ...(options.authorKind ? { actorKind: options.authorKind as KudosListInput['actorKind'] } : {}),
     ...(options.tag ? { tag: options.tag } : {}),
     ...(options.topic ? { topicId: options.topic } : {}),
     ...(options.status ? { status: options.status as KudosListInput['status'] } : {}),
@@ -354,398 +324,1159 @@ function listInput(options: Record<string, string>): KudosListInput {
   };
 }
 
-/**
- * The value `--actor` should supply to commands that name an actor.
- *
- * Read from argv directly, before the commands are built, because Commander
- * evaluates option defaults at DECLARATION time: a `--as` declared without one
- * is required, and a `--as` declared with one is already satisfied. Supplying
- * it here is a single change point instead of a fallback threaded through
- * twenty action bodies, and `--as` still wins when both are given because an
- * explicitly passed option overrides its default.
- */
-function actorDefault(argv: string[], env: NodeJS.ProcessEnv): string | undefined {
-  for (let index = 0; index < argv.length; index += 1) {
-    const argument = argv[index]!;
-    if (argument === '--actor') return argv[index + 1]?.trim() || undefined;
-    if (argument.startsWith('--actor='))
-      return argument.slice('--actor='.length).trim() || undefined;
-  }
-  if (env.SYNOMEM_ACTOR_ID?.trim()) return env.SYNOMEM_ACTOR_ID.trim();
-  /*
-   * Last, the project's own binding. `workspace use --as` exists so a
-   * repository can settle both questions once — which workspace, and as whom —
-   * and a command run there needs neither flag afterwards.
-   */
-  try {
-    return findProjectSelection()?.actor;
-  } catch {
-    // A malformed project file is reported by the resolver when the command
-    // actually runs, with the path in the message. Failing here would turn it
-    // into an error before any command had been parsed.
-    return undefined;
-  }
+function describeEffective(context: EffectiveContext): string {
+  return `${context.actor.displayName ?? context.actor.id} (${context.actor.kind}:${context.actor.id}) in ${context.workspaceId}`;
 }
 
-export function createCli(
-  io: CliIo = defaultIo,
-  serviceFactory: SynomemServiceFactory = configuredServiceFactory,
-  dependencies: CliDependencies = {},
-  argv: string[] = process.argv,
-): Command {
-  const env = dependencies.env ?? process.env;
-  const actingDefault = actorDefault(argv, env);
+interface Globals {
+  home: string;
+  explicitHome?: string;
+  json: boolean;
+  profile?: string;
+  preset?: string;
+}
 
-  const globals = (
-    command: Command,
-  ): { home?: string; json: boolean; actor?: string; workspace?: string } => {
+export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies = {}): Command {
+  const env = dependencies.env ?? process.env;
+  const cwd = dependencies.cwd ?? process.cwd();
+  const platform = dependencies.platform ?? process.platform;
+  const fetchImplementation = dependencies.fetch ?? fetch;
+  const promptIo = dependencies.promptIo ?? defaultPromptIo();
+  const oauthLogin = dependencies.oauthLogin ?? loginWithOAuth;
+  const storesFor = dependencies.credentialStores ?? defaultCredentialStores;
+  const profileStoreFor = dependencies.profileStore ?? ((home: string) => new ProfileStore(home));
+
+  const globals = (command: Command): Globals => {
     const options = command.optsWithGlobals<{
       home?: string;
       json: boolean;
-      workspace?: string;
-      actor?: string;
+      profile?: string;
+      preset?: string;
     }>();
-    if (CONFIGURES_BACKEND.has(commandPath(command))) return options;
-    /*
-     * Resolution runs even with no `--workspace`, because a project's
-     * `.synomem/config.json` selects one without anybody passing a flag — that is
-     * the whole point of it. `--home` still wins outright: it names a home
-     * directly rather than a workspace within one.
-     */
-    if (!options.home) {
-      const selection = resolveWorkspaceSelection({
-        ...(options.workspace ? { flag: options.workspace } : {}),
-        ...(options.actor ? { actorFlag: options.actor } : {}),
-        env,
-      });
-      return { ...options, home: selection.home, actor: selection.actor ?? options.actor };
-    }
-    if (!options.workspace) return options;
-    /*
-     * One flag, one meaning — "which workspace" — resolved differently by the
-     * handful of commands that CONFIGURE a backend rather than act inside one.
-     * For those, the value is a hosted workspace ID to be written to the config,
-     * so it is passed through raw and they read `workspace`. Everywhere else it
-     * names a local workspace, which is a home.
-     *
-     * These commands used to declare their own `--workspace`, which does not
-     * work: Commander gives a duplicated long flag to the parent, so the
-     * subcommand never received it at all.
-     */
-    return { ...options, home: localWorkspaceHome(options.workspace, options.home) };
+    return {
+      home: resolveHome(options.home),
+      ...(options.home ? { explicitHome: options.home } : {}),
+      json: options.json,
+      ...(options.profile ? { profile: options.profile } : {}),
+      ...(options.preset ? { preset: options.preset } : {}),
+    };
   };
 
-  const credentialStore = dependencies.credentialStore ?? new OsCredentialStore();
-  const oauthLogin = dependencies.oauthLogin ?? loginWithOAuth;
-  const discoverWorkspaces =
-    dependencies.discoverAccessKeyWorkspaces ?? discoverAccessKeyWorkspaces;
-  const discoverAccountIdentity = dependencies.discoverIdentity ?? discoverIdentity;
-  const promptIo = dependencies.promptIo ?? defaultPromptIo();
-  const verifyRemoteCredential =
-    dependencies.verifyRemoteCredential ??
-    (async (options) => {
-      const remote = new RemoteSynomemService({
-        baseUrl: options.baseUrl,
-        workspaceId: options.workspaceId,
-        expectedActor: options.actor,
-        credentialProvider: new StoredCredentialProvider(
-          options.reference,
-          options.credentialStore,
-          {},
-        ),
-      });
-      try {
-        await remote.init();
-      } finally {
-        await remote.close();
-      }
+  const resolverDeps = (home: string): ResolverDependencies => ({
+    stores: storesFor(home),
+    env,
+    fetch: fetchImplementation,
+    ...(dependencies.createRemoteResolver
+      ? { createRemoteResolver: dependencies.createRemoteResolver }
+      : {}),
+    ...(dependencies.createLocalResolver
+      ? { createLocalResolver: dependencies.createLocalResolver }
+      : {}),
+  });
+
+  const selectionFor = (global: Globals, config: ProfilesConfig) =>
+    resolveSelection(config, {
+      ...(global.profile ? { profile: global.profile } : {}),
+      ...(global.preset ? { preset: global.preset } : {}),
+      env,
+      cwd,
+      home: global.home,
     });
 
+  /**
+   * Runs a domain command as the selected profile's single context. Every
+   * acting identity comes from here — there is no per-command actor flag.
+   */
+  const withProfile = async <T>(
+    command: Command,
+    operation: (
+      service: SynomemService,
+      context: EffectiveContext,
+      profileName: string,
+    ) => Promise<T>,
+  ): Promise<T> => {
+    const global = globals(command);
+    const config = profileStoreFor(global.home).read();
+    const selection = selectionFor(global, config);
+    if (!selection) throw noSelectionError();
+    if (selection.kind === 'preset') {
+      throw new SynomemError(
+        'INVALID_INPUT',
+        `A command acts as exactly one profile; preset ${selection.name} is for \`synomem mcp --preset ${selection.name} --contexts explicit\`. Pass --profile <name>.`,
+      );
+    }
+    const resolver = profileResolver(
+      global.home,
+      config,
+      selection.name,
+      resolverDeps(global.home),
+    );
+    try {
+      const { service, context } = await resolver.resolve();
+      return await operation(service, context, selection.name);
+    } finally {
+      await resolver.close?.();
+    }
+  };
+
+  /**
+   * Store administration: agent management, rebuild, backup, export, doctor.
+   *
+   * A selected REMOTE profile routes through its context (the API decides
+   * whether that context may administer). Otherwise it is a local store — the
+   * selected local profile's store, or the root home — administered as the
+   * local operator, since the filesystem owner is the authority over a local
+   * store.
+   */
+  const withManagement = async <T>(
+    command: Command,
+    operation: (
+      service: SynomemService,
+      context: EffectiveContext | undefined,
+      home: string | undefined,
+    ) => Promise<T>,
+  ): Promise<T> => {
+    const global = globals(command);
+    const config = profileStoreFor(global.home).read();
+    const selection = selectionFor(global, config);
+    const profile = selection?.kind === 'profile' ? config.profiles[selection.name] : undefined;
+    if (profile && !isLocalProfile(profile)) {
+      return await withProfile(command, (service, context) =>
+        operation(service, context, undefined),
+      );
+    }
+    const storeHome =
+      profile && isLocalProfile(profile) ? (profile.home ?? global.home) : global.home;
+    const client = await openLocalService(storeHome, LOCAL_OPERATOR);
+    try {
+      return await operation(client, undefined, storeHome);
+    } finally {
+      await client.close();
+    }
+  };
+
   const program = new Command();
-  const withClient = <T>(
-    home: string | undefined,
-    configuredActor: ActorIdentity,
-    operation: (client: SynomemService) => Promise<T>,
-    assertActor?: boolean,
-  ) => withService(serviceFactory, home, configuredActor, operation, assertActor);
   cliExitCodes.set(program, 0);
   program
     .name('synomem')
-    .description(
-      'Local-first communication, memory, recognition, and task infrastructure for agents',
-    )
+    .description('Durable communication, memory, recognition, and task infrastructure for agents')
     .version(packageVersion())
-    .option('--home <path>', 'storage root (defaults to SYNOMEM_HOME or ~/.synomem)')
-    // A local workspace is its own database under the root, so this selects a
-    // home. On a remote backend the hosted workspace is chosen by
-    // `backend use remote --workspace` instead.
-    .option('--workspace <name>', 'local workspace to act in (see `synomem workspace list`)')
-    .option('--actor <id>', 'act as this agent (overrides SYNOMEM_ACTOR_ID)')
+    .option('--home <path>', 'Synomem home (defaults to SYNOMEM_HOME or ~/.synomem)')
+    .option('--profile <name>', 'act as this profile (or SYNOMEM_PROFILE)')
+    .option('--preset <name>', 'MCP preset of several profiles (or SYNOMEM_PRESET)')
     .option('--json', 'emit stable machine-readable JSON', false)
     .showSuggestionAfterError()
     .configureOutput({ writeOut: io.stdout, writeErr: io.stderr });
 
-  /*
-   * Local workspaces.
-   *
-   * Each is a separate database in its own home, which is what makes the
-   * isolation real: SQLite has no row-level security, so a shared file would
-   * rest on every query remembering to filter, with nothing to catch a miss.
-   * Separate files mean cross-workspace leakage is not something anybody can
-   * write by accident.
-   */
-  const workspaceCommand = program
-    .command('workspace')
-    .description('Work in a separate local store, isolated from the others');
+  /* ------------------------------------------------------------ setup */
 
-  workspaceCommand
+  program
+    .command('setup')
+    .description('Set up a local store with its first agent and a matching fixed profile')
+    .option('--backend <kind>', 'local (hosted access uses `connection login`)', 'local')
+    .option('--agent <handle>', 'handle of the first agent')
+    .option('--name <display-name>', 'display name of the first agent')
+    .option('--description <text>')
+    .option('--profile-name <name>', 'profile name (defaults to the handle)')
+    .action(
+      async (
+        options: {
+          backend: string;
+          agent?: string;
+          name?: string;
+          description?: string;
+          profileName?: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        if (options.backend !== 'local') {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            'Hosted access is a connection: run `synomem connection login --name <name>`, then `synomem profile create`.',
+          );
+        }
+        let handle = options.agent?.trim();
+        let displayName = options.name?.trim();
+        if (!handle || !displayName) {
+          assertInteractive(
+            promptIo,
+            'synomem setup --backend local --agent <handle> --name "<display name>"',
+          );
+          handle ||= await ask(promptIo, 'Agent handle (what people type, e.g. gracie)');
+          displayName ||= await ask(promptIo, 'Agent display name', handle);
+        }
+        if (!handle) throw new SynomemError('INVALID_INPUT', 'An agent handle is required.');
+        const profileName = assertName(options.profileName ?? handle, 'profile');
+        const store = profileStoreFor(global.home);
+        const storeConfig = ensureLocalStore(global.home);
+        const config = store.read();
+
+        const existing = config.profiles[profileName];
+        const client = await openLocalService(global.home, LOCAL_OPERATOR);
+        let agent;
+        let resumed = false;
+        try {
+          const resolution = await client.agents.resolve(handle);
+          const match =
+            resolution.match && resolution.match.handle.toLowerCase() === handle.toLowerCase()
+              ? resolution.match
+              : undefined;
+          if (existing) {
+            // Idempotent re-run: the same profile, same store, same agent.
+            if (
+              isLocalProfile(existing) &&
+              (existing.home ?? global.home) === global.home &&
+              match &&
+              existing.actorId === match.id
+            ) {
+              output(
+                io,
+                global.json,
+                {
+                  applied: false,
+                  profile: profileName,
+                  agentId: match.id,
+                  contextId: existing.contextId,
+                },
+                `Already set up: profile ${profileName} acts as ${match.displayName} (${match.id}).\n\nStart the MCP server with:\n  synomem mcp --profile ${profileName}`,
+              );
+              return;
+            }
+            throw new SynomemError(
+              'CONFIG_INVALID',
+              `Profile ${profileName} already exists and points somewhere else; setup will not overwrite it. Pass --profile-name <other>.`,
+            );
+          }
+          if (match) {
+            agent = match;
+            resumed = true;
+          } else {
+            agent = await client.agents.create({
+              handle,
+              displayName: displayName || handle,
+              ...(options.description ? { description: options.description } : {}),
+            });
+          }
+        } finally {
+          await client.close();
+        }
+
+        const actor = { kind: 'agent' as const, id: agent.id };
+        const profile: LocalProfile = {
+          backend: 'local',
+          ...(global.explicitHome ? { home: global.home } : {}),
+          actorId: agent.id,
+          actorName: agent.displayName,
+          contextId: localContextId(storeConfig.workspaceId, actor),
+        };
+        const next: ProfilesConfig = {
+          ...config,
+          profiles: { ...config.profiles, [profileName]: profile },
+          ...(config.defaultProfile ? {} : { defaultProfile: profileName }),
+        };
+        store.write(next);
+        output(
+          io,
+          global.json,
+          {
+            applied: true,
+            resumed,
+            profile: profileName,
+            agentId: agent.id,
+            contextId: profile.contextId,
+            default: next.defaultProfile === profileName,
+            mcpCommand: `synomem mcp --profile ${profileName}`,
+          },
+          [
+            '',
+            `${resumed ? 'Found existing agent' : 'Created'} ${agent.displayName}  (handle ${agent.handle}, id ${agent.id})`,
+            `Profile ${profileName} acts as it in ${global.home}${next.defaultProfile === profileName ? ' (default)' : ''}.`,
+            '',
+            'Start the MCP server with:',
+            `  synomem mcp --profile ${profileName}`,
+            '',
+            'Register it with your harness and install the skill:',
+            `  synomem skill install --runtime <claude|codex|hermes|...> --profile ${profileName} --yes`,
+          ].join('\n'),
+        );
+      },
+    );
+
+  /* ------------------------------------------------------------ connections */
+
+  const connectionCommand = program
+    .command('connection')
+    .description('Hosted credentials: one per harness installation, shared by its profiles');
+
+  const saveCredential = async (
+    global: Globals,
+    name: string,
+    entry: CredentialEntry,
+    credential: StoredCredential | undefined,
+  ): Promise<ProfilesConfig> => {
+    const store = profileStoreFor(global.home);
+    const config = store.read();
+    if (credential && entry.store !== 'environment') {
+      await storeFor(storesFor(global.home), entry).set(entry.secretRef!, credential);
+    }
+    const next = { ...config, credentials: { ...config.credentials, [name]: entry } };
+    store.write(next);
+    return next;
+  };
+
+  const verifyConnection = async (
+    apiUrl: string,
+    bearer: string,
+  ): Promise<{ identity: IdentityDescription; contexts: ContextSummary[] }> => {
+    const identity = await describeIdentity({
+      baseUrl: apiUrl,
+      accessToken: bearer,
+      fetch: fetchImplementation,
+    });
+    const listing = await discoverContexts({
+      baseUrl: apiUrl,
+      accessToken: bearer,
+      fetch: fetchImplementation,
+    });
+    return { identity, contexts: listing.contexts };
+  };
+
+  const connectionSummary = (
+    name: string,
+    identity: IdentityDescription,
+    contexts: ContextSummary[],
+  ): string =>
+    [
+      `Connection ${name}${identity.connection ? ` — ${identity.connection.label}` : ''}`,
+      ...(identity.grant
+        ? [`Grant: ${identity.grant.mode}, ${identity.grant.actions.join(' ')}`]
+        : []),
+      contexts.length ? 'May act as:' : 'This connection may not act as anything yet.',
+      ...contexts.map((context) => `  ${context.contextId}  ${describeContext(context)}`),
+      '',
+      contexts.length
+        ? `Next: synomem profile create <name> --connection ${name} --context <context-id>`
+        : 'Authorize an agent for it on the consent screen or in the portal.',
+    ].join('\n');
+
+  connectionCommand
+    .command('login')
+    .description('Sign in through the browser (OAuth 2.1 + PKCE) and store the credential')
+    .requiredOption('--name <name>', 'connection name, e.g. codex-mac')
+    // Internal: development and private deployments. Kept out of public docs —
+    // onboarding must never ask a person for a service address.
+    .option('--api-url <url>', 'internal: alternate API origin')
+    .option('--client-id <id>', 'OAuth client id (default synomem-cli)')
+    .option('--store <where>', 'keychain (default) or file')
+    .option('--callback-port <port>', 'loopback callback port', '43817')
+    .action(
+      async (
+        options: {
+          name: string;
+          apiUrl?: string;
+          clientId?: string;
+          store?: string;
+          callbackPort: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const name = assertName(options.name, 'connection');
+        const apiUrl = secureUrl(options.apiUrl ?? cloudApiUrl(env), 'API URL').origin;
+        const config = profileStoreFor(global.home).read();
+        const existing = config.credentials[name];
+        if (existing && existing.kind !== 'oauth') {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            `Connection ${name} is an access key, not a browser sign-in. Choose another name.`,
+          );
+        }
+        const backend = parseCredentialBackend(options.store ?? existing?.store, platform);
+        if (backend === 'environment') {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            'A browser sign-in is stored in the keychain or a file, never the environment.',
+          );
+        }
+        const callbackPort = Number(options.callbackPort);
+        if (!Number.isSafeInteger(callbackPort) || callbackPort < 1 || callbackPort > 65_535) {
+          throw new SynomemError('INVALID_INPUT', '--callback-port must be from 1 through 65535.');
+        }
+        const credential = await oauthLogin({
+          apiUrl,
+          ...(options.clientId ? { clientId: options.clientId } : {}),
+          callbackPort,
+          fetch: fetchImplementation,
+        });
+        const { identity, contexts } = await verifyConnection(apiUrl, credential.accessToken);
+        // Re-login keeps the same secret reference, so every profile routing
+        // through this connection keeps working with the new credential.
+        const entry: CredentialEntry = {
+          kind: 'oauth',
+          apiUrl,
+          store: backend,
+          secretRef: existing?.secretRef ?? newSecretReference(),
+          issuer: credential.issuer,
+          resource: credential.resource,
+          clientId: credential.clientId,
+          ...(identity.connection
+            ? { connectionId: identity.connection.id, label: identity.connection.label }
+            : {}),
+          createdAt: existing?.createdAt ?? new Date().toISOString(),
+        };
+        await saveCredential(global, name, entry, credential);
+        output(
+          io,
+          global.json,
+          { connection: name, store: backend, identity, contexts },
+          connectionSummary(name, identity, contexts),
+        );
+      },
+    );
+
+  connectionCommand
+    .command('add-key')
+    .description('Store a member-owned access key (read from stdin, never an argument)')
+    .requiredOption('--name <name>', 'connection name')
+    .option('--api-url <url>', 'internal: alternate API origin')
+    .option('--store <where>', 'keychain (default), file, or environment')
+    .action(
+      async (options: { name: string; apiUrl?: string; store?: string }, command: Command) => {
+        const global = globals(command);
+        const name = assertName(options.name, 'connection');
+        const apiUrl = secureUrl(options.apiUrl ?? cloudApiUrl(env), 'API URL').origin;
+        const config = profileStoreFor(global.home).read();
+        const existing = config.credentials[name];
+        if (existing && existing.kind !== 'access-key') {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            `Connection ${name} is a browser sign-in. Choose another name.`,
+          );
+        }
+        const backend = parseCredentialBackend(options.store, platform);
+        const secret =
+          backend === 'environment'
+            ? env.SYNOMEM_ACCESS_TOKEN?.trim()
+            : await readAccessKey(promptIo);
+        if (!secret) {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            'Set SYNOMEM_ACCESS_TOKEN to the key before adding an environment connection.',
+          );
+        }
+        const { identity, contexts } = await verifyConnection(apiUrl, secret);
+        const entry: CredentialEntry = {
+          kind: 'access-key',
+          apiUrl,
+          store: backend,
+          ...(backend === 'environment'
+            ? {}
+            : { secretRef: existing?.secretRef ?? newSecretReference() }),
+          ...(identity.connection
+            ? { connectionId: identity.connection.id, label: identity.connection.label }
+            : {}),
+          createdAt: existing?.createdAt ?? new Date().toISOString(),
+        };
+        await saveCredential(
+          global,
+          name,
+          entry,
+          backend === 'environment' ? undefined : { kind: 'access-key', secret },
+        );
+        output(
+          io,
+          global.json,
+          {
+            connection: name,
+            store: backend,
+            key: credentialFingerprint(secret),
+            identity,
+            contexts,
+          },
+          connectionSummary(name, identity, contexts),
+        );
+      },
+    );
+
+  connectionCommand
     .command('list')
-    .description('List the local workspaces on this machine')
+    .description('List connections and the profiles using each, without secrets')
     .action((_options, command: Command) => {
       const global = globals(command);
-      // Read from disk, so nothing is listed that does not exist.
-      const workspaces = listLocalWorkspaces(global.home);
-      // Which one is in effect here, and what decided it — a flag, the
-      // environment, a project file, or nothing.
-      const selection = resolveWorkspaceSelection({ env });
-      const human = workspaces
-        .map(
-          (workspace) =>
-            `${workspace.name === DEFAULT_WORKSPACE ? '*' : ' '} ${workspace.name.padEnd(24)} ${
-              workspace.initialized ? workspace.home : `${workspace.home} (not initialized)`
-            }`,
-        )
-        .join('\n');
+      const config = profileStoreFor(global.home).read();
+      const connections = Object.entries(config.credentials).map(([name, entry]) => ({
+        name,
+        kind: entry.kind,
+        store: entry.store,
+        apiUrl: entry.apiUrl,
+        ...(entry.label ? { label: entry.label } : {}),
+        ...(entry.connectionId ? { connectionId: entry.connectionId } : {}),
+        profiles: Object.entries(config.profiles)
+          .filter(([, profile]) => !isLocalProfile(profile) && profile.credentialRef === name)
+          .map(([profileName]) => profileName),
+      }));
       output(
         io,
         global.json,
-        { workspaces, active: selection.workspace ?? DEFAULT_WORKSPACE, source: selection.source },
-        [
-          human,
-          '',
-          `Acting in: ${selection.workspace ?? DEFAULT_WORKSPACE}  (from ${selection.source})`,
-          '',
-          'Bind a directory with `synomem workspace use <name>`, or pass --workspace once.',
-          'A local workspace is a separate store on this machine; a hosted workspace is shared,',
-          'and is selected with `backend use remote --workspace`.',
-        ].join('\n'),
+        { connections },
+        connections.length
+          ? connections
+              .map(
+                (connection) =>
+                  `${connection.name}  ${connection.kind}  ${connection.store}  ${connection.label ?? ''}\n  profiles: ${
+                    connection.profiles.join(', ') || 'none'
+                  }`,
+              )
+              .join('\n')
+          : 'No connections. Run `synomem connection login --name <name>`.',
       );
     });
 
-  workspaceCommand
-    .command('use <name>')
-    .description('Bind this directory to a workspace, for every session opened here')
-    .option('--as <actor-id>', 'also always write as this agent', actingDefault)
-    .action((name: string, options: { as?: string }, command: Command) => {
+  connectionCommand
+    .command('status [name]')
+    .description('Check that a connection (or every connection) authenticates')
+    .action(async (name: string | undefined, _options, command: Command) => {
       const global = globals(command);
-      // Validated by resolving it, so a name that could never work is refused
-      // before a file claiming it is written.
-      const home = localWorkspaceHome(name, undefined);
-      const path = writeProjectSelection(process.cwd(), {
-        workspace: name,
-        ...(options.as ? { actor: options.as } : {}),
+      const config = profileStoreFor(global.home).read();
+      const names = name ? [name] : Object.keys(config.credentials);
+      const results: Array<Record<string, unknown>> = [];
+      let failed = false;
+      for (const connection of names) {
+        const entry = config.credentials[connection];
+        if (!entry) throw new SynomemError('CONFIG_INVALID', `Unknown connection "${connection}".`);
+        try {
+          const bearer = await credentialSourceFor(
+            global.home,
+            config,
+            connection,
+            resolverDeps(global.home),
+          ).bearer();
+          const { identity, contexts } = await verifyConnection(entry.apiUrl, bearer);
+          results.push({
+            name: connection,
+            ok: true,
+            store: entry.store,
+            identity,
+            contexts: contexts.length,
+          });
+        } catch (error) {
+          failed = true;
+          const synomemError = asSynomemError(error);
+          results.push({
+            name: connection,
+            ok: false,
+            store: entry.store,
+            error: { code: synomemError.code, message: synomemError.message },
+          });
+        }
+      }
+      output(
+        io,
+        global.json,
+        { connections: results },
+        results.length
+          ? results
+              .map((result) =>
+                result.ok
+                  ? `${String(result.name)}  ok  (${String(result.store)}) — ${String(result.contexts)} context(s)`
+                  : `${String(result.name)}  FAILED  ${(result.error as { message: string }).message}`,
+              )
+              .join('\n')
+          : 'No connections.',
+      );
+      if (failed) cliExitCodes.set(program, 4);
+    });
+
+  connectionCommand
+    .command('remove')
+    .description('Forget a connection and delete its locally stored secret')
+    .requiredOption('--name <name>')
+    .option('--force', 'also remove the profiles that use it', false)
+    .action(async (options: { name: string; force: boolean }, command: Command) => {
+      const global = globals(command);
+      const store = profileStoreFor(global.home);
+      const config = store.read();
+      const entry = config.credentials[options.name];
+      if (!entry) throw new SynomemError('CONFIG_INVALID', `Unknown connection "${options.name}".`);
+      const dependents = Object.entries(config.profiles)
+        .filter(([, profile]) => !isLocalProfile(profile) && profile.credentialRef === options.name)
+        .map(([profileName]) => profileName);
+      if (dependents.length && !options.force) {
+        throw new SynomemError(
+          'INVALID_INPUT',
+          `Profiles ${dependents.join(', ')} use connection ${options.name}. Remove them first, or pass --force to remove them too.`,
+        );
+      }
+      if (entry.store !== 'environment') {
+        await storeFor(storesFor(global.home), entry).delete(entry.secretRef!);
+      }
+      const profiles = Object.fromEntries(
+        Object.entries(config.profiles).filter(
+          ([profileName]) => !dependents.includes(profileName),
+        ),
+      );
+      const harnessPresets = Object.fromEntries(
+        Object.entries(config.harnessPresets)
+          .map(
+            ([preset, members]) =>
+              [preset, members.filter((member) => !dependents.includes(member))] as const,
+          )
+          .filter(([, members]) => members.length > 0),
+      );
+      const credentials = Object.fromEntries(
+        Object.entries(config.credentials).filter(([name]) => name !== options.name),
+      );
+      store.write({
+        ...config,
+        credentials,
+        profiles,
+        harnessPresets,
+        ...(config.defaultProfile && dependents.includes(config.defaultProfile)
+          ? { defaultProfile: undefined }
+          : {}),
       });
       output(
         io,
         global.json,
-        { path, workspace: name, home, ...(options.as ? { actor: options.as } : {}) },
+        { removed: options.name, profilesRemoved: dependents },
         [
-          `Wrote ${path}`,
-          '',
-          `Every Synomem command and MCP server started in this directory now acts in ${name}${
-            options.as ? ` as ${options.as}` : ''
-          }, with no flag.`,
-          `Records live in ${home} — nothing is stored in this directory.`,
-          '',
-          'Commit it to share the choice with the repository, or ignore it to keep it yours.',
+          `Removed connection ${options.name} and its local secret.`,
+          ...(dependents.length ? [`Also removed profiles: ${dependents.join(', ')}.`] : []),
+          'The server-side authorization still exists: revoke it in the portal (Connections) to stop it everywhere.',
         ].join('\n'),
+      );
+    });
+
+  /* ------------------------------------------------------------ profiles */
+
+  const profileCommand = program
+    .command('profile')
+    .description('Named identities: one stable context through one connection or local store');
+
+  profileCommand
+    .command('create <name>')
+    .description('Create a profile for a context this connection may already use')
+    .option('--connection <name>', 'hosted connection to route through')
+    .option('--context <context-id>', 'exact context id (see `connection status`)')
+    .option('--agent <handle-or-id>', 'narrow by agent handle, id or display name')
+    .option('--workspace <name-or-id>', 'narrow by workspace name or id')
+    .option('--local', 'a local-store profile for an existing local agent', false)
+    .option('--store-home <path>', 'local store home (default: the Synomem home)')
+    .option('--default', 'make this the default profile', false)
+    .action(
+      async (
+        rawName: string,
+        options: {
+          connection?: string;
+          context?: string;
+          agent?: string;
+          workspace?: string;
+          local: boolean;
+          storeHome?: string;
+          default: boolean;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const name = assertName(rawName, 'profile');
+        const store = profileStoreFor(global.home);
+        const config = store.read();
+        if (config.profiles[name]) {
+          throw new SynomemError(
+            'CONFIG_INVALID',
+            `Profile ${name} already exists. Remove it first to change what it points at.`,
+          );
+        }
+
+        if (options.local) {
+          if (!options.agent)
+            throw new SynomemError(
+              'INVALID_INPUT',
+              'A local profile needs --agent <handle-or-id>.',
+            );
+          const storeHome = options.storeHome ? resolve(options.storeHome) : global.home;
+          const client = await openLocalService(storeHome, LOCAL_OPERATOR);
+          let agent;
+          try {
+            const resolution = await client.agents.resolve(options.agent);
+            if (!resolution.match) {
+              throw new SynomemError(
+                resolution.candidates.length ? 'CONTEXT_AMBIGUOUS' : 'AGENT_NOT_FOUND',
+                resolution.candidates.length
+                  ? `"${options.agent}" matches several agents: ${resolution.candidates.map((c) => `${c.handle} (${c.id})`).join(', ')}.`
+                  : `No local agent answers to "${options.agent}". Profiles never create agents: run \`synomem agent create\` first.`,
+              );
+            }
+            agent = resolution.match;
+          } finally {
+            await client.close();
+          }
+          const profile: LocalProfile = {
+            backend: 'local',
+            ...(storeHome !== global.home ? { home: storeHome } : {}),
+            actorId: agent.id,
+            actorName: agent.displayName,
+            contextId: localContextId(localStoreWorkspaceId(storeHome), {
+              kind: 'agent',
+              id: agent.id,
+            }),
+          };
+          store.write({
+            ...config,
+            profiles: { ...config.profiles, [name]: profile },
+            ...(options.default || !config.defaultProfile ? { defaultProfile: name } : {}),
+          });
+          output(
+            io,
+            global.json,
+            { profile: name, ...profile },
+            `Created profile ${name}: ${agent.displayName} in ${storeHome}.`,
+          );
+          return;
+        }
+
+        if (!options.connection) {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            'Pass --connection <name> (or --local for a local store).',
+          );
+        }
+        const entry = config.credentials[options.connection];
+        if (!entry)
+          throw new SynomemError('CONFIG_INVALID', `Unknown connection "${options.connection}".`);
+        const bearer = await credentialSourceFor(
+          global.home,
+          config,
+          options.connection,
+          resolverDeps(global.home),
+        ).bearer();
+        const listing = await discoverContexts({
+          baseUrl: entry.apiUrl,
+          accessToken: bearer,
+          fetch: fetchImplementation,
+        });
+        const lower = (value: string | undefined) => value?.toLowerCase();
+        let candidates = listing.contexts.filter((context) => {
+          if (options.context && context.contextId !== options.context) return false;
+          if (options.agent) {
+            const wanted = options.agent.toLowerCase();
+            if (
+              context.actor.id !== options.agent &&
+              lower(context.actor.handle) !== wanted &&
+              lower(context.actor.displayName) !== wanted
+            )
+              return false;
+          }
+          if (options.workspace) {
+            const wanted = options.workspace.toLowerCase();
+            if (
+              context.workspaceId !== options.workspace &&
+              lower(context.workspaceName) !== wanted
+            )
+              return false;
+          }
+          return true;
+        });
+        if (candidates.length === 0) {
+          throw new SynomemError(
+            'CONTEXT_FORBIDDEN',
+            `Connection ${options.connection} may not use any context matching that. Profiles never create agents or grant access — authorize it on the consent screen or in the portal. Available: ${
+              listing.contexts
+                .map((context) => `${context.contextId} (${describeContext(context)})`)
+                .join('; ') || 'none'
+            }.`,
+          );
+        }
+        if (candidates.length > 1) {
+          if (!promptIo.interactive) {
+            throw new SynomemError(
+              'CONTEXT_AMBIGUOUS',
+              `Several contexts match; pass --context <id>:\n${candidates
+                .map((context) => `  ${context.contextId}  ${describeContext(context)}`)
+                .join('\n')}`,
+            );
+          }
+          const chosen = await select(
+            promptIo,
+            'Which identity should this profile act as?',
+            candidates.map((context) => ({
+              value: context.contextId,
+              label: describeContext(context),
+              detail: context.contextId,
+            })),
+          );
+          candidates = candidates.filter((context) => context.contextId === chosen);
+        }
+        const context = candidates[0]!;
+        const profile: RemoteProfile = {
+          credentialRef: options.connection,
+          contextId: context.contextId,
+          workspaceId: context.workspaceId,
+          ...(context.workspaceName ? { workspaceName: context.workspaceName } : {}),
+          actor: {
+            kind: context.actor.kind,
+            id: context.actor.id,
+            ...(context.actor.displayName ? { displayName: context.actor.displayName } : {}),
+          },
+        };
+        store.write({
+          ...config,
+          profiles: { ...config.profiles, [name]: profile },
+          ...(options.default || !config.defaultProfile ? { defaultProfile: name } : {}),
+        });
+        output(
+          io,
+          global.json,
+          { profile: name, ...profile },
+          `Created profile ${name}: ${describeContext(context)} via ${options.connection}.\n\nUse it with --profile ${name}, or start MCP with:\n  synomem mcp --profile ${name}`,
+        );
+      },
+    );
+
+  profileCommand
+    .command('list')
+    .description('List profiles and presets')
+    .action((_options, command: Command) => {
+      const global = globals(command);
+      const config = profileStoreFor(global.home).read();
+      const lines = Object.entries(config.profiles).map(
+        ([name, profile]) =>
+          `${name === config.defaultProfile ? '*' : ' '} ${describeProfile(name, profile)}`,
+      );
+      output(
+        io,
+        global.json,
+        {
+          profiles: config.profiles,
+          presets: config.harnessPresets,
+          defaultProfile: config.defaultProfile ?? null,
+        },
+        lines.length
+          ? [
+              ...lines,
+              ...(Object.keys(config.harnessPresets).length
+                ? [
+                    '',
+                    'Presets:',
+                    ...Object.entries(config.harnessPresets).map(
+                      ([name, members]) => `  ${name}: ${members.join(', ')}`,
+                    ),
+                  ]
+                : []),
+            ].join('\n')
+          : 'No profiles. Run `synomem setup --backend local`, or `synomem connection login` then `synomem profile create`.',
+      );
+    });
+
+  profileCommand
+    .command('show <name>')
+    .description('Show one profile')
+    .action((name: string, _options, command: Command) => {
+      const global = globals(command);
+      const config = profileStoreFor(global.home).read();
+      const profile = config.profiles[name];
+      if (!profile) throw new SynomemError('CONFIG_INVALID', `Unknown profile "${name}".`);
+      output(
+        io,
+        global.json,
+        { name, ...profile, default: config.defaultProfile === name },
+        describeProfile(name, profile),
+      );
+    });
+
+  profileCommand
+    .command('remove <name>')
+    .description('Remove a profile (its connection and credential are kept)')
+    .option('--force', 'also remove it from presets that use it', false)
+    .action((name: string, options: { force: boolean }, command: Command) => {
+      const global = globals(command);
+      const store = profileStoreFor(global.home);
+      const config = store.read();
+      if (!config.profiles[name])
+        throw new SynomemError('CONFIG_INVALID', `Unknown profile "${name}".`);
+      const presets = Object.entries(config.harnessPresets)
+        .filter(([, members]) => members.includes(name))
+        .map(([preset]) => preset);
+      if (presets.length && !options.force) {
+        throw new SynomemError(
+          'INVALID_INPUT',
+          `Presets ${presets.join(', ')} use profile ${name}. Pass --force to remove it from them too.`,
+        );
+      }
+      const profiles = Object.fromEntries(
+        Object.entries(config.profiles).filter(([profileName]) => profileName !== name),
+      );
+      store.write({
+        ...config,
+        profiles,
+        harnessPresets: Object.fromEntries(
+          Object.entries(config.harnessPresets)
+            .map(
+              ([preset, members]) => [preset, members.filter((member) => member !== name)] as const,
+            )
+            .filter(([, members]) => members.length > 0),
+        ),
+        ...(config.defaultProfile === name ? { defaultProfile: undefined } : {}),
+      });
+      output(
+        io,
+        global.json,
+        { removed: name },
+        `Removed profile ${name}. Its connection and credential were kept.`,
+      );
+    });
+
+  profileCommand
+    .command('default <name>')
+    .description('Make a profile the default when nothing else selects one')
+    .action((name: string, _options, command: Command) => {
+      const global = globals(command);
+      const store = profileStoreFor(global.home);
+      const config = store.read();
+      if (!config.profiles[name])
+        throw new SynomemError('CONFIG_INVALID', `Unknown profile "${name}".`);
+      store.write({ ...config, defaultProfile: name });
+      output(io, global.json, { defaultProfile: name }, `Default profile: ${name}.`);
+    });
+
+  profileCommand
+    .command('use <name>')
+    .description('Bind this directory to a profile (writes .synomem/config.json)')
+    .action((name: string, _options, command: Command) => {
+      const global = globals(command);
+      const config = profileStoreFor(global.home).read();
+      if (!config.profiles[name])
+        throw new SynomemError('CONFIG_INVALID', `Unknown profile "${name}".`);
+      const path = writeProjectSelection(cwd, { profile: name });
+      output(
+        io,
+        global.json,
+        { path, profile: name },
+        `Wrote ${path}\n\nCommands and MCP servers started here now act as profile ${name} unless --profile or SYNOMEM_PROFILE says otherwise.`,
+      );
+    });
+
+  const presetCommand = program
+    .command('preset')
+    .description('Several profiles served by one explicit-context MCP server');
+
+  presetCommand
+    .command('create <name> <profiles...>')
+    .description('Create a preset from existing profiles')
+    .action((rawName: string, members: string[], _options, command: Command) => {
+      const global = globals(command);
+      const name = assertName(rawName, 'preset');
+      const store = profileStoreFor(global.home);
+      const config = store.read();
+      if (config.harnessPresets[name])
+        throw new SynomemError('CONFIG_INVALID', `Preset ${name} already exists.`);
+      const missing = members.filter((member) => !config.profiles[member]);
+      if (missing.length)
+        throw new SynomemError('CONFIG_INVALID', `Unknown profiles: ${missing.join(', ')}.`);
+      const contexts = members.map((member) => config.profiles[member]!.contextId);
+      if (new Set(contexts).size !== contexts.length) {
+        throw new SynomemError('CONFIG_INVALID', 'Two of those profiles select the same context.');
+      }
+      store.write({ ...config, harnessPresets: { ...config.harnessPresets, [name]: members } });
+      output(
+        io,
+        global.json,
+        { preset: name, profiles: members },
+        `Created preset ${name}: ${members.join(', ')}.\n\nStart it with:\n  synomem mcp --preset ${name} --contexts explicit`,
+      );
+    });
+
+  presetCommand.command('list').action((_options, command: Command) => {
+    const global = globals(command);
+    const config = profileStoreFor(global.home).read();
+    output(
+      io,
+      global.json,
+      { presets: config.harnessPresets },
+      Object.entries(config.harnessPresets)
+        .map(([name, members]) => `${name}: ${members.join(', ')}`)
+        .join('\n') || 'No presets.',
+    );
+  });
+
+  presetCommand.command('remove <name>').action((name: string, _options, command: Command) => {
+    const global = globals(command);
+    const store = profileStoreFor(global.home);
+    const config = store.read();
+    if (!config.harnessPresets[name])
+      throw new SynomemError('CONFIG_INVALID', `Unknown preset "${name}".`);
+    const harnessPresets = Object.fromEntries(
+      Object.entries(config.harnessPresets).filter(([preset]) => preset !== name),
+    );
+    store.write({ ...config, harnessPresets });
+    output(io, global.json, { removed: name }, `Removed preset ${name}.`);
+  });
+
+  /* ------------------------------------------------------------ identity */
+
+  program
+    .command('whoami')
+    .description('Show the selected profile, its effective context, and its credential source')
+    .action(async (_options, command: Command) => {
+      const global = globals(command);
+      const config = profileStoreFor(global.home).read();
+      const selection = selectionFor(global, config);
+      if (!selection) throw noSelectionError();
+      const deps = resolverDeps(global.home);
+      if (selection.kind === 'preset') {
+        const resolver = presetResolver(global.home, config, selection.name, deps);
+        try {
+          const listing = await resolver.list();
+          output(
+            io,
+            global.json,
+            { selection, listing },
+            [
+              `Preset ${selection.name} (from ${selection.source}) — explicit contexts:`,
+              ...listing.contexts.map(
+                (context) => `  ${context.contextId}  ${describeContext(context)}`,
+              ),
+            ].join('\n'),
+          );
+        } finally {
+          await resolver.close?.();
+        }
+        return;
+      }
+      const profile = config.profiles[selection.name]!;
+      const resolver = profileResolver(global.home, config, selection.name, deps);
+      try {
+        const { context } = await resolver.resolve();
+        const description = await resolver.describe?.().catch(() => undefined);
+        const source = isLocalProfile(profile)
+          ? `local store ${profile.home ?? global.home}`
+          : `connection ${profile.credentialRef} (${config.credentials[profile.credentialRef]?.store ?? '?'})`;
+        output(
+          io,
+          global.json,
+          {
+            selection,
+            effectiveContext: context,
+            credentialSource: source,
+            identity: description ?? null,
+          },
+          [
+            `Profile:   ${selection.name}  (from ${selection.source})`,
+            `Acting as: ${describeEffective(context)}`,
+            `Context:   ${context.contextId}`,
+            `Source:    ${source}`,
+            ...(description?.connection
+              ? [`Connection: ${description.connection.label} (${description.connection.id})`]
+              : []),
+            ...(description?.grant
+              ? [`Grant:     ${description.grant.mode}, ${description.grant.actions.join(' ')}`]
+              : []),
+          ].join('\n'),
+        );
+      } finally {
+        await resolver.close?.();
+      }
+    });
+
+  /* ------------------------------------------------------------ local stores */
+
+  const workspaceCommand = program
+    .command('workspace')
+    .description('Local stores on this machine, each a separate SQLite database');
+
+  workspaceCommand
+    .command('list')
+    .description('List the local stores on this machine')
+    .action((_options, command: Command) => {
+      const global = globals(command);
+      const workspaces = listLocalWorkspaces(global.home);
+      output(
+        io,
+        global.json,
+        { workspaces },
+        workspaces
+          .map(
+            (workspace) =>
+              `${workspace.name.padEnd(24)} ${workspace.initialized ? workspace.home : `${workspace.home} (not initialized)`}`,
+          )
+          .join('\n') || 'No local stores.',
       );
     });
 
   workspaceCommand
     .command('create <name>')
-    .description('Create a local workspace and initialize its store')
-    .action(async (name: string, _options, command: Command) => {
+    .description('Create a local store (then `profile create --local --store-home <path>`)')
+    .action((name: string, _options, command: Command) => {
       const global = globals(command);
       const home = localWorkspaceHome(name, global.home);
-      if (readSynomemConfig(home)) {
+      if (existsSync(join(home, 'config.json'))) {
         throw new SynomemError('INVALID_INPUT', `Workspace already exists: ${name}`);
       }
-      writeSynomemBackend({ kind: 'local' }, home);
-      // Opening it once creates the database, so `list` does not report a
-      // workspace that exists in name only.
-      await withClient(
-        home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        async () => undefined,
-      );
-      output(
-        io,
-        global.json,
-        { name, home },
-        `Created workspace ${name} at ${home}.\nAct in it with --workspace ${name}.`,
-      );
+      ensureLocalStore(home);
+      output(io, global.json, { name, home }, `Created local store ${name} at ${home}.`);
     });
 
-  const remoteCommand = program.command('remote').description('Administer a remote workspace');
+  /* ------------------------------------------------------------ remote import */
 
-  const remoteWorkspaceCommand = remoteCommand
-    .command('workspace')
-    .description('List or switch the workspace this credential addresses');
-
-  /*
-   * Every workspace this credential's account belongs to, and which are
-   * reachable right now with it — no new token needed for any workspace
-   * flagged reachable, since a human credential authorizes its whole
-   * organization, not permanently one workspace (see `workspace use`). Data
-   * plane (`/v1/identity`), not `/v1/me`: the latter is a first-party
-   * control-plane route gated by a service secret this CLI never holds, and
-   * would 401 unconditionally against the real hosted API.
-   */
-  remoteWorkspaceCommand
-    .command('list')
-    .description("List this credential's account's workspaces, and which are reachable now")
-    .option('--url <url>', 'internal: alternate HTTPS origin')
-    .action(async (options: { url?: string }, command: Command) => {
-      const global = globals(command);
-      const config = readSynomemConfig(global.home, env);
-      const baseUrl =
-        options.url ??
-        (config?.backend.kind === 'remote' ? config.backend.baseUrl : cloudApiUrl(env));
-      const accessToken = env.SYNOMEM_ACCESS_TOKEN;
-      if (!accessToken) {
-        throw new SynomemError(
-          'AUTH_REQUIRED',
-          'Set SYNOMEM_ACCESS_TOKEN, or run `synomem auth login` first.',
-        );
-      }
-      const identity = await discoverAccountIdentity({ baseUrl, accessToken });
-      const human = identity.workspaces.length
-        ? identity.workspaces
-            .map(
-              (workspace) =>
-                `${workspace.id}  ${workspace.displayName}` +
-                (workspace.addressableWithThisToken
-                  ? ''
-                  : '  (not reachable with this credential)'),
-            )
-            .join('\n')
-        : 'This credential belongs to no workspaces yet.';
-      output(io, global.json, identity, human);
-    });
-
-  /*
-   * A workspace flagged `addressableWithThisToken` by `workspace list` needs
-   * no new token or re-authentication — the credential already covers it.
-   * This only ever rewrites local config to point at it; see `backend use
-   * remote --workspace`, which this delegates to.
-   */
-  remoteWorkspaceCommand
-    .command('use <workspace-id>')
-    .description('Address a different workspace with the current remote credential')
-    .option('--url <url>', 'internal: alternate HTTPS origin')
-    .action((workspaceId: string, options: { url?: string }, command: Command) => {
-      const global = globals(command);
-      const config = writeSynomemBackend(
-        { kind: 'remote', baseUrl: options.url ?? cloudApiUrl(env), workspaceId },
-        global.home,
-      );
-      output(
-        io,
-        global.json,
-        { backend: config.backend },
-        `Now addressing workspace ${workspaceId}.`,
-      );
-    });
-
-  // Deprecated alias for `remote workspace list`, kept working rather than
-  // breaking anyone who already scripted the old name.
-  remoteCommand
-    .command('workspaces')
-    .description('Deprecated: use `remote workspace list`')
-    .option('--url <url>', 'internal: alternate HTTPS origin')
-    .action(async (options: { url?: string }, command: Command) => {
-      const global = globals(command);
-      const config = readSynomemConfig(global.home, env);
-      const baseUrl =
-        options.url ??
-        (config?.backend.kind === 'remote' ? config.backend.baseUrl : cloudApiUrl(env));
-      const accessToken = env.SYNOMEM_ACCESS_TOKEN;
-      if (!accessToken) {
-        throw new SynomemError(
-          'AUTH_REQUIRED',
-          'Set SYNOMEM_ACCESS_TOKEN, or run `synomem auth login` first.',
-        );
-      }
-      const identity = await discoverAccountIdentity({ baseUrl, accessToken });
-      const human = identity.workspaces.length
-        ? identity.workspaces
-            .map(
-              (workspace) =>
-                `${workspace.id}  ${workspace.displayName}` +
-                (workspace.addressableWithThisToken
-                  ? ''
-                  : '  (not reachable with this credential)'),
-            )
-            .join('\n')
-        : 'This credential belongs to no workspaces yet.';
-      output(io, global.json, identity, human);
-    });
+  const remoteCommand = program.command('remote').description('Hosted workspace administration');
 
   remoteCommand
     .command('import')
-    .description('Preview or confirm a one-way import from a local Synomem home')
+    .description(
+      'Preview or confirm a one-way import from a local store into the profile’s workspace',
+    )
     .requiredOption('--from-home <path>', 'source local Synomem home')
-    .requiredOption('--actor-id <id>', 'bound human administrator actor ID')
-    .option('--actor-name <name>', 'expected administrator display name')
     .option('--preview', 'validate and return a short-lived import plan')
     .option('--confirm <plan-id>', 'commit the exact bundle authorized by a preview')
     .action(
       async (
-        options: {
-          fromHome: string;
-          actorId: string;
-          actorName?: string;
-          preview?: boolean;
-          confirm?: string;
-        },
+        options: { fromHome: string; preview?: boolean; confirm?: string },
         command: Command,
       ) => {
         const global = globals(command);
         if (Boolean(options.preview) === Boolean(options.confirm)) {
           throw new SynomemError('INVALID_INPUT', 'Choose exactly one of --preview or --confirm.');
         }
-        const config = readSynomemConfig(global.home, env);
-        if (config?.backend.kind !== 'remote') {
-          throw new SynomemError('INVALID_INPUT', 'Select a remote backend before importing.');
+        const config = profileStoreFor(global.home).read();
+        const selection = selectionFor(global, config);
+        if (!selection || selection.kind !== 'profile') throw noSelectionError();
+        const profile = config.profiles[selection.name]!;
+        if (isLocalProfile(profile)) {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            'Importing needs a hosted profile (a human context with administration).',
+          );
         }
-        const backend = config.backend;
-        const administrator = actor('human', options.actorId, options.actorName);
+        const entry = config.credentials[profile.credentialRef]!;
         const bundle = await (dependencies.createImportBundle ?? createLocalImportBundle)(
           options.fromHome,
         );
+        const workspaceId = await withProfile(
+          command,
+          async (_service, context) => context.workspaceId,
+        );
         const result = dependencies.remoteImport
           ? await dependencies.remoteImport({
-              baseUrl: backend.baseUrl,
-              workspaceId: backend.workspaceId,
-              actor: administrator,
+              baseUrl: entry.apiUrl,
+              workspaceId,
+              contextId: profile.contextId,
               bundle,
               ...(options.confirm ? { planId: options.confirm } : {}),
             })
           : await (async () => {
-              const credentialProvider = env.SYNOMEM_ACCESS_TOKEN
-                ? { getAccessToken: async () => env.SYNOMEM_ACCESS_TOKEN }
-                : new StoredCredentialProvider(
-                    credentialReference(backend.baseUrl, backend.workspaceId, administrator),
-                    credentialStore,
-                    env,
-                    fetch,
-                    resolveHome(global.home),
-                  );
+              const source = credentialSourceFor(
+                global.home,
+                config,
+                profile.credentialRef,
+                resolverDeps(global.home),
+              );
               const importer = new RemoteImportClient({
-                baseUrl: backend.baseUrl,
-                workspaceId: backend.workspaceId,
-                credentialProvider,
+                baseUrl: entry.apiUrl,
+                workspaceId,
+                contextId: profile.contextId,
+                credentialProvider: { getAccessToken: () => source.bearer() },
+                fetch: fetchImplementation,
               });
               return options.confirm
                 ? await importer.confirm(bundle, options.confirm)
@@ -767,362 +1498,39 @@ export function createCli(
       },
     );
 
-  program
-    .command('init')
-    .description('Initialize the local Synomem database')
-    .action(async (_options, command: Command) => {
-      const options = globals(command);
-      const persisted = readSynomemConfig(options.home);
-      if (persisted?.backend.kind === 'remote') {
-        throw new SynomemError('INVALID_INPUT', 'The init command requires a local backend.');
-      }
-      await withClient(
-        options.home,
-        defaultActor(env, 'system', 'cli', options.actor),
-        async (client) => {
-          const info = await client.info();
-          if (info.backend !== 'local') {
-            throw new SynomemError('INVALID_INPUT', 'The init command requires a local backend.');
-          }
-          output(
-            io,
-            options.json,
-            { home: info.home, database: info.databasePath },
-            `Initialized Synomem at ${info.home}`,
-          );
-        },
-      );
-    });
-
-  /*
-   * `synomem config` is the canonical entry point. `configure` and `setup` are
-   * accepted because people reach for them, and a setup program that rejects
-   * the word somebody guessed is needlessly unhelpful.
-   */
-  const configCommand = program
-    .command('config')
-    .aliases(['configure', 'setup'])
-    .description('Set up Synomem, interactively or deterministically');
-
-  const applyPlan = async (
-    plan: ConfigPlan,
-    token: string | undefined,
-    global: { home?: string; json: boolean },
-  ): Promise<void> => {
-    const home = plan.home;
-    const serviceUrl = plan.serviceUrl ?? cloudApiUrl(env);
-
-    /*
-     * A member-owned access key reaches every workspace in its organization,
-     * never just one, so the workspace is discovered and then chosen — not
-     * typed from memory, and not assumed. An explicit --workspace still wins
-     * regardless: automation should not depend on a network round trip, and a
-     * person who already knows which one they want should not be asked again.
-     */
-    let workspaceId = plan.workspaceId;
-    // Only known once discovered below — printed in the final summary rather
-    // than the bare ID, so "what did config just do" reads like an answer
-    // instead of a lookup key.
-    let workspaceName: string | undefined;
-    if (plan.backend === 'remote' && !workspaceId && token) {
-      const discovered = await discoverWorkspaces({ baseUrl: serviceUrl, accessToken: token });
-      if (discovered.workspaces.length === 0) {
-        throw new SynomemError(
-          'INVALID_INPUT',
-          [
-            "This access key's organization has no workspaces yet.",
-            'Create one in the Synomem portal, then re-run this command — or pass',
-            '--workspace <workspace-id> once one exists.',
-          ].join('\n'),
-        );
-      } else if (discovered.workspaces.length === 1) {
-        workspaceId = discovered.workspaces[0]!.id;
-        workspaceName = discovered.workspaces[0]!.displayName;
-      } else if (promptIo.interactive) {
-        workspaceId = await select(
-          promptIo,
-          'Which workspace should this machine use?',
-          discovered.workspaces.map((workspace) => ({
-            value: workspace.id,
-            label: workspace.displayName,
-            detail: workspace.id,
-          })),
-        );
-        workspaceName = discovered.workspaces.find((w) => w.id === workspaceId)?.displayName;
-      } else {
-        throw new SynomemError(
-          'INVALID_INPUT',
-          [
-            'This access key can reach more than one workspace, so a non-interactive',
-            'setup needs to be told which one:',
-            '',
-            ...discovered.workspaces.map(
-              (workspace) => `  ${workspace.id}  ${workspace.displayName}`,
-            ),
-            '',
-            'Re-run with --workspace <workspace-id>.',
-          ].join('\n'),
-        );
-      }
-    }
-    if (plan.backend === 'remote' && !workspaceId) {
-      /*
-       * Signing in through a browser needs an actor identity and a client ID,
-       * which is `synomem auth login`'s job. Rather than write a remote
-       * backend with no workspace -- a configuration that fails on its first
-       * real use -- say exactly what remains.
-       */
-      output(
-        io,
-        global.json,
-        { applied: false, pending: 'sign-in', home, serviceUrl },
-        [
-          '',
-          'Nothing was configured yet: signing in through a browser is a separate step.',
-          '',
-          'Run, with the actor this machine acts as:',
-          '',
-          '  synomem auth login --actor-id <agent> --client-id <client>',
-          '',
-          'Then select the workspace it reports:',
-          '',
-          '  synomem backend use remote --workspace <workspace-id>',
-        ].join('\n'),
-      );
-      return;
-    }
-
-    const config = writeSynomemBackend(
-      plan.backend === 'local'
-        ? { kind: 'local' }
-        : { kind: 'remote', baseUrl: serviceUrl, workspaceId: workspaceId! },
-      home,
-    );
-
-    let credentialLocation: string | undefined;
-    if (token) {
-      if (plan.credentialStore === 'environment') {
-        io.stdout(`${environmentInstructions(token)}\n`);
-        credentialLocation = 'environment';
-      } else if (plan.credentialStore === 'file') {
-        credentialLocation = writeCredentialFile(home, token);
-      } else {
-        // The platform store is the default, and a failure falls back to the
-        // restricted file rather than leaving the credential nowhere.
-        try {
-          await credentialStore.set(`synomem:${workspaceId}`, {
-            kind: 'installation-key',
-            accessToken: token,
-          });
-          credentialLocation = 'platform credential store';
-        } catch {
-          credentialLocation = writeCredentialFile(home, token);
-        }
-      }
-    }
-
-    // Diagnostics run before success is claimed: a configuration that cannot
-    // open its own database is not a finished setup.
-    const diagnostics = await withClient(home, defaultActor(env, 'system', 'cli'), (client) =>
-      client.doctor(),
-    );
-
-    /*
-     * What to do next differs by exactly one thing: whether an agent can be
-     * created from here at all. An access key never carries the
-     * administrator authority agent creation requires (§ deliberate,
-     * independent of the key owner's own role) — local storage and a human
-     * browser sign-in both can. Telling everyone to just run `agent create`
-     * regardless was the CLI recommending a command guaranteed to fail for
-     * the single most common setup path.
-     */
-    const canCreateAgentHere = config.backend.kind === 'local' || plan.auth !== 'access-key';
-    const nextSteps = canCreateAgentHere
-      ? [
-          '  synomem agent create <handle> --name "<display name>"',
-          '  synomem skill install --runtime <claude|codex|cursor|...> --agent <agent-id>',
-        ]
-      : [
-          "  An access key can't create an agent — that needs an administrator,",
-          "  which a key never asserts on its own, regardless of the member's own",
-          "  role. Create one in the Synomem portal (a workspace's Actors page →",
-          '  New agent), then use its ID:',
-          '',
-          '  synomem skill install --runtime <claude|codex|cursor|...> --agent <agent-id>',
-        ];
-
-    output(
-      io,
-      global.json,
-      {
-        backend: config.backend,
-        home,
-        ...(credentialLocation ? { credentialSource: credentialLocation } : {}),
-        ...(token ? { credential: credentialFingerprint(token) } : {}),
-        healthy: diagnostics.healthy,
-        canCreateAgentHere,
-      },
-      [
-        '',
-        'Synomem is ready.',
-        '',
-        `  Backend:    ${config.backend.kind === 'local' ? 'Local SQLite' : 'Synomem Cloud'}`,
-        `  Home:       ${home}`,
-        ...(config.backend.kind === 'remote'
-          ? [
-              `  Service:    ${config.backend.baseUrl}`,
-              `  Workspace:  ${workspaceName ? `${workspaceName} (${config.backend.workspaceId})` : config.backend.workspaceId}`,
-            ]
-          : []),
-        ...(credentialLocation ? [`  Credential: ${credentialLocation}`] : []),
-        `  Database:   ${diagnostics.healthy ? 'Healthy' : 'Needs attention — run synomem doctor'}`,
-        '',
-        'Next: set up an agent for this machine.',
-        '',
-        ...nextSteps,
-        '',
-        'Full walkthrough, including the MCP connector for each platform, and a',
-        'prompt that does all of this for you:',
-        '  https://github.com/Coaden/synomem#let-your-agent-set-it-up',
-      ].join('\n'),
-    );
-  };
-
-  configCommand.action(async (_options, command: Command) => {
-    const global = globals(command);
-    assertInteractive(promptIo);
-    const plan = await runConfigWizard(promptIo, {
-      ...(global.home ? { home: global.home } : {}),
-      env,
-    });
-    const token = plan.auth === 'access-key' ? await readAccessToken(promptIo) : undefined;
-    if (!(await confirmPlan(promptIo, plan))) {
-      output(io, global.json, { applied: false }, 'Nothing was changed.');
-      return;
-    }
-    await applyPlan(plan, token, global);
-  });
-
-  configCommand
-    .command('init')
-    .description('Configure Synomem without prompting')
-    .option('--backend <kind>', 'local or remote')
-    .option('--auth <method>', 'browser or access-key')
-    .option('--credential-store <where>', 'auto, keychain, file, or environment', 'auto')
-    // The token is read from stdin, never taken as an argument: an argument is
-    // kept by the shell history and visible in the process list.
-    .option('--access-token-stdin', 'read the access key from stdin', false)
-    .option('--yes', 'apply without confirming', false)
-    .action(
-      async (
-        options: {
-          backend?: string;
-          auth?: string;
-          credentialStore: string;
-          accessTokenStdin: boolean;
-          yes: boolean;
-        },
-        command: Command,
-      ) => {
-        const global = globals(command);
-        if (options.backend !== 'local' && options.backend !== 'remote') {
-          throw new SynomemError('INVALID_INPUT', 'Pass --backend local or --backend remote.');
-        }
-        const backend: BackendChoice = options.backend;
-        // An access key can be asked which workspaces it reaches, so
-        // --workspace is only required when there is no key to ask.
-        if (backend === 'remote' && !global.workspace && !options.accessTokenStdin) {
-          throw new SynomemError(
-            'INVALID_INPUT',
-            'Remote setup requires --workspace, or --access-token-stdin so the key can be asked.',
-          );
-        }
-        const token = options.accessTokenStdin ? await readAccessToken(promptIo) : undefined;
-        if (backend === 'remote' && options.auth === 'access-key' && !token) {
-          throw new SynomemError(
-            'INVALID_INPUT',
-            'Access-key setup requires --access-token-stdin so the key is not passed as an argument.',
-          );
-        }
-        const plan: ConfigPlan = {
-          backend,
-          home: resolveHome(global.home),
-          ...(backend === 'remote'
-            ? {
-                serviceUrl: cloudApiUrl(env),
-                auth: (options.auth as AuthChoice | undefined) ?? 'access-key',
-                workspaceId: global.workspace,
-                credentialStore: options.credentialStore as CredentialStoreChoice,
-              }
-            : {}),
-        };
-        if (!options.yes) {
-          throw new SynomemError('INVALID_INPUT', 'Re-run with --yes to apply this configuration.');
-        }
-        await applyPlan(plan, token, global);
-      },
-    );
-
-  configCommand
-    .command('show')
-    .description('Show the current configuration without revealing secrets')
-    .action(async (_options, command: Command) => {
-      const global = globals(command);
-      const home = resolveHome(global.home);
-      const config = readSynomemConfig(global.home, env);
-      const backend = config?.backend ?? { kind: 'local' as const };
-      const credentialSource = env.SYNOMEM_ACCESS_TOKEN
-        ? 'environment (SYNOMEM_ACCESS_TOKEN)'
-        : existsSync(join(home, 'credentials', 'installation.json'))
-          ? 'restricted file'
-          : 'platform credential store or none';
-      output(
-        io,
-        global.json,
-        // Never the secret itself, only where it comes from.
-        { backend, home, credentialSource, stores: credentialStoreChoices().map((c) => c.value) },
-        [
-          `Backend:    ${backend.kind === 'local' ? 'Local SQLite' : 'Synomem Cloud'}`,
-          `Home:       ${home}`,
-          ...(backend.kind === 'remote'
-            ? [`Service:    ${backend.baseUrl}`, `Workspace:  ${backend.workspaceId}`]
-            : []),
-          `Credential: ${credentialSource}`,
-        ].join('\n'),
-      );
-    });
+  /* ------------------------------------------------------------ reset */
 
   program
     .command('reset')
-    .description('Remove Synomem configuration, database and credentials')
-    // Integrations are opt-in because they live in other tools' directories.
-    // Removing somebody's harness configuration as a side effect of resetting
-    // Synomem would be a surprise with no undo.
-    .option('--integrations', 'also remove installed skills and MCP registrations', false)
+    .description('Remove Synomem configuration, the local database, profiles and stored secrets')
+    .option('--integrations', 'also remove installed skills', false)
     .option('--yes', 'apply the displayed plan', false)
     .action(async (options: { integrations: boolean; yes: boolean }, command: Command) => {
       const global = globals(command);
-      const home = resolveHome(global.home);
-
-      /*
-       * Every target is an exact path, listed before anything is touched. No
-       * recursive delete is ever derived from a variable that might be empty:
-       * a reset that computes `rm -rf $HOME/` from an unset home is the
-       * failure this shape exists to make impossible.
-       */
+      const home = global.home;
+      const store = profileStoreFor(home);
+      const config = existsSync(store.path) ? store.read() : undefined;
+      const secrets = Object.entries(config?.credentials ?? {})
+        .filter(([, entry]) => entry.store !== 'environment')
+        .map(([name, entry]) => ({ name, entry }));
+      // Every target is an exact path; no recursive delete is derived from a
+      // variable that might be empty.
       const targets = [
         join(home, 'config.json'),
+        join(home, 'profiles.json'),
         join(home, 'synomem.sqlite3'),
         join(home, 'synomem.sqlite3-wal'),
         join(home, 'synomem.sqlite3-shm'),
-        join(home, 'credentials', 'installation.json'),
+        ...secrets
+          .filter(({ entry }) => entry.store === 'file')
+          .map(({ entry }) => join(home, 'credentials', `${entry.secretRef}.json`)),
       ].filter((path) => existsSync(path));
-
+      const keychain = secrets
+        .filter(({ entry }) => entry.store === 'keychain')
+        .map(({ name }) => name);
       const skillPlan = options.integrations ? uninstallSkill({ apply: false }) : undefined;
       const skillTargets =
         skillPlan?.locations
-          // Installed Synomem-owned copies only; an unowned directory at
-          // the same path is not ours to remove.
           .filter((location) => location.state === 'current' || location.state === 'stale')
           .map((location) => location.target) ?? [];
 
@@ -1130,351 +1538,111 @@ export function createCli(
         output(
           io,
           global.json,
-          { targets, skillTargets, applied: false },
+          { targets, keychain, skillTargets, applied: false },
           [
             'This will remove:',
-            ...(targets.length ? targets.map((path) => `  ${path}`) : ['  (nothing found)']),
-            ...(skillTargets.length ? ['', 'And these Synomem-owned skills:'] : []),
-            ...skillTargets.map((path) => `  ${path}`),
+            ...(targets.length ? targets.map((path) => `  ${path}`) : ['  (no files found)']),
+            ...(keychain.length
+              ? [
+                  '',
+                  'And the keychain secrets of connections:',
+                  ...keychain.map((name) => `  ${name}`),
+                ]
+              : []),
+            ...(skillTargets.length
+              ? ['', 'And these Synomem-owned skills:', ...skillTargets.map((path) => `  ${path}`)]
+              : []),
             '',
-            ...(options.integrations
-              ? []
-              : ['Installed skills and MCP registrations are left alone.', '']),
+            'Server-side authorizations are not revoked; do that in the portal.',
             'Run with --yes to continue.',
           ].join('\n'),
         );
         return;
       }
-
-      const removed: string[] = [];
-      for (const path of targets) {
-        rmSync(path, { force: true });
-        removed.push(path);
+      const stores = storesFor(home);
+      for (const { entry } of secrets.filter(({ entry }) => entry.store === 'keychain')) {
+        await stores.keychain.delete(entry.secretRef!).catch(() => false);
       }
-      // Only ownership-stamped Synomem skills are removed, which uninstall
-      // already enforces — an unowned directory at the same path is left.
+      for (const path of targets) rmSync(path, { force: true });
       const skillResult = options.integrations ? uninstallSkill({ apply: true }) : undefined;
-
       output(
         io,
         global.json,
-        { removed, skills: skillResult?.locations ?? [] },
+        { removed: targets, keychain, skills: skillResult?.locations ?? [] },
         [
-          `Removed ${removed.length} file(s).`,
-          ...(skillResult
-            ? [`Skill locations processed: ${skillResult.locations.length}.`]
-            : ['Installed skills and MCP registrations were left alone.']),
+          `Removed ${targets.length} file(s)${keychain.length ? ` and ${keychain.length} keychain secret(s)` : ''}.`,
+          ...(skillResult ? [`Skill locations processed: ${skillResult.locations.length}.`] : []),
         ].join('\n'),
       );
     });
 
-  const backendCommand = program
-    .command('backend')
-    .description('Inspect or select the canonical backend');
-  backendCommand
-    .command('show')
-    .description('Show backend selection without connecting')
-    .action((_options, command: Command) => {
-      const global = globals(command);
-      const config = readSynomemConfig(global.home);
-      const backend = config?.backend ?? { kind: 'local' as const };
-      const human =
-        backend.kind === 'local'
-          ? `Backend: local${config ? `\nWorkspace: ${config.workspaceId}` : ' (not initialized)'}`
-          : `Backend: remote\nURL: ${backend.baseUrl}\nWorkspace: ${backend.workspaceId}`;
-      output(io, global.json, { backend, initialized: config !== undefined }, human);
-    });
-  backendCommand
-    .command('use')
-    .description('Select local or remote canonical state')
-    .argument('<kind>', 'local or remote')
-    // --url is for development and private deployments. It stays out of the
-    // README, the public docs and the packaged skill: public onboarding must
-    // never ask for a service address, because a person has no way to tell a
-    // real one from a phished one.
-    .option('--url <url>', 'internal: alternate HTTPS origin')
-    .action((kind: string, options: { url?: string }, command: Command) => {
-      const global = globals(command);
-      if (kind !== 'local' && kind !== 'remote') {
-        throw new SynomemError('INVALID_INPUT', 'Backend kind must be local or remote.');
-      }
-      if (kind === 'remote' && !global.workspace) {
-        throw new SynomemError('INVALID_INPUT', 'Remote backend selection requires --workspace.');
-      }
-      const config = writeSynomemBackend(
-        kind === 'local'
-          ? { kind: 'local' }
-          : {
-              kind: 'remote',
-              baseUrl: options.url ?? cloudApiUrl(env),
-              workspaceId: global.workspace!,
-            },
-        global.home,
-      );
-      output(
-        io,
-        global.json,
-        { backend: config.backend },
-        `Selected ${config.backend.kind} Synomem backend.`,
-      );
-    });
-
-  /*
-   * `show` reads the config file; `status` proves the selection actually works.
-   *
-   * The two are deliberately separate. A person debugging a broken setup needs
-   * to know what is configured even when nothing can be reached, and a person
-   * checking that a setup is live needs a connection to have been made. One
-   * command doing both would make a printed workspace ID look like a reachable
-   * workspace.
-   */
-  backendCommand
-    .command('status')
-    .description('Connect to the selected backend and report what answered')
-    .action(async (_options, command: Command) => {
-      const global = globals(command);
-      const config = readSynomemConfig(global.home);
-      if (!config) {
-        throw new SynomemError(
-          'CONFIG_INVALID',
-          'No Synomem home here yet. Run `synomem config init` first.',
-        );
-      }
-      const result = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        async (client) => ({
-          info: await client.info(),
-          capabilities: await client.capabilities(),
-          diagnostics: (await client.doctor()).diagnostics.filter(
-            (item) => item.level === 'error' || item.level === 'warning',
-          ),
-        }),
-      );
-      const { info, capabilities, diagnostics } = result;
-      const where =
-        info.backend === 'local'
-          ? `Home: ${info.home}\nDatabase: ${info.databasePath}`
-          : `URL: ${info.baseUrl}`;
-      const problems = diagnostics.length
-        ? diagnostics
-            .map((item) => `${item.level.toUpperCase()} ${item.code}: ${item.message}`)
-            .join('\n')
-        : 'No warnings or errors.';
-      const human = [
-        `Backend: ${info.backend} (reachable)`,
-        where,
-        `Workspace: ${capabilities.binding.workspaceId}`,
-        `Acting as: ${capabilities.binding.actor.kind} ${capabilities.binding.actor.id}`,
-        problems,
-      ].join('\n');
-      output(io, global.json, { reachable: true, info, capabilities, diagnostics }, human);
-      if (diagnostics.some((item) => item.level === 'error')) cliExitCodes.set(program, 5);
-    });
-
-  const projectionCommand = program
-    .command('projection')
-    .description('Inspect the generated files Synomem derives from events');
-  projectionCommand
-    .command('status')
-    .description('Report whether the generated files match the canonical events')
-    .action(async (_options, command: Command) => {
-      const global = globals(command);
-      const status = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => {
-          if (!client.projectionStatus) {
-            throw new SynomemError(
-              'INVALID_INPUT',
-              'The remote backend keeps no filesystem projections, so there is nothing to report.',
-            );
-          }
-          return client.projectionStatus();
-        },
-      );
-      const enabled = Object.entries(status.settings)
-        .filter(([, on]) => on)
-        .map(([name]) => name);
-      const lines = [
-        `Directory: ${status.directory ?? '(none)'}`,
-        `Enabled: ${enabled.length ? enabled.join(', ') : 'none'}`,
-        `Last rebuilt: ${status.lastRebuiltAt ?? 'never'}`,
-        status.current
-          ? `Current: ${status.counts.manifest} generated file(s) match the events.`
-          : `Stale: ${status.counts.missing} missing, ${status.counts.unexpected} no longer expected. Run \`synomem rebuild\`.`,
-      ];
-      for (const path of status.missing) lines.push(`  missing     ${path}`);
-      for (const path of status.unexpected) lines.push(`  unexpected  ${path}`);
-      output(io, global.json, status, lines.join('\n'));
-    });
-
-  const authCommand = program.command('auth').description('Inspect remote authentication');
-  authCommand
-    .command('status')
-    .description('Report token availability without printing it')
-    .option('--actor-id <id>', 'bound actor ID (or SYNOMEM_ACTOR_ID)')
-    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
-    .action(async (options: { actorId?: string; actorKind: string }, command: Command) => {
-      const global = globals(command);
-      if (env.SYNOMEM_ACCESS_TOKEN) {
-        output(
-          io,
-          global.json,
-          { authenticated: true, source: 'environment' },
-          'Remote authentication token is available from SYNOMEM_ACCESS_TOKEN.',
-        );
-        return;
-      }
-      const config = readSynomemConfig(global.home, env);
-      if (config?.backend.kind !== 'remote') {
-        throw new SynomemError(
-          'INVALID_INPUT',
-          'Select a remote backend before checking authentication.',
-        );
-      }
-      const actorId = options.actorId ?? env.SYNOMEM_ACTOR_ID;
-      if (!actorId) throw new SynomemError('INVALID_INPUT', 'Specify --actor-id.');
-      const reference = credentialReference(
-        config.backend.baseUrl,
-        config.backend.workspaceId,
-        actor(options.actorKind, actorId),
-      );
-      const available = Boolean(await credentialStore.get(reference));
-      output(
-        io,
-        global.json,
-        { authenticated: available, source: available ? 'os-credential-store' : undefined },
-        available
-          ? 'A remote credential is available in the operating-system credential store.'
-          : 'Remote authentication is not configured.',
-      );
-    });
-  authCommand
-    .command('login')
-    .description('Authorize this actor with OAuth 2.1 authorization code and PKCE')
-    .requiredOption('--actor-id <id>', 'bound actor ID')
-    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
-    .option('--actor-name <name>', 'expected actor display name')
-    .option('--client-id <id>', 'registered public OAuth client ID (or SYNOMEM_OAUTH_CLIENT_ID)')
-    .option('--scope <scope>', 'requested OAuth scopes')
-    .option('--callback-port <port>', 'loopback callback port', '43817')
-    .action(
-      async (
-        options: {
-          actorId: string;
-          actorKind: string;
-          actorName?: string;
-          clientId?: string;
-          scope?: string;
-          callbackPort: string;
-        },
-        command: Command,
-      ) => {
-        const global = globals(command);
-        const config = readSynomemConfig(global.home, env);
-        if (config?.backend.kind !== 'remote') {
-          throw new SynomemError('INVALID_INPUT', 'Select a remote backend before login.');
-        }
-        const configuredActor = actor(options.actorKind, options.actorId, options.actorName);
-        const clientId = options.clientId ?? env.SYNOMEM_OAUTH_CLIENT_ID;
-        if (!clientId) throw new SynomemError('INVALID_INPUT', 'Specify --client-id.');
-        const callbackPort = Number(options.callbackPort);
-        if (!Number.isSafeInteger(callbackPort) || callbackPort < 1 || callbackPort > 65_535) {
-          throw new SynomemError('INVALID_INPUT', '--callback-port must be from 1 through 65535.');
-        }
-        const reference = credentialReference(
-          config.backend.baseUrl,
-          config.backend.workspaceId,
-          configuredActor,
-        );
-        await oauthLogin({
-          baseUrl: config.backend.baseUrl,
-          clientId,
-          credentialReference: reference,
-          credentialStore,
-          callbackPort,
-          ...(options.scope ? { scope: options.scope } : {}),
-        });
-        try {
-          await verifyRemoteCredential({
-            baseUrl: config.backend.baseUrl,
-            workspaceId: config.backend.workspaceId,
-            actor: configuredActor,
-            reference,
-            credentialStore,
-          });
-        } catch (error) {
-          await credentialStore.delete(reference);
-          throw error;
-        }
-        output(
-          io,
-          global.json,
-          { authenticated: true, source: 'os-credential-store', actor: configuredActor },
-          `Authorized ${configuredActor.kind}:${configuredActor.id}; the credential is stored by the operating system.`,
-        );
-      },
-    );
-  authCommand
-    .command('logout')
-    .description('Remove the stored OAuth credential for one actor')
-    .requiredOption('--actor-id <id>', 'bound actor ID')
-    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
-    .action(async (options: { actorId: string; actorKind: string }, command: Command) => {
-      const global = globals(command);
-      const config = readSynomemConfig(global.home, env);
-      if (config?.backend.kind !== 'remote') {
-        throw new SynomemError('INVALID_INPUT', 'Select a remote backend before logout.');
-      }
-      const configuredActor = actor(options.actorKind, options.actorId);
-      const removed = await credentialStore.delete(
-        credentialReference(config.backend.baseUrl, config.backend.workspaceId, configuredActor),
-      );
-      output(
-        io,
-        global.json,
-        { authenticated: false, removed },
-        removed
-          ? 'Removed the stored Synomem credential.'
-          : 'No stored Synomem credential existed.',
-      );
-    });
+  /* ------------------------------------------------------------ agents */
 
   const agentCommand = program
     .command('agent')
     .description('Create and inspect stable agent identities');
+
   agentCommand
     .command('create <handle>')
     .description('Create an agent. The canonical ID is generated, not chosen.')
     .requiredOption('--name <display-name>', 'display name')
     .option('--alias <name>', 'alias (repeatable)', collect, [])
     .option('--description <text>')
+    .option('--create-profile', 'local store: also create a same-named fixed profile', false)
     .action(
       async (
         handle: string,
-        options: { name: string; alias: string[]; description?: string },
+        options: { name: string; alias: string[]; description?: string; createProfile: boolean },
         command: Command,
       ) => {
         const global = globals(command);
-        const profile = await withClient(
-          global.home,
-          defaultActor(env, 'system', 'cli', global.actor),
-          (client) =>
-            client.agents.create({
-              handle,
-              displayName: options.name,
-              ...(options.alias.length ? { aliases: options.alias } : {}),
-              ...(options.description ? { description: options.description } : {}),
+        const created = await withManagement(command, async (service, context, storeHome) => ({
+          agent: await service.agents.create({
+            handle,
+            displayName: options.name,
+            ...(options.alias.length ? { aliases: options.alias } : {}),
+            ...(options.description ? { description: options.description } : {}),
+          }),
+          remote: context !== undefined,
+          storeHome,
+        }));
+        const agent = created.agent;
+        let profileName: string | undefined;
+        if (options.createProfile) {
+          if (created.remote || !created.storeHome) {
+            throw new SynomemError(
+              'INVALID_INPUT',
+              `Created ${agent.handle} (${agent.id}), but --create-profile works for local stores only. For a hosted agent, authorize it for a connection and run \`synomem profile create\`.`,
+            );
+          }
+          const store = profileStoreFor(global.home);
+          const config = store.read();
+          profileName = assertName(agent.handle, 'profile');
+          if (config.profiles[profileName]) {
+            throw new SynomemError(
+              'CONFIG_INVALID',
+              `Created ${agent.handle} (${agent.id}), but profile ${profileName} already exists.`,
+            );
+          }
+          const profile: LocalProfile = {
+            backend: 'local',
+            ...(created.storeHome !== global.home ? { home: created.storeHome } : {}),
+            actorId: agent.id,
+            actorName: agent.displayName,
+            contextId: localContextId(localStoreWorkspaceId(created.storeHome), {
+              kind: 'agent',
+              id: agent.id,
             }),
-        );
-        // Both are printed because both matter: the handle is what people type,
-        // the ID is what every event records and what MCP registration uses.
+          };
+          store.write({ ...config, profiles: { ...config.profiles, [profileName]: profile } });
+        }
         output(
           io,
           global.json,
-          profile,
-          `Created ${profile.displayName}\n\nHandle:   ${profile.handle}\nAgent ID: ${profile.id}`,
+          { ...agent, ...(profileName ? { profileCreated: profileName } : {}) },
+          `Created ${agent.displayName}\n\nHandle:   ${agent.handle}\nAgent ID: ${agent.id}${
+            profileName ? `\nProfile:  ${profileName} (synomem mcp --profile ${profileName})` : ''
+          }`,
         );
       },
     );
@@ -1488,10 +1656,8 @@ export function createCli(
     .description('Add aliases, keeping the ones already there')
     .action(async (agent: string, aliases: string[], _options, command: Command) => {
       const global = globals(command);
-      const profile = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.agents.addAliases(agent, aliases),
+      const profile = await withManagement(command, (service) =>
+        service.agents.addAliases(agent, aliases),
       );
       output(io, global.json, profile, `Aliases: ${(profile.aliases ?? []).join(', ') || 'none'}`);
     });
@@ -1501,10 +1667,8 @@ export function createCli(
     .description('Remove aliases, keeping the rest')
     .action(async (agent: string, aliases: string[], _options, command: Command) => {
       const global = globals(command);
-      const profile = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.agents.removeAliases(agent, aliases),
+      const profile = await withManagement(command, (service) =>
+        service.agents.removeAliases(agent, aliases),
       );
       output(io, global.json, profile, `Aliases: ${(profile.aliases ?? []).join(', ') || 'none'}`);
     });
@@ -1514,10 +1678,8 @@ export function createCli(
     .description('Change an agent handle. Its canonical ID never changes.')
     .action(async (agent: string, handle: string, _options, command: Command) => {
       const global = globals(command);
-      const profile = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.agents.update(agent, { handle }),
+      const profile = await withManagement(command, (service) =>
+        service.agents.update(agent, { handle }),
       );
       output(
         io,
@@ -1532,11 +1694,7 @@ export function createCli(
     .description('Stop an agent acting, keeping its records and history')
     .action(async (agent: string, _options, command: Command) => {
       const global = globals(command);
-      const profile = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.agents.archive(agent),
-      );
+      const profile = await withManagement(command, (service) => service.agents.archive(agent));
       output(io, global.json, profile, `Archived ${profile.handle} (${profile.id})`);
     });
 
@@ -1545,263 +1703,8 @@ export function createCli(
     .description('Let an archived agent act again')
     .action(async (agent: string, _options, command: Command) => {
       const global = globals(command);
-      const profile = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.agents.restore(agent),
-      );
+      const profile = await withManagement(command, (service) => service.agents.restore(agent));
       output(io, global.json, profile, `Restored ${profile.handle} (${profile.id})`);
-    });
-
-  const topicCommand = program
-    .command('topic')
-    .description('Create and manage topics — a stable, reusable subject any record can carry');
-
-  topicCommand
-    .command('create <display-name>')
-    .description('Create a topic. Any actor may create one.')
-    .option('--alias <name>', 'alias (repeatable)', collect, [])
-    .action(async (displayName: string, options: { alias: string[] }, command: Command) => {
-      const global = globals(command);
-      const topic = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) =>
-          client.topics.create({
-            displayName,
-            ...(options.alias.length ? { aliases: options.alias } : {}),
-          }),
-      );
-      output(io, global.json, topic, `Created ${topic.displayName}\n\nTopic ID: ${topic.id}`);
-    });
-
-  topicCommand
-    .command('list')
-    .description('List known topics')
-    .option('--status <status>', 'active or archived')
-    .action(async (options: { status?: string }, command: Command) => {
-      const global = globals(command);
-      const topics = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) =>
-          client.topics.list(
-            options.status ? { status: options.status as 'active' | 'archived' } : {},
-          ),
-      );
-      const human = topics.length
-        ? topics
-            .map(
-              (topic) =>
-                `${topic.displayName}${topic.status === 'archived' ? '  [archived]' : ''}${
-                  topic.aliases?.length ? `  aliases: ${topic.aliases.join(', ')}` : ''
-                }\n  ${topic.id}`,
-            )
-            .join('\n')
-        : 'No topics yet.';
-      output(io, global.json, { topics }, human);
-    });
-
-  topicCommand
-    .command('show <id>')
-    .description('Show one topic, resolving aliases')
-    .action(async (id: string, _options, command: Command) => {
-      const global = globals(command);
-      const topic = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.topics.get(id),
-      );
-      output(
-        io,
-        global.json,
-        topic,
-        `${topic.displayName}\n\nTopic ID: ${topic.id}\nStatus:   ${topic.status}\nAliases:  ${topic.aliases?.join(', ') ?? 'none'}`,
-      );
-    });
-
-  topicCommand
-    .command('resolve <name>')
-    .description('Resolve a name or alias to one topic, or list the candidates')
-    .action(async (name: string, _options, command: Command) => {
-      const global = globals(command);
-      const resolution = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.topics.resolve(name),
-      );
-      const human = resolution.match
-        ? `${resolution.match.displayName} (${resolution.match.id})`
-        : resolution.candidates.length
-          ? `"${resolution.query}" is ambiguous. Candidates:\n${resolution.candidates
-              .map((topic) => `  ${topic.id}  ${topic.displayName}`)
-              .join('\n')}`
-          : `No topic answers to "${resolution.query}".`;
-      output(io, global.json, resolution, human);
-    });
-
-  topicCommand
-    .command('rename <id> <display-name>')
-    .description("Change a topic's display name. Its ID never changes.")
-    .action(async (id: string, displayName: string, _options, command: Command) => {
-      const global = globals(command);
-      const topic = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.topics.update(id, { displayName }),
-      );
-      output(
-        io,
-        global.json,
-        topic,
-        `Renamed to ${topic.displayName}\nTopic ID: ${topic.id} (unchanged)`,
-      );
-    });
-
-  topicCommand
-    .command('archive <id>')
-    .description('Stop a topic being attached to new records, keeping the ones it already has')
-    .action(async (id: string, _options, command: Command) => {
-      const global = globals(command);
-      const topic = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.topics.archive(id),
-      );
-      output(io, global.json, topic, `Archived ${topic.displayName} (${topic.id})`);
-    });
-
-  topicCommand
-    .command('restore <id>')
-    .description('Let an archived topic be attached to new records again')
-    .action(async (id: string, _options, command: Command) => {
-      const global = globals(command);
-      const topic = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.topics.restore(id),
-      );
-      output(io, global.json, topic, `Restored ${topic.displayName} (${topic.id})`);
-    });
-
-  const skillCommand = program
-    .command('skill')
-    .description('Install and maintain the packaged agent skill');
-
-  skillCommand
-    .command('install')
-    .description('Plan or install the skill for detected agent runtimes')
-    .option('--runtime <runtime>', `${skillRuntimeHelp} (repeatable)`, collect, [])
-    .option('--yes', 'apply the displayed plan', false)
-    .option('--force', 'replace a conflicting synomem directory', false)
-    .option('--link', 'symlink to the packaged skill instead of copying it', false)
-    .option('--agent <id-or-alias>', 'bind this installation to an agent')
-    .action(
-      async (
-        options: {
-          runtime: string[];
-          yes: boolean;
-          force: boolean;
-          link: boolean;
-          agent?: string;
-        },
-        command: Command,
-      ) => {
-        const global = globals(command);
-        const runtimes = skillRuntimes(options.runtime);
-
-        /*
-         * The agent is resolved BEFORE anything is written. An ambiguous or
-         * unknown name then stops the command with a name to fix, rather than
-         * leaving a skill installed and pointed at an agent that does not
-         * exist.
-         */
-        let agentId: string | undefined;
-        if (options.agent) {
-          agentId = await withClient(
-            global.home,
-            defaultActor(env, 'system', 'cli', global.actor),
-            async (client) => {
-              const resolution = await client.agents.resolve(options.agent!);
-              if (!resolution.match) {
-                throw new SynomemError(
-                  'AGENT_NOT_FOUND',
-                  resolution.candidates.length
-                    ? `"${options.agent}" matches ${resolution.candidates.length} agents: ${resolution.candidates
-                        .map((candidate) => candidate.id)
-                        .join(', ')}. Name one of them.`
-                    : `Unknown agent: ${options.agent}`,
-                );
-              }
-              return resolution.match.id;
-            },
-          );
-        }
-
-        const result = installSkill({
-          ...(runtimes ? { runtimes } : {}),
-          apply: options.yes,
-          force: options.force,
-          link: options.link,
-          ...(agentId ? { agentId } : {}),
-        });
-
-        // Bindings follow what was actually installed, and only on a real run:
-        // a dry run must not claim a binding it did not make, and a runtime
-        // whose harness is not present here is not somewhere this agent runs.
-        if (agentId && options.yes) {
-          const installed = result.locations
-            .filter((location) => location.state !== 'unavailable')
-            .map((location) => location.runtime);
-          if (installed.length) {
-            /*
-             * Recording where you yourself run is self-service (§ the
-             * server's own `isSelf` check), but only when the request
-             * actually asserts that agent's identity — recording it as the
-             * generic `system/cli` placeholder looks like binding SOME OTHER
-             * agent's runtime, which is administration and a remote backend
-             * rightly refuses without an admin credential.
-             */
-            await withClient(global.home, actor('agent', agentId), async (client) => {
-              for (const runtime of installed) {
-                await client.agents.bindRuntime({ agentId, runtime });
-              }
-            });
-          }
-        }
-
-        output(io, global.json, result, formatSkillResult(result, 'install'));
-      },
-    );
-
-  skillCommand
-    .command('status')
-    .description('Show installed, stale, missing, or conflicting skill copies')
-    .option('--runtime <runtime>', `${skillRuntimeHelp} (repeatable)`, collect, [])
-    .option('--agent <id>', 'print the registration command for this agent')
-    .action((options: { runtime: string[]; agent?: string }, command: Command) => {
-      const global = globals(command);
-      const result = skillStatus({
-        runtimes: skillRuntimes(options.runtime),
-        ...(options.agent ? { agentId: options.agent } : {}),
-      });
-      output(io, global.json, result, formatSkillResult(result, 'status'));
-    });
-
-  skillCommand
-    .command('uninstall')
-    .description('Plan or remove Synomem-owned skill installations')
-    .option('--runtime <runtime>', `${skillRuntimeHelp} (repeatable)`, collect, [])
-    .option('--yes', 'apply the displayed plan', false)
-    .option('--force', 'remove a conflicting synomem directory', false)
-    .action((options: { runtime: string[]; yes: boolean; force: boolean }, command: Command) => {
-      const global = globals(command);
-      const result = uninstallSkill({
-        runtimes: skillRuntimes(options.runtime),
-        apply: options.yes,
-        force: options.force,
-      });
-      output(io, global.json, result, formatSkillResult(result, 'uninstall'));
     });
 
   agentCommand
@@ -1809,20 +1712,14 @@ export function createCli(
     .description('List known agent identities')
     .action(async (_options, command: Command) => {
       const global = globals(command);
-      const agents = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.agents.list(),
-      );
+      const agents = await withManagement(command, (service) => service.agents.list());
       const human = agents.length
         ? agents
             .map(
               (profile) =>
-                // Handle first: it is what people type. The canonical ID
-                // follows because MCP registration needs it.
-                `${profile.handle}  ${profile.displayName}${
-                  profile.status === 'archived' ? '  [archived]' : ''
-                }${profile.aliases?.length ? `  aliases: ${profile.aliases.join(', ')}` : ''}\n  ${profile.id}`,
+                `${profile.handle}  ${profile.displayName}${profile.status === 'archived' ? '  [archived]' : ''}${
+                  profile.aliases?.length ? `  aliases: ${profile.aliases.join(', ')}` : ''
+                }\n  ${profile.id}`,
             )
             .join('\n')
         : 'No agents configured.';
@@ -1834,11 +1731,7 @@ export function createCli(
     .description('Show one agent profile, resolving aliases')
     .action(async (id: string, _options, command: Command) => {
       const global = globals(command);
-      const profile = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.agents.get(id),
-      );
+      const profile = await withManagement(command, (service) => service.agents.get(id));
       output(
         io,
         global.json,
@@ -1862,15 +1755,12 @@ export function createCli(
       ) => {
         const global = globals(command);
         const hasAliases = options.clearAliases || options.alias.length > 0;
-        const profile = await withClient(
-          global.home,
-          defaultActor(env, 'system', 'cli', global.actor),
-          (client) =>
-            client.agents.update(id, {
-              ...(options.name ? { displayName: options.name } : {}),
-              ...(hasAliases ? { aliases: options.clearAliases ? [] : options.alias } : {}),
-              ...(options.description !== undefined ? { description: options.description } : {}),
-            }),
+        const profile = await withManagement(command, (service) =>
+          service.agents.update(id, {
+            ...(options.name ? { displayName: options.name } : {}),
+            ...(hasAliases ? { aliases: options.clearAliases ? [] : options.alias } : {}),
+            ...(options.description !== undefined ? { description: options.description } : {}),
+          }),
         );
         output(io, global.json, profile, `Updated ${profile.displayName} (${profile.id})`);
       },
@@ -1881,13 +1771,7 @@ export function createCli(
     .description('Resolve a name or alias to one agent, or list the candidates')
     .action(async (name: string, _options, command: Command) => {
       const global = globals(command);
-      const resolution = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.agents.resolve(name),
-      );
-      // An ambiguous name is a question, not a failure: exit zero and show the
-      // candidates so the caller can pick one.
+      const resolution = await withManagement(command, (service) => service.agents.resolve(name));
       const human = resolution.match
         ? `${resolution.match.displayName} (${resolution.match.id})`
         : resolution.candidates.length
@@ -1903,11 +1787,7 @@ export function createCli(
     .description('List agents with their runtime bindings')
     .action(async (_options, command: Command) => {
       const global = globals(command);
-      const entries = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.agents.directory(),
-      );
+      const entries = await withManagement(command, (service) => service.agents.directory());
       const human = entries.length
         ? entries
             .map((entry) => {
@@ -1916,8 +1796,6 @@ export function createCli(
                     .map(
                       (binding) =>
                         `    ${binding.runtime}${binding.profile ? `/${binding.profile}` : ''}` +
-                        // Last-seen is advisory, so it is labelled as an
-                        // observation rather than a status.
                         `${binding.lastSeenAt ? `  last seen ${binding.lastSeenAt}` : '  not yet seen'}`,
                     )
                     .join('\n')
@@ -1935,25 +1813,20 @@ export function createCli(
     .command('bind <agent>')
     .description('Bind an agent to a runtime')
     .requiredOption('--runtime <name>', 'runtime family, e.g. claude-code')
-    .option('--profile <name>', 'named configuration within the runtime')
-    .option('--installation <id>', 'hosted installation this binding belongs to')
+    .option('--runtime-profile <name>', 'named configuration within the runtime')
     .action(
       async (
         agent: string,
-        options: { runtime: string; profile?: string; installation?: string },
+        options: { runtime: string; runtimeProfile?: string },
         command: Command,
       ) => {
         const global = globals(command);
-        const binding = await withClient(
-          global.home,
-          defaultActor(env, 'system', 'cli', global.actor),
-          (client) =>
-            client.agents.bindRuntime({
-              agentId: agent,
-              runtime: options.runtime,
-              ...(options.profile ? { profile: options.profile } : {}),
-              ...(options.installation ? { installationId: options.installation } : {}),
-            }),
+        const binding = await withManagement(command, (service) =>
+          service.agents.bindRuntime({
+            agentId: agent,
+            runtime: options.runtime,
+            ...(options.runtimeProfile ? { profile: options.runtimeProfile } : {}),
+          }),
         );
         output(
           io,
@@ -1964,30 +1837,20 @@ export function createCli(
       },
     );
 
-  /*
-   * With no agent named this answers the question people actually arrive with:
-   * "where is any of my stuff running?". Naming an agent narrows it. Requiring
-   * the agent, as this once did, means you must already know the answer to the
-   * question you came to ask.
-   */
   runtimeCommand
     .command('list [agent]')
     .description('List runtime bindings for one agent, or for every agent')
     .action(async (agent: string | undefined, _options, command: Command) => {
       const global = globals(command);
-      const result = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        async (client) => {
-          if (agent) {
-            const profile = await client.agents.get(agent);
-            return [{ profile, runtimeBindings: await client.agents.bindings(agent) }];
-          }
-          return (await client.agents.directory()).filter(
-            (entry) => entry.runtimeBindings.length > 0,
-          );
-        },
-      );
+      const result = await withManagement(command, async (service) => {
+        if (agent) {
+          const profile = await service.agents.get(agent);
+          return [{ profile, runtimeBindings: await service.agents.bindings(agent) }];
+        }
+        return (await service.agents.directory()).filter(
+          (entry) => entry.runtimeBindings.length > 0,
+        );
+      });
       const describe = (binding: AgentRuntimeBinding) =>
         `  ${binding.id}  ${binding.runtime}${binding.profile ? `/${binding.profile}` : ''}  bound ${binding.boundAt}`;
       const human = result.length
@@ -2010,10 +1873,8 @@ export function createCli(
     .description('Remove a runtime binding')
     .action(async (bindingId: string, _options, command: Command) => {
       const global = globals(command);
-      const removed = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.agents.unbindRuntime(bindingId),
+      const removed = await withManagement(command, (service) =>
+        service.agents.unbindRuntime(bindingId),
       );
       output(
         io,
@@ -2023,13 +1884,213 @@ export function createCli(
       );
     });
 
+  /* ------------------------------------------------------------ topics */
+
+  const topicCommand = program
+    .command('topic')
+    .description('Create and manage topics — a stable, reusable subject any record can carry');
+
+  topicCommand
+    .command('create <display-name>')
+    .description('Create a topic. Any actor may create one.')
+    .option('--alias <name>', 'alias (repeatable)', collect, [])
+    .action(async (displayName: string, options: { alias: string[] }, command: Command) => {
+      const global = globals(command);
+      const topic = await withProfile(command, (service) =>
+        service.topics.create({
+          displayName,
+          ...(options.alias.length ? { aliases: options.alias } : {}),
+        }),
+      );
+      output(io, global.json, topic, `Created ${topic.displayName}\n\nTopic ID: ${topic.id}`);
+    });
+
+  topicCommand
+    .command('list')
+    .description('List known topics')
+    .option('--status <status>', 'active or archived')
+    .action(async (options: { status?: string }, command: Command) => {
+      const global = globals(command);
+      const topics = await withProfile(command, (service) =>
+        service.topics.list(
+          options.status ? { status: options.status as 'active' | 'archived' } : {},
+        ),
+      );
+      const human = topics.length
+        ? topics
+            .map(
+              (topic) =>
+                `${topic.displayName}${topic.status === 'archived' ? '  [archived]' : ''}${
+                  topic.aliases?.length ? `  aliases: ${topic.aliases.join(', ')}` : ''
+                }\n  ${topic.id}`,
+            )
+            .join('\n')
+        : 'No topics yet.';
+      output(io, global.json, { topics }, human);
+    });
+
+  topicCommand
+    .command('show <id>')
+    .description('Show one topic, resolving aliases')
+    .action(async (id: string, _options, command: Command) => {
+      const global = globals(command);
+      const topic = await withProfile(command, (service) => service.topics.get(id));
+      output(
+        io,
+        global.json,
+        topic,
+        `${topic.displayName}\n\nTopic ID: ${topic.id}\nStatus:   ${topic.status}\nAliases:  ${topic.aliases?.join(', ') ?? 'none'}`,
+      );
+    });
+
+  topicCommand
+    .command('resolve <name>')
+    .description('Resolve a name or alias to one topic, or list the candidates')
+    .action(async (name: string, _options, command: Command) => {
+      const global = globals(command);
+      const resolution = await withProfile(command, (service) => service.topics.resolve(name));
+      const human = resolution.match
+        ? `${resolution.match.displayName} (${resolution.match.id})`
+        : resolution.candidates.length
+          ? `"${resolution.query}" is ambiguous. Candidates:\n${resolution.candidates
+              .map((topic) => `  ${topic.id}  ${topic.displayName}`)
+              .join('\n')}`
+          : `No topic answers to "${resolution.query}".`;
+      output(io, global.json, resolution, human);
+    });
+
+  topicCommand
+    .command('rename <id> <display-name>')
+    .description("Change a topic's display name. Its ID never changes.")
+    .action(async (id: string, displayName: string, _options, command: Command) => {
+      const global = globals(command);
+      const topic = await withProfile(command, (service) =>
+        service.topics.update(id, { displayName }),
+      );
+      output(
+        io,
+        global.json,
+        topic,
+        `Renamed to ${topic.displayName}\nTopic ID: ${topic.id} (unchanged)`,
+      );
+    });
+
+  topicCommand
+    .command('archive <id>')
+    .description('Stop a topic being attached to new records, keeping the ones it already has')
+    .action(async (id: string, _options, command: Command) => {
+      const global = globals(command);
+      const topic = await withProfile(command, (service) => service.topics.archive(id));
+      output(io, global.json, topic, `Archived ${topic.displayName} (${topic.id})`);
+    });
+
+  topicCommand
+    .command('restore <id>')
+    .description('Let an archived topic be attached to new records again')
+    .action(async (id: string, _options, command: Command) => {
+      const global = globals(command);
+      const topic = await withProfile(command, (service) => service.topics.restore(id));
+      output(io, global.json, topic, `Restored ${topic.displayName} (${topic.id})`);
+    });
+
+  /* ------------------------------------------------------------ skills */
+
+  const skillCommand = program
+    .command('skill')
+    .description('Install and maintain the packaged agent skill');
+
+  skillCommand
+    .command('install')
+    .description('Plan or install the skill for detected agent runtimes')
+    .option('--runtime <runtime>', `${skillRuntimeHelp} (repeatable)`, collect, [])
+    .option('--yes', 'apply the displayed plan', false)
+    .option('--force', 'replace a conflicting synomem directory', false)
+    .option('--link', 'symlink to the packaged skill instead of copying it', false)
+    .action(
+      async (
+        options: { runtime: string[]; yes: boolean; force: boolean; link: boolean },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const runtimes = skillRuntimes(options.runtime);
+        // Only an explicitly named profile is written into registration
+        // commands; an inherited default is not something to bake into a harness.
+        const profile = global.profile;
+        if (profile && !profileStoreFor(global.home).read().profiles[profile]) {
+          throw new SynomemError('CONFIG_INVALID', `Unknown profile "${profile}".`);
+        }
+        const result = installSkill({
+          ...(runtimes ? { runtimes } : {}),
+          apply: options.yes,
+          force: options.force,
+          link: options.link,
+          ...(profile ? { profile } : {}),
+        });
+        let bindingWarning: string | undefined;
+        if (profile && options.yes) {
+          const installed = result.locations
+            .filter((location) => location.state !== 'unavailable')
+            .map((location) => location.runtime);
+          if (installed.length) {
+            // Recording where you yourself run is self-service, as the
+            // profile's own agent — never on another agent's behalf.
+            try {
+              await withProfile(command, async (service, context) => {
+                if (context.actor.kind !== 'agent') return;
+                for (const runtime of installed) {
+                  await service.agents.bindRuntime({ agentId: context.actor.id, runtime, profile });
+                }
+              });
+            } catch (error) {
+              bindingWarning = `Skill installed, but recording the runtime binding failed: ${asSynomemError(error).message}`;
+            }
+          }
+        }
+        output(
+          io,
+          global.json,
+          { ...result, ...(bindingWarning ? { warning: bindingWarning } : {}) },
+          `${formatSkillResult(result, 'install')}${bindingWarning ? `\n\n${bindingWarning}` : ''}`,
+        );
+      },
+    );
+
+  skillCommand
+    .command('status')
+    .description('Show installed, stale, missing, or conflicting skill copies')
+    .option('--runtime <runtime>', `${skillRuntimeHelp} (repeatable)`, collect, [])
+    .action((options: { runtime: string[] }, command: Command) => {
+      const global = globals(command);
+      const result = skillStatus({
+        runtimes: skillRuntimes(options.runtime),
+        ...(global.profile ? { profile: global.profile } : {}),
+      });
+      output(io, global.json, result, formatSkillResult(result, 'status'));
+    });
+
+  skillCommand
+    .command('uninstall')
+    .description('Plan or remove Synomem-owned skill installations')
+    .option('--runtime <runtime>', `${skillRuntimeHelp} (repeatable)`, collect, [])
+    .option('--yes', 'apply the displayed plan', false)
+    .option('--force', 'remove a conflicting synomem directory', false)
+    .action((options: { runtime: string[]; yes: boolean; force: boolean }, command: Command) => {
+      const global = globals(command);
+      const result = uninstallSkill({
+        runtimes: skillRuntimes(options.runtime),
+        apply: options.yes,
+        force: options.force,
+      });
+      output(io, global.json, result, formatSkillResult(result, 'uninstall'));
+    });
+
+  /* ------------------------------------------------------------ posts */
+
   const postCommand = program.command('post').description('Publish to everyone in the workspace');
 
   postCommand
     .command('create')
     .description('Publish a post the whole workspace can read')
-    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .requiredOption('--title <title>')
     .requiredOption('--body <body>')
     .option('--tag <tag>', 'repeatable', collect, [])
@@ -2037,29 +2098,18 @@ export function createCli(
     .option('--reply-to <post-id>')
     .action(
       async (
-        options: {
-          as: string;
-          actorKind: string;
-          title: string;
-          body: string;
-          tag: string[];
-          topic: string[];
-          replyTo?: string;
-        },
+        options: { title: string; body: string; tag: string[]; topic: string[]; replyTo?: string },
         command: Command,
       ) => {
         const global = globals(command);
-        const result = await withClient(
-          global.home,
-          actor(options.actorKind, options.as),
-          (client) =>
-            client.posts.create({
-              title: options.title,
-              body: options.body,
-              ...(options.tag.length ? { tags: options.tag } : {}),
-              ...(options.topic.length ? { topicIds: options.topic } : {}),
-              ...(options.replyTo ? { replyTo: options.replyTo } : {}),
-            }),
+        const result = await withProfile(command, (service) =>
+          service.posts.create({
+            title: options.title,
+            body: options.body,
+            ...(options.tag.length ? { tags: options.tag } : {}),
+            ...(options.topic.length ? { topicIds: options.topic } : {}),
+            ...(options.replyTo ? { replyTo: options.replyTo } : {}),
+          }),
         );
         output(io, global.json, result, `Published ${result.record.event.id}`);
       },
@@ -2068,156 +2118,101 @@ export function createCli(
   postCommand
     .command('list')
     .description('List posts in this workspace')
-    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .option('--limit <n>', 'default 10, maximum 50')
-    .action(
-      async (options: { as: string; actorKind: string; limit?: string }, command: Command) => {
-        const global = globals(command);
-        const page = await withClient(global.home, actor(options.actorKind, options.as), (client) =>
-          client.posts.list(options.limit ? { limit: Number(options.limit) } : {}),
-        );
-        const human = page.items.length
-          ? page.items.map((item) => `${item.id}  ${item.title}`).join('\n')
-          : 'No posts yet.';
-        output(io, global.json, page, human);
-      },
-    );
+    .action(async (options: { limit?: string }, command: Command) => {
+      const global = globals(command);
+      const page = await withProfile(command, (service) =>
+        service.posts.list(options.limit ? { limit: Number(options.limit) } : {}),
+      );
+      const human = page.items.length
+        ? page.items.map((item) => `${item.id}  ${item.title}`).join('\n')
+        : 'No posts yet.';
+      output(io, global.json, page, human);
+    });
 
   postCommand
     .command('show <post-id>')
     .description('Show one post with its acknowledgements')
-    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
-    .action(
-      async (postId: string, options: { as: string; actorKind: string }, command: Command) => {
-        const global = globals(command);
-        const record = await withClient(
-          global.home,
-          actor(options.actorKind, options.as),
-          (client) => client.posts.get(postId),
-        );
-        const acks = record.acknowledgments.length
-          ? record.acknowledgments
-              .map((entry) => `  ${entry.actor.id}${entry.note ? ` — ${entry.note}` : ''}`)
-              .join('\n')
-          : '  none yet';
-        output(
-          io,
-          global.json,
-          record,
-          `${record.title}\n\n${record.body}\n\nAcknowledged by:\n${acks}`,
-        );
-      },
-    );
+    .action(async (postId: string, _options, command: Command) => {
+      const global = globals(command);
+      const record = await withProfile(command, (service) => service.posts.get(postId));
+      const acks = record.acknowledgments.length
+        ? record.acknowledgments
+            .map((entry) => `  ${entry.actor.id}${entry.note ? ` — ${entry.note}` : ''}`)
+            .join('\n')
+        : '  none yet';
+      output(
+        io,
+        global.json,
+        record,
+        `${record.title}\n\n${record.body}\n\nAcknowledged by:\n${acks}`,
+      );
+    });
 
   postCommand
     .command('acknowledge <post-id>')
     .description('Say you have seen a post')
-    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .option('--note <text>', 'optional context for the author')
-    .action(
-      async (
-        postId: string,
-        options: { as: string; actorKind: string; note?: string },
-        command: Command,
-      ) => {
-        const global = globals(command);
-        const record = await withClient(
-          global.home,
-          actor(options.actorKind, options.as),
-          (client) =>
-            client.posts.acknowledge({
-              postId,
-              ...(options.note ? { note: options.note } : {}),
-            }),
-        );
-        output(io, global.json, record, `Acknowledged ${postId}`);
-      },
-    );
+    .action(async (postId: string, options: { note?: string }, command: Command) => {
+      const global = globals(command);
+      const record = await withProfile(command, (service) =>
+        service.posts.acknowledge({ postId, ...(options.note ? { note: options.note } : {}) }),
+      );
+      output(io, global.json, record, `Acknowledged ${postId}`);
+    });
 
   postCommand
     .command('roster <post-id>')
     .description('Who has acknowledged a post, and who has not')
-    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
-    .action(
-      async (postId: string, options: { as: string; actorKind: string }, command: Command) => {
-        const global = globals(command);
-        const roster = await withClient(
-          global.home,
-          actor(options.actorKind, options.as),
-          (client) => client.posts.roster(postId),
-        );
-        // "Outstanding" means no acknowledgement recorded — never that somebody
-        // has not read it, which this cannot know.
-        const lines = [
-          `Acknowledged (${roster.acknowledged.length}):`,
-          ...(roster.acknowledged.length
-            ? roster.acknowledged.map((entry) => `  ${entry.actor.id}`)
-            : ['  none yet']),
-          `No acknowledgement recorded (${roster.outstanding.length}):`,
-          ...(roster.outstanding.length
-            ? roster.outstanding.map((entry) => `  ${entry.id}`)
-            : ['  none']),
-        ];
-        if (roster.joinedSince > 0) {
-          lines.push(`${roster.joinedSince} agent(s) joined after this was posted.`);
-        }
-        output(io, global.json, roster, lines.join('\n'));
-      },
-    );
+    .action(async (postId: string, _options, command: Command) => {
+      const global = globals(command);
+      const roster = await withProfile(command, (service) => service.posts.roster(postId));
+      const lines = [
+        `Acknowledged (${roster.acknowledged.length}):`,
+        ...(roster.acknowledged.length
+          ? roster.acknowledged.map((entry) => `  ${entry.actor.id}`)
+          : ['  none yet']),
+        `No acknowledgement recorded (${roster.outstanding.length}):`,
+        ...(roster.outstanding.length
+          ? roster.outstanding.map((entry) => `  ${entry.id}`)
+          : ['  none']),
+      ];
+      if (roster.joinedSince > 0) {
+        lines.push(`${roster.joinedSince} agent(s) joined after this was posted.`);
+      }
+      output(io, global.json, roster, lines.join('\n'));
+    });
 
   postCommand
     .command('archive <post-id>')
     .description('Archive a post you wrote')
-    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
     .option('--reason <text>')
-    .action(
-      async (
-        postId: string,
-        options: { as: string; actorKind: string; reason?: string },
-        command: Command,
-      ) => {
-        const global = globals(command);
-        const record = await withClient(
-          global.home,
-          actor(options.actorKind, options.as),
-          (client) =>
-            client.posts.archive({ postId, ...(options.reason ? { reason: options.reason } : {}) }),
-        );
-        output(io, global.json, record, `Archived ${postId}`);
-      },
-    );
+    .action(async (postId: string, options: { reason?: string }, command: Command) => {
+      const global = globals(command);
+      const record = await withProfile(command, (service) =>
+        service.posts.archive({ postId, ...(options.reason ? { reason: options.reason } : {}) }),
+      );
+      output(io, global.json, record, `Archived ${postId}`);
+    });
+
+  /* ------------------------------------------------------------ kudos */
 
   const kudosCommand = program.command('kudos').description('Give and manage agent recognition');
 
   kudosCommand
     .command('give <recipient>')
     .description('Give specific, evidence-based kudos to an agent')
-    .requiredOption(
-      '--from <actor-id>',
-      'stable ID of the giver (defaults to --actor)',
-      actingDefault,
-    )
-    .requiredOption('--actor-kind <kind>', 'human, agent, or system')
-    .option('--actor-name <display-name>')
     .requiredOption('--title <title>')
     .requiredOption('--reason <reason>')
     .option('--tag <tag>', 'tag (repeatable)', collect, [])
     .option('--topic <id>', 'topic ID (repeatable)', collect, [])
     .option('--evidence <kind:value>', 'sanitized evidence (repeatable)', collect, [])
-    .option('--visibility <visibility>', 'private, local, or public', 'workspace')
+    .option('--visibility <visibility>', 'private, workspace, or public', 'workspace')
     .option('--idempotency-key <key>')
     .action(
       async (
         recipient: string,
         options: {
-          from: string;
-          actorKind: string;
-          actorName?: string;
           title: string;
           reason: string;
           tag: string[];
@@ -2229,20 +2224,17 @@ export function createCli(
         command: Command,
       ) => {
         const global = globals(command);
-        const result = await withClient(
-          global.home,
-          actor(options.actorKind, options.from, options.actorName),
-          (client) =>
-            client.kudos.give({
-              recipientAgentId: recipient,
-              title: options.title,
-              reason: options.reason,
-              visibility: options.visibility,
-              ...(options.tag.length ? { tags: options.tag } : {}),
-              ...(options.topic.length ? { topicIds: options.topic } : {}),
-              ...(options.evidence.length ? { evidence: options.evidence.map(parseEvidence) } : {}),
-              ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-            }),
+        const result = await withProfile(command, (service) =>
+          service.kudos.give({
+            recipientAgentId: recipient,
+            title: options.title,
+            reason: options.reason,
+            visibility: options.visibility,
+            ...(options.tag.length ? { tags: options.tag } : {}),
+            ...(options.topic.length ? { topicIds: options.topic } : {}),
+            ...(options.evidence.length ? { evidence: options.evidence.map(parseEvidence) } : {}),
+            ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+          }),
         );
         const event = result.record.event;
         output(
@@ -2254,52 +2246,10 @@ export function createCli(
       },
     );
 
-  program
-    .command('inbox [agent]')
-    .description('Show pending kudos, memos, and tasks for an agent')
-    .option('--as <agent-id>', 'defaults to the positional agent')
-    .option('--limit <number>', 'maximum results (default 10, maximum 50)', '10')
-    .option('--cursor <cursor>', 'opaque cursor returned by the previous page')
-    .action(
-      async (
-        agentId: string | undefined,
-        options: { as?: string; limit: string; cursor?: string },
-        command: Command,
-      ) => {
-        const global = globals(command);
-        const recipient = agentId ?? options.as;
-        if (!recipient) throw new SynomemError('INVALID_INPUT', 'Specify an agent inbox.');
-        const page = await withClient(
-          global.home,
-          actor('agent', options.as ?? recipient),
-          (client) =>
-            client.items.list({
-              participantAgentId: recipient,
-              pending: true,
-              limit: Number(options.limit),
-              ...(options.cursor ? { cursor: options.cursor } : {}),
-            }),
-        );
-        output(
-          io,
-          global.json,
-          page,
-          page.items.length
-            ? `${page.items.map(lineForItem).join('\n')}${page.hasMore ? `\nNext cursor: ${page.nextCursor}` : ''}`
-            : 'Inbox is clear.',
-        );
-      },
-    );
-
   addListOptions(kudosCommand.command('list').description('List and filter kudos')).action(
     async (options: Record<string, string>, command: Command) => {
       const global = globals(command);
-      const page = await withClient(
-        global.home,
-        defaultActor(env, 'human', 'local-cli', global.actor),
-        (client) => client.kudos.list(listInput(options)),
-        Boolean(global.actor),
-      );
+      const page = await withProfile(command, (service) => service.kudos.list(listInput(options)));
       output(
         io,
         global.json,
@@ -2311,12 +2261,166 @@ export function createCli(
     },
   );
 
+  kudosCommand
+    .command('show <kudos-id>')
+    .description('Show one kudos item and its current state')
+    .action(async (id: string, _options, command: Command) => {
+      const global = globals(command);
+      const record = await withProfile(command, (service) => service.kudos.get(id));
+      output(io, global.json, record, showRecord(record));
+    });
+
+  kudosCommand
+    .command('acknowledge <kudos-id>')
+    .description('Record that you (the recipient) reviewed kudos')
+    .option('--note <text>')
+    .action(async (id: string, options: { note?: string }, command: Command) => {
+      const global = globals(command);
+      const record = await withProfile(command, (service) =>
+        service.kudos.acknowledge({ kudosId: id, ...(options.note ? { note: options.note } : {}) }),
+      );
+      output(io, global.json, record, `Acknowledged ${id}.`);
+    });
+
+  kudosCommand
+    .command('revoke <kudos-id>')
+    .description('Record a revocation while preserving history')
+    .requiredOption('--reason <reason>')
+    .option('--administrative', 'mark as an administrative revocation', false)
+    .action(
+      async (
+        id: string,
+        options: { reason: string; administrative: boolean },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const record = await withProfile(command, (service) =>
+          service.kudos.revoke({
+            kudosId: id,
+            reason: options.reason,
+            administrative: options.administrative,
+          }),
+        );
+        output(io, global.json, record, `Revoked ${id}; the audit trail was preserved.`);
+      },
+    );
+
+  kudosCommand
+    .command('wins [agent]')
+    .description('Print the generated WINS.md path or content (local stores)')
+    .option('--open', 'open WINS.md in the system GUI', false)
+    .option('--print', 'print Markdown content', false)
+    .action(
+      async (
+        agentId: string | undefined,
+        options: { open: boolean; print: boolean },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const details = await withManagement(command, async (service, context) => {
+          if (context) {
+            throw new SynomemError(
+              'INVALID_INPUT',
+              'Generated WINS.md files are available only for local stores.',
+            );
+          }
+          if (!agentId) throw new SynomemError('INVALID_INPUT', 'Specify an agent.');
+          const profile = await service.agents.get(agentId);
+          const info = await service.info();
+          if (info.backend !== 'local') {
+            throw new SynomemError(
+              'INVALID_INPUT',
+              'Generated WINS.md files are available only for local stores.',
+            );
+          }
+          const capabilities = await service.capabilities();
+          const path = join(info.home, profile.handle, 'WINS.md');
+          if (!existsSync(path)) {
+            const hint = capabilities.projections.writeWinsMarkdown
+              ? 'Run `synomem rebuild` to generate it.'
+              : 'Enable projection.writeWinsMarkdown and run `synomem rebuild`.';
+            throw new SynomemError(
+              'INVALID_INPUT',
+              `No generated WINS.md exists for ${profile.handle}. ${hint}`,
+            );
+          }
+          return { profile, path, content: readFileSync(path, 'utf8') };
+        });
+        if (options.open) {
+          const commandName =
+            process.platform === 'darwin'
+              ? 'open'
+              : process.platform === 'win32'
+                ? 'cmd'
+                : 'xdg-open';
+          const args =
+            process.platform === 'win32' ? ['/c', 'start', '', details.path] : [details.path];
+          spawn(commandName, args, { detached: true, stdio: 'ignore' }).unref();
+        }
+        output(io, global.json, details, options.print ? details.content.trimEnd() : details.path);
+      },
+    );
+
+  addListOptions(
+    kudosCommand.command('stats').description('Show aggregate kudos statistics'),
+  ).action(async (options: Record<string, string>, command: Command) => {
+    const global = globals(command);
+    const stats = await withProfile(command, (service) => service.stats(listInput(options)));
+    output(
+      io,
+      global.json,
+      stats,
+      `Total: ${stats.total}\nActive: ${stats.active}\nAcknowledged: ${stats.acknowledged}\nRevoked: ${stats.revoked}`,
+    );
+  });
+
+  /* ------------------------------------------------------------ cross-kind */
+
+  program
+    .command('inbox [agent]')
+    .description("Show pending kudos, memos, and tasks (the profile's own agent by default)")
+    .option('--limit <number>', 'maximum results (default 10, maximum 50)', '10')
+    .option('--cursor <cursor>', 'opaque cursor returned by the previous page')
+    .action(
+      async (
+        agentId: string | undefined,
+        options: { limit: string; cursor?: string },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const page = await withProfile(command, (service, context) => {
+          const recipient =
+            agentId ?? (context.actor.kind === 'agent' ? context.actor.id : undefined);
+          if (!recipient) {
+            throw new SynomemError(
+              'INVALID_INPUT',
+              'This profile is not an agent; name the agent whose inbox to show.',
+            );
+          }
+          return service.items.list({
+            participantAgentId: recipient,
+            pending: true,
+            limit: Number(options.limit),
+            ...(options.cursor ? { cursor: options.cursor } : {}),
+          });
+        });
+        output(
+          io,
+          global.json,
+          page,
+          page.items.length
+            ? `${page.items.map(lineForItem).join('\n')}${page.hasMore ? `\nNext cursor: ${page.nextCursor}` : ''}`
+            : 'Inbox is clear.',
+        );
+      },
+    );
+
   program
     .command('list')
     .description('List compact summaries across all record types')
-    .option('--kind <kind>', 'kudos, memo, note, or task (repeatable)', collect, [])
+    .option('--kind <kind>', 'kudos, memo, note, task, todo, or post (repeatable)', collect, [])
     .option('--participant <agent>')
-    .option('--actor <id>')
+    .option('--author <id>', 'only records written by this actor')
     .option('--tag <tag>')
     .option('--topic <id>', 'only records carrying this topic')
     .option('--status <status>')
@@ -2326,11 +2430,8 @@ export function createCli(
     .option('--offset <number>', 'deprecated offset', '0')
     .action(async (options: Record<string, string | string[]>, command: Command) => {
       const global = globals(command);
-      const page = await withClient(
-        global.home,
-        defaultActor(env, 'human', 'local-cli', global.actor),
-        (client) => client.items.list(itemListInput(options)),
-        Boolean(global.actor),
+      const page = await withProfile(command, (service) =>
+        service.items.list(itemListInput(options)),
       );
       output(
         io,
@@ -2351,16 +2452,12 @@ export function createCli(
     .action(
       async (options: { after?: string; limit: string; kind: string[] }, command: Command) => {
         const global = globals(command);
-        const page = await withClient(
-          global.home,
-          defaultActor(env, 'human', 'local-cli', global.actor),
-          (client) =>
-            client.items.changes({
-              limit: Number(options.limit),
-              ...(options.kind.length ? { kinds: options.kind as ItemListInput['kinds'] } : {}),
-              ...(options.after ? { after: options.after } : {}),
-            }),
-          Boolean(global.actor),
+        const page = await withProfile(command, (service) =>
+          service.items.changes({
+            limit: Number(options.limit),
+            ...(options.kind.length ? { kinds: options.kind as ItemListInput['kinds'] } : {}),
+            ...(options.after ? { after: options.after } : {}),
+          }),
         );
         const human = page.items.length
           ? `${page.items
@@ -2374,12 +2471,13 @@ export function createCli(
       },
     );
 
+  /* ------------------------------------------------------------ memos */
+
   const memoCommand = program.command('memo').description('Send and manage durable messages');
+
   memoCommand
     .command('send <recipient>')
-    .requiredOption('--from <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
-    .option('--actor-name <name>')
+    .description('Send a durable one-to-one memo')
     .requiredOption('--subject <subject>')
     .requiredOption('--body <body>')
     .option('--tag <tag>', 'tag (repeatable)', collect, [])
@@ -2390,9 +2488,6 @@ export function createCli(
       async (
         recipient: string,
         options: {
-          from: string;
-          actorKind: string;
-          actorName?: string;
           subject: string;
           body: string;
           tag: string[];
@@ -2403,19 +2498,16 @@ export function createCli(
         command: Command,
       ) => {
         const global = globals(command);
-        const result = await withClient(
-          global.home,
-          actor(options.actorKind, options.from, options.actorName),
-          (client) =>
-            client.memos.send({
-              recipientAgentId: recipient,
-              subject: options.subject,
-              body: options.body,
-              visibility: options.visibility,
-              ...(options.tag.length ? { tags: options.tag } : {}),
-              ...(options.topic.length ? { topicIds: options.topic } : {}),
-              ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-            }),
+        const result = await withProfile(command, (service) =>
+          service.memos.send({
+            recipientAgentId: recipient,
+            subject: options.subject,
+            body: options.body,
+            visibility: options.visibility,
+            ...(options.tag.length ? { tags: options.tag } : {}),
+            ...(options.topic.length ? { topicIds: options.topic } : {}),
+            ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+          }),
         );
         output(
           io,
@@ -2425,8 +2517,10 @@ export function createCli(
         );
       },
     );
+
   memoCommand
     .command('list')
+    .description('List memos')
     .option('--participant <agent>')
     .option('--status <status>')
     .option('--limit <number>', 'maximum results', '10')
@@ -2437,70 +2531,62 @@ export function createCli(
         command: Command,
       ) => {
         const global = globals(command);
-        const page = await withClient(
-          global.home,
-          defaultActor(env, 'human', 'local-cli', global.actor),
-          (client) =>
-            client.memos.list({
-              ...(options.participant ? { participantAgentId: options.participant } : {}),
-              ...(options.status ? { status: options.status } : {}),
-              limit: Number(options.limit),
-              ...(options.cursor ? { cursor: options.cursor } : {}),
-            }),
-          Boolean(global.actor),
+        const page = await withProfile(command, (service) =>
+          service.memos.list({
+            ...(options.participant ? { participantAgentId: options.participant } : {}),
+            ...(options.status ? { status: options.status } : {}),
+            limit: Number(options.limit),
+            ...(options.cursor ? { cursor: options.cursor } : {}),
+          }),
         );
         output(io, global.json, page, page.items.map(lineForItem).join('\n') || 'No memos found.');
       },
     );
-  memoCommand.command('show <memo-id>').action(async (id: string, _options, command: Command) => {
-    const global = globals(command);
-    const record = await withClient(
-      global.home,
-      defaultActor(env, 'human', 'local-cli', global.actor),
-      (client) => client.memos.get(id),
-      Boolean(global.actor),
-    );
-    output(
-      io,
-      global.json,
-      record,
-      `${record.event.subject}\nID: ${record.event.id}\nStatus: ${record.status}\n\n${record.event.body}`,
-    );
-  });
+
+  memoCommand
+    .command('show <memo-id>')
+    .description('Show one memo')
+    .action(async (id: string, _options, command: Command) => {
+      const global = globals(command);
+      const record = await withProfile(command, (service) => service.memos.get(id));
+      output(
+        io,
+        global.json,
+        record,
+        `${record.event.subject}\nID: ${record.event.id}\nStatus: ${record.status}\n\n${record.event.body}`,
+      );
+    });
+
   for (const operation of ['read', 'archive'] as const) {
     memoCommand
       .command(`${operation} <memo-id>`)
-      .requiredOption('--as <agent-id>')
-      .option('--actor-kind <kind>', 'agent or human', 'agent')
+      .description(
+        operation === 'read'
+          ? 'Mark a memo addressed to you as read'
+          : 'Archive a memo addressed to you',
+      )
       .option('--idempotency-key <key>')
-      .action(
-        async (
-          id: string,
-          options: { as: string; actorKind: string; idempotencyKey?: string },
-          command: Command,
-        ) => {
-          const global = globals(command);
-          const record = await withClient(
-            global.home,
-            actor(options.actorKind, options.as),
-            (client) =>
-              client.memos[operation]({
-                memoId: id,
-                ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-              }),
-          );
-          output(io, global.json, record, `Memo ${id} is ${record.status}.`);
-        },
-      );
+      .action(async (id: string, options: { idempotencyKey?: string }, command: Command) => {
+        const global = globals(command);
+        const record = await withProfile(command, (service) =>
+          service.memos[operation]({
+            memoId: id,
+            ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+          }),
+        );
+        output(io, global.json, record, `Memo ${id} is ${record.status}.`);
+      });
   }
+
+  /* ------------------------------------------------------------ notes */
 
   const noteCommand = program
     .command('note')
     .description('Retain and revise agent-owned knowledge');
+
   noteCommand
     .command('create')
-    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'agent or human', 'agent')
+    .description('Create an owner-private note')
     .option('--owner <agent-id>')
     .requiredOption('--title <title>')
     .requiredOption('--body <body>')
@@ -2510,8 +2596,6 @@ export function createCli(
     .action(
       async (
         options: {
-          as: string;
-          actorKind: string;
           owner?: string;
           title: string;
           body: string;
@@ -2522,18 +2606,15 @@ export function createCli(
         command: Command,
       ) => {
         const global = globals(command);
-        const result = await withClient(
-          global.home,
-          actor(options.actorKind, options.as),
-          (client) =>
-            client.notes.create({
-              ...(options.owner ? { ownerAgentId: options.owner } : {}),
-              title: options.title,
-              body: options.body,
-              ...(options.tag.length ? { tags: options.tag } : {}),
-              ...(options.topic.length ? { topicIds: options.topic } : {}),
-              ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-            }),
+        const result = await withProfile(command, (service) =>
+          service.notes.create({
+            ...(options.owner ? { ownerAgentId: options.owner } : {}),
+            title: options.title,
+            body: options.body,
+            ...(options.tag.length ? { tags: options.tag } : {}),
+            ...(options.topic.length ? { topicIds: options.topic } : {}),
+            ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+          }),
         );
         output(
           io,
@@ -2543,47 +2624,44 @@ export function createCli(
         );
       },
     );
+
   noteCommand
     .command('list')
+    .description('List notes')
     .option('--owner <agent>')
     .option('--status <status>')
     .option('--limit <number>', 'maximum results', '10')
     .action(
       async (options: { owner?: string; status?: string; limit: string }, command: Command) => {
         const global = globals(command);
-        const page = await withClient(
-          global.home,
-          defaultActor(env, 'human', 'local-cli', global.actor),
-          (client) =>
-            client.notes.list({
-              ...(options.owner ? { participantAgentId: options.owner } : {}),
-              ...(options.status ? { status: options.status } : {}),
-              limit: Number(options.limit),
-            }),
-          Boolean(global.actor),
+        const page = await withProfile(command, (service) =>
+          service.notes.list({
+            ...(options.owner ? { participantAgentId: options.owner } : {}),
+            ...(options.status ? { status: options.status } : {}),
+            limit: Number(options.limit),
+          }),
         );
         output(io, global.json, page, page.items.map(lineForItem).join('\n') || 'No notes found.');
       },
     );
-  noteCommand.command('show <note-id>').action(async (id: string, _options, command: Command) => {
-    const global = globals(command);
-    const record = await withClient(
-      global.home,
-      defaultActor(env, 'human', 'local-cli', global.actor),
-      (client) => client.notes.get(id),
-      Boolean(global.actor),
-    );
-    output(
-      io,
-      global.json,
-      record,
-      `${record.current.title}\nID: ${record.event.id}\nVersion: ${record.current.version}\n\n${record.current.body}`,
-    );
-  });
+
+  noteCommand
+    .command('show <note-id>')
+    .description('Show one note')
+    .action(async (id: string, _options, command: Command) => {
+      const global = globals(command);
+      const record = await withProfile(command, (service) => service.notes.get(id));
+      output(
+        io,
+        global.json,
+        record,
+        `${record.current.title}\nID: ${record.event.id}\nVersion: ${record.current.version}\n\n${record.current.body}`,
+      );
+    });
+
   noteCommand
     .command('revise <note-id>')
-    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'agent or human', 'agent')
+    .description('Revise a note (optimistic concurrency)')
     .requiredOption('--expected-version <number>')
     .option('--title <title>')
     .option('--body <body>')
@@ -2593,8 +2671,6 @@ export function createCli(
       async (
         id: string,
         options: {
-          as: string;
-          actorKind: string;
           expectedVersion: string;
           title?: string;
           body?: string;
@@ -2604,54 +2680,44 @@ export function createCli(
         command: Command,
       ) => {
         const global = globals(command);
-        const record = await withClient(
-          global.home,
-          actor(options.actorKind, options.as),
-          (client) =>
-            client.notes.revise({
-              noteId: id,
-              expectedVersion: Number(options.expectedVersion),
-              ...(options.title ? { title: options.title } : {}),
-              ...(options.body ? { body: options.body } : {}),
-              ...(options.tag.length ? { tags: options.tag } : {}),
-              ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-            }),
+        const record = await withProfile(command, (service) =>
+          service.notes.revise({
+            noteId: id,
+            expectedVersion: Number(options.expectedVersion),
+            ...(options.title ? { title: options.title } : {}),
+            ...(options.body ? { body: options.body } : {}),
+            ...(options.tag.length ? { tags: options.tag } : {}),
+            ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+          }),
         );
         output(io, global.json, record, `Revised note ${id} to version ${record.current.version}.`);
       },
     );
+
   noteCommand
     .command('archive <note-id>')
-    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'agent or human', 'agent')
+    .description('Archive a note')
     .option('--idempotency-key <key>')
-    .action(
-      async (
-        id: string,
-        options: { as: string; actorKind: string; idempotencyKey?: string },
-        command: Command,
-      ) => {
-        const global = globals(command);
-        const record = await withClient(
-          global.home,
-          actor(options.actorKind, options.as),
-          (client) =>
-            client.notes.archive({
-              noteId: id,
-              ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-            }),
-        );
-        output(io, global.json, record, `Archived note ${id}.`);
-      },
-    );
+    .action(async (id: string, options: { idempotencyKey?: string }, command: Command) => {
+      const global = globals(command);
+      const record = await withProfile(command, (service) =>
+        service.notes.archive({
+          noteId: id,
+          ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+        }),
+      );
+      output(io, global.json, record, `Archived note ${id}.`);
+    });
+
+  /* ------------------------------------------------------------ todos */
 
   const todoCommand = program
     .command('todo')
     .description('Create and manage your own private reminders');
+
   todoCommand
     .command('create')
-    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .description('Create a private todo')
     .requiredOption('--title <title>')
     .option('--details <text>', 'private working detail')
     .option('--priority <number>', '1 highest, 4 lowest', '3')
@@ -2664,8 +2730,6 @@ export function createCli(
     .action(
       async (
         options: {
-          as: string;
-          actorKind: string;
           title: string;
           details?: string;
           priority: string;
@@ -2679,19 +2743,16 @@ export function createCli(
         command: Command,
       ) => {
         const global = globals(command);
-        const result = await withClient(
-          global.home,
-          actor(options.actorKind, options.as),
-          (client) =>
-            client.todos.create({
-              title: options.title,
-              ...(options.details ? { details: options.details } : {}),
-              priority: Number(options.priority) as 1 | 2 | 3 | 4,
-              ...((due) => (due ? { due } : {}))(taskDue(options)),
-              ...(options.tag.length ? { tags: options.tag } : {}),
-              ...(options.topic.length ? { topicIds: options.topic } : {}),
-              ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-            }),
+        const result = await withProfile(command, (service) =>
+          service.todos.create({
+            title: options.title,
+            ...(options.details ? { details: options.details } : {}),
+            priority: Number(options.priority) as 1 | 2 | 3 | 4,
+            ...((due) => (due ? { due } : {}))(taskDue(options)),
+            ...(options.tag.length ? { tags: options.tag } : {}),
+            ...(options.topic.length ? { topicIds: options.topic } : {}),
+            ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+          }),
         );
         output(
           io,
@@ -2701,45 +2762,38 @@ export function createCli(
         );
       },
     );
+
   todoCommand
     .command('list')
-    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .description('List your todos')
     .option('--status <status>')
     .option('--limit <number>', 'maximum results', '10')
-    .action(
-      async (
-        options: { as: string; actorKind: string; status?: string; limit: string },
-        command: Command,
-      ) => {
-        const global = globals(command);
-        const page = await withClient(global.home, actor(options.actorKind, options.as), (client) =>
-          client.todos.list({
-            ...(options.status ? { status: options.status } : {}),
-            limit: Number(options.limit),
-          }),
-        );
-        output(
-          io,
-          global.json,
-          page,
-          page.items.length
-            ? page.items
-                .map((item) => `${item.id}  ${item.status.padEnd(9)}  ${item.title}`)
-                .join('\n')
-            : 'No todos.',
-        );
-      },
-    );
+    .action(async (options: { status?: string; limit: string }, command: Command) => {
+      const global = globals(command);
+      const page = await withProfile(command, (service) =>
+        service.todos.list({
+          ...(options.status ? { status: options.status } : {}),
+          limit: Number(options.limit),
+        }),
+      );
+      output(
+        io,
+        global.json,
+        page,
+        page.items.length
+          ? page.items
+              .map((item) => `${item.id}  ${item.status.padEnd(9)}  ${item.title}`)
+              .join('\n')
+          : 'No todos.',
+      );
+    });
+
   todoCommand
     .command('show <todo-id>')
-    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
-    .action(async (id: string, options: { as: string; actorKind: string }, command: Command) => {
+    .description('Show one of your todos')
+    .action(async (id: string, _options, command: Command) => {
       const global = globals(command);
-      const record = await withClient(global.home, actor(options.actorKind, options.as), (client) =>
-        client.todos.get(id),
-      );
+      const record = await withProfile(command, (service) => service.todos.get(id));
       output(
         io,
         global.json,
@@ -2747,67 +2801,51 @@ export function createCli(
         `${record.current.title}\nStatus: ${record.status}\nPriority: ${record.current.priority}\nVersion: ${record.current.version}${record.current.details ? `\n\n${record.current.details}` : ''}`,
       );
     });
+
   for (const operation of ['complete', 'reopen', 'cancel', 'archive'] as const) {
     todoCommand
       .command(`${operation} <todo-id>`)
-      .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-      .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+      .description(`${operation[0]!.toUpperCase()}${operation.slice(1)} one of your todos`)
       .option('--note <text>')
       .option('--reason <text>')
       .option('--idempotency-key <key>')
       .action(
         async (
           id: string,
-          options: {
-            as: string;
-            actorKind: string;
-            note?: string;
-            reason?: string;
-            idempotencyKey?: string;
-          },
+          options: { note?: string; reason?: string; idempotencyKey?: string },
           command: Command,
         ) => {
           const global = globals(command);
-          const record = await withClient(
-            global.home,
-            actor(options.actorKind, options.as),
-            (client) =>
-              operation === 'complete'
-                ? client.todos.complete({
+          const key = options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {};
+          const record = await withProfile(command, (service) =>
+            operation === 'complete'
+              ? service.todos.complete({
+                  todoId: id,
+                  ...(options.note ? { note: options.note } : {}),
+                  ...key,
+                })
+              : operation === 'cancel'
+                ? service.todos.cancel({
                     todoId: id,
-                    ...(options.note ? { note: options.note } : {}),
-                    ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+                    ...(options.reason ? { reason: options.reason } : {}),
+                    ...key,
                   })
-                : operation === 'cancel'
-                  ? client.todos.cancel({
-                      todoId: id,
-                      ...(options.reason ? { reason: options.reason } : {}),
-                      ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-                    })
-                  : operation === 'archive'
-                    ? client.todos.archive({
-                        todoId: id,
-                        ...(options.idempotencyKey
-                          ? { idempotencyKey: options.idempotencyKey }
-                          : {}),
-                      })
-                    : client.todos.reopen({
-                        todoId: id,
-                        ...(options.idempotencyKey
-                          ? { idempotencyKey: options.idempotencyKey }
-                          : {}),
-                      }),
+                : operation === 'archive'
+                  ? service.todos.archive({ todoId: id, ...key })
+                  : service.todos.reopen({ todoId: id, ...key }),
           );
           output(io, global.json, record, `Todo ${id} is now ${record.status}.`);
         },
       );
   }
 
+  /* ------------------------------------------------------------ tasks */
+
   const taskCommand = program.command('task').description('Create and manage agent tasks');
+
   taskCommand
     .command('create <assignee>')
-    .requiredOption('--from <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'human, agent, or system', 'agent')
+    .description('Assign a task to an agent')
     .requiredOption('--title <title>')
     .option('--description <text>')
     .option('--priority <number>', '1 highest, 4 lowest', '3')
@@ -2822,8 +2860,6 @@ export function createCli(
       async (
         assignee: string,
         options: {
-          from: string;
-          actorKind: string;
           title: string;
           description?: string;
           priority: string;
@@ -2838,21 +2874,18 @@ export function createCli(
         command: Command,
       ) => {
         const global = globals(command);
-        const result = await withClient(
-          global.home,
-          actor(options.actorKind, options.from),
-          (client) =>
-            client.tasks.create({
-              assigneeAgentId: assignee,
-              title: options.title,
-              ...(options.description ? { description: options.description } : {}),
-              priority: Number(options.priority) as 1 | 2 | 3 | 4,
-              ...((due) => (due ? { due } : {}))(taskDue(options)),
-              ...(options.tag.length ? { tags: options.tag } : {}),
-              ...(options.topic.length ? { topicIds: options.topic } : {}),
-              visibility: options.visibility,
-              ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-            }),
+        const result = await withProfile(command, (service) =>
+          service.tasks.create({
+            assigneeAgentId: assignee,
+            title: options.title,
+            ...(options.description ? { description: options.description } : {}),
+            priority: Number(options.priority) as 1 | 2 | 3 | 4,
+            ...((due) => (due ? { due } : {}))(taskDue(options)),
+            ...(options.tag.length ? { tags: options.tag } : {}),
+            ...(options.topic.length ? { topicIds: options.topic } : {}),
+            visibility: options.visibility,
+            ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+          }),
         );
         output(
           io,
@@ -2862,47 +2895,44 @@ export function createCli(
         );
       },
     );
+
   taskCommand
     .command('list')
+    .description('List tasks')
     .option('--assignee <agent>')
     .option('--status <status>')
     .option('--limit <number>', 'maximum results', '10')
     .action(
       async (options: { assignee?: string; status?: string; limit: string }, command: Command) => {
         const global = globals(command);
-        const page = await withClient(
-          global.home,
-          defaultActor(env, 'human', 'local-cli', global.actor),
-          (client) =>
-            client.tasks.list({
-              ...(options.assignee ? { participantAgentId: options.assignee } : {}),
-              ...(options.status ? { status: options.status } : {}),
-              limit: Number(options.limit),
-            }),
-          Boolean(global.actor),
+        const page = await withProfile(command, (service) =>
+          service.tasks.list({
+            ...(options.assignee ? { participantAgentId: options.assignee } : {}),
+            ...(options.status ? { status: options.status } : {}),
+            limit: Number(options.limit),
+          }),
         );
         output(io, global.json, page, page.items.map(lineForItem).join('\n') || 'No tasks found.');
       },
     );
-  taskCommand.command('show <task-id>').action(async (id: string, _options, command: Command) => {
-    const global = globals(command);
-    const record = await withClient(
-      global.home,
-      defaultActor(env, 'human', 'local-cli', global.actor),
-      (client) => client.tasks.get(id),
-      Boolean(global.actor),
-    );
-    output(
-      io,
-      global.json,
-      record,
-      `${record.current.title}\nID: ${record.event.id}\nStatus: ${record.status}\nVersion: ${record.current.version}`,
-    );
-  });
+
+  taskCommand
+    .command('show <task-id>')
+    .description('Show one task')
+    .action(async (id: string, _options, command: Command) => {
+      const global = globals(command);
+      const record = await withProfile(command, (service) => service.tasks.get(id));
+      output(
+        io,
+        global.json,
+        record,
+        `${record.current.title}\nID: ${record.event.id}\nStatus: ${record.status}\nVersion: ${record.current.version}`,
+      );
+    });
+
   taskCommand
     .command('update <task-id>')
-    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'agent or human', 'agent')
+    .description('Update a task (optimistic concurrency)')
     .requiredOption('--expected-version <number>')
     .option('--title <title>')
     .option('--description <text>')
@@ -2917,8 +2947,6 @@ export function createCli(
       async (
         id: string,
         options: {
-          as: string;
-          actorKind: string;
           expectedVersion: string;
           title?: string;
           description?: string;
@@ -2934,34 +2962,30 @@ export function createCli(
       ) => {
         const global = globals(command);
         const parsedDue = taskDue(options);
-        const record = await withClient(
-          global.home,
-          actor(options.actorKind, options.as),
-          (client) =>
-            client.tasks.update({
-              taskId: id,
-              expectedVersion: Number(options.expectedVersion),
-              ...(options.title ? { title: options.title } : {}),
-              ...(options.description !== undefined ? { description: options.description } : {}),
-              ...(options.priority ? { priority: Number(options.priority) as 1 | 2 | 3 | 4 } : {}),
-              ...(options.clearDue ? { due: null } : parsedDue ? { due: parsedDue } : {}),
-              ...(options.visibility ? { visibility: options.visibility } : {}),
-              ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-            }),
+        const record = await withProfile(command, (service) =>
+          service.tasks.update({
+            taskId: id,
+            expectedVersion: Number(options.expectedVersion),
+            ...(options.title ? { title: options.title } : {}),
+            ...(options.description !== undefined ? { description: options.description } : {}),
+            ...(options.priority ? { priority: Number(options.priority) as 1 | 2 | 3 | 4 } : {}),
+            ...(options.clearDue ? { due: null } : parsedDue ? { due: parsedDue } : {}),
+            ...(options.visibility ? { visibility: options.visibility } : {}),
+            ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+          }),
         );
         output(io, global.json, record, `Updated task ${id} to version ${record.current.version}.`);
       },
     );
+
   for (const operation of ['accept', 'reject', 'complete', 'reopen', 'cancel'] as const) {
     const command_ = taskCommand
       .command(`${operation} <task-id>`)
-      .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-      .option('--actor-kind <kind>', 'agent or human', 'agent')
+      .description(`${operation[0]!.toUpperCase()}${operation.slice(1)} a task`)
       .option('--note <text>')
       .option('--reason <text>')
       .option('--idempotency-key <key>');
-    // Rejecting requires saying why; accepting may. Marked required at the
-    // parser so the CLI refuses before touching the store.
+    // Rejecting requires saying why; accepting may.
     if (operation === 'reject') {
       command_.requiredOption('--response <text>', 'why the task is being refused');
     } else if (operation === 'accept') {
@@ -2970,209 +2994,85 @@ export function createCli(
     command_.action(
       async (
         id: string,
-        options: {
-          as: string;
-          actorKind: string;
-          note?: string;
-          reason?: string;
-          response?: string;
-          idempotencyKey?: string;
-        },
+        options: { note?: string; reason?: string; response?: string; idempotencyKey?: string },
         command: Command,
       ) => {
         const global = globals(command);
-        const record = await withClient(
-          global.home,
-          actor(options.actorKind, options.as),
-          (client) =>
-            operation === 'accept'
-              ? client.tasks.accept({
+        const key = options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {};
+        const record = await withProfile(command, (service) =>
+          operation === 'accept'
+            ? service.tasks.accept({
+                taskId: id,
+                ...(options.response ? { response: options.response } : {}),
+                ...key,
+              })
+            : operation === 'reject'
+              ? service.tasks.reject({
                   taskId: id,
-                  ...(options.response ? { response: options.response } : {}),
-                  ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+                  response: options.response ?? options.reason ?? '',
+                  ...key,
                 })
-              : operation === 'reject'
-                ? client.tasks.reject({
+              : operation === 'complete'
+                ? service.tasks.complete({
                     taskId: id,
-                    response: options.response ?? options.reason ?? '',
-                    ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+                    ...(options.note ? { note: options.note } : {}),
+                    ...key,
                   })
-                : operation === 'complete'
-                  ? client.tasks.complete({
+                : operation === 'cancel'
+                  ? service.tasks.cancel({
                       taskId: id,
-                      ...(options.note ? { note: options.note } : {}),
-                      ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+                      ...(options.reason ? { reason: options.reason } : {}),
+                      ...key,
                     })
-                  : operation === 'cancel'
-                    ? client.tasks.cancel({
-                        taskId: id,
-                        ...(options.reason ? { reason: options.reason } : {}),
-                        ...(options.idempotencyKey
-                          ? { idempotencyKey: options.idempotencyKey }
-                          : {}),
-                      })
-                    : client.tasks.reopen({
-                        taskId: id,
-                        ...(options.idempotencyKey
-                          ? { idempotencyKey: options.idempotencyKey }
-                          : {}),
-                      }),
+                  : service.tasks.reopen({ taskId: id, ...key }),
         );
         output(io, global.json, record, `Task ${id} is ${record.status}.`);
       },
     );
   }
 
-  kudosCommand
-    .command('show <kudos-id>')
-    .description('Show one kudos item and its current state')
-    .action(async (id: string, _options, command: Command) => {
+  /* ------------------------------------------------------------ maintenance */
+
+  const projectionCommand = program
+    .command('projection')
+    .description('Inspect the generated files Synomem derives from events');
+
+  projectionCommand
+    .command('status')
+    .description('Report whether the generated files match the canonical events (local stores)')
+    .action(async (_options, command: Command) => {
       const global = globals(command);
-      const record = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.kudos.get(id),
-      );
-      output(io, global.json, record, showRecord(record));
-    });
-
-  kudosCommand
-    .command('acknowledge <kudos-id>')
-    .description('Record that a recipient reviewed kudos')
-    .requiredOption('--as <agent-id>', 'recipient agent identity')
-    .option('--actor-kind <kind>', 'agent, human, or system', 'agent')
-    .option('--name <display-name>')
-    .option('--note <text>')
-    .action(
-      async (
-        id: string,
-        options: { as: string; actorKind: string; name?: string; note?: string },
-        command: Command,
-      ) => {
-        const global = globals(command);
-        const record = await withClient(
-          global.home,
-          actor(options.actorKind, options.as, options.name),
-          (client) =>
-            client.kudos.acknowledge({
-              kudosId: id,
-              ...(options.note ? { note: options.note } : {}),
-            }),
-        );
-        output(io, global.json, record, `Acknowledged ${id} as ${options.as}.`);
-      },
-    );
-
-  kudosCommand
-    .command('revoke <kudos-id>')
-    .description('Record a revocation while preserving history')
-    .requiredOption('--as <actor-id>', 'actor to act as (defaults to --actor)', actingDefault)
-    .option('--actor-kind <kind>', 'human, agent, or system', 'human')
-    .requiredOption('--reason <reason>')
-    .option('--administrative', 'mark as an administrative revocation', false)
-    .action(
-      async (
-        id: string,
-        options: { as: string; actorKind: string; reason: string; administrative: boolean },
-        command: Command,
-      ) => {
-        const global = globals(command);
-        const record = await withClient(
-          global.home,
-          actor(options.actorKind, options.as),
-          (client) =>
-            client.kudos.revoke({
-              kudosId: id,
-              reason: options.reason,
-              administrative: options.administrative,
-            }),
-        );
-        output(io, global.json, record, `Revoked ${id}; the audit trail was preserved.`);
-      },
-    );
-
-  kudosCommand
-    .command('wins [agent]')
-    .description('Print the generated WINS.md path or content')
-    .option('--open', 'open WINS.md in the system GUI', false)
-    .option('--print', 'print Markdown content', false)
-    .action(
-      async (
-        agentId: string | undefined,
-        options: { open: boolean; print: boolean },
-        command: Command,
-      ) => {
-        const global = globals(command);
-        if (!agentId) throw new SynomemError('INVALID_INPUT', 'Specify an agent.');
-        const details = await withClient(
-          global.home,
-          defaultActor(env, 'system', 'cli', global.actor),
-          async (client) => {
-            const profile = await client.agents.get(agentId);
-            const info = await client.info();
-            if (info.backend !== 'local') {
-              throw new SynomemError(
-                'INVALID_INPUT',
-                'Generated WINS.md files are available only with the local backend.',
-              );
-            }
-            const capabilities = await client.capabilities();
-            // Projections are written under the handle, since they exist to be read.
-            const path = join(info.home, profile.handle, 'WINS.md');
-            if (!existsSync(path)) {
-              const hint = capabilities.projections.writeWinsMarkdown
-                ? 'Run `synomem rebuild` to generate it.'
-                : 'Enable projection.writeWinsMarkdown and run `synomem rebuild`.';
-              throw new SynomemError(
-                'INVALID_INPUT',
-                `No generated WINS.md exists for ${profile.handle}. ${hint}`,
-              );
-            }
-            return { profile, path, content: readFileSync(path, 'utf8') };
-          },
-        );
-        if (options.open) {
-          const commandName =
-            process.platform === 'darwin'
-              ? 'open'
-              : process.platform === 'win32'
-                ? 'cmd'
-                : 'xdg-open';
-          const args =
-            process.platform === 'win32' ? ['/c', 'start', '', details.path] : [details.path];
-          spawn(commandName, args, { detached: true, stdio: 'ignore' }).unref();
+      const status = await withManagement(command, (service) => {
+        if (!service.projectionStatus) {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            'The hosted API keeps no filesystem projections, so there is nothing to report.',
+          );
         }
-        output(io, global.json, details, options.print ? details.content.trimEnd() : details.path);
-      },
-    );
-
-  addListOptions(
-    kudosCommand.command('stats').description('Show aggregate kudos statistics'),
-  ).action(async (options: Record<string, string>, command: Command) => {
-    const global = globals(command);
-    const stats = await withClient(
-      global.home,
-      defaultActor(env, 'system', 'cli', global.actor),
-      (client) => client.stats(listInput(options)),
-    );
-    output(
-      io,
-      global.json,
-      stats,
-      `Total: ${stats.total}\nActive: ${stats.active}\nAcknowledged: ${stats.acknowledged}\nRevoked: ${stats.revoked}`,
-    );
-  });
+        return service.projectionStatus();
+      });
+      const enabled = Object.entries(status.settings)
+        .filter(([, on]) => on)
+        .map(([name]) => name);
+      const lines = [
+        `Directory: ${status.directory ?? '(none)'}`,
+        `Enabled: ${enabled.length ? enabled.join(', ') : 'none'}`,
+        `Last rebuilt: ${status.lastRebuiltAt ?? 'never'}`,
+        status.current
+          ? `Current: ${status.counts.manifest} generated file(s) match the events.`
+          : `Stale: ${status.counts.missing} missing, ${status.counts.unexpected} no longer expected. Run \`synomem rebuild\`.`,
+      ];
+      for (const path of status.missing) lines.push(`  missing     ${path}`);
+      for (const path of status.unexpected) lines.push(`  unexpected  ${path}`);
+      output(io, global.json, status, lines.join('\n'));
+    });
 
   program
     .command('rebuild')
     .description('Regenerate current-state and filesystem projections from canonical events')
     .action(async (_options, command: Command) => {
       const global = globals(command);
-      const result = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.rebuild(),
-      );
+      const result = await withManagement(command, (service) => service.rebuild());
       output(
         io,
         global.json,
@@ -3183,22 +3083,18 @@ export function createCli(
 
   program
     .command('backup <destination>')
-    .description('Create a transactionally consistent SQLite backup')
+    .description('Create a transactionally consistent SQLite backup (local stores)')
     .action(async (destination: string, _options, command: Command) => {
       const global = globals(command);
-      const path = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => {
-          if (!client.backup) {
-            throw new SynomemError(
-              'INVALID_INPUT',
-              'Filesystem backup is available only with the local backend.',
-            );
-          }
-          return client.backup(destination);
-        },
-      );
+      const path = await withManagement(command, (service) => {
+        if (!service.backup) {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            'Filesystem backup is available only for local stores.',
+          );
+        }
+        return service.backup(destination);
+      });
       output(io, global.json, { path }, `Created backup at ${path}`);
     });
 
@@ -3215,11 +3111,7 @@ export function createCli(
         command: Command,
       ) => {
         const global = globals(command);
-        const content = await withClient(
-          global.home,
-          defaultActor(env, 'system', 'cli', global.actor),
-          (client) => client.export(options.format),
-        );
+        const content = await withManagement(command, (service) => service.export(options.format));
         if (options.output) {
           const destination = resolve(options.output);
           atomicWriteFile(destination, content, 0o600);
@@ -3240,11 +3132,7 @@ export function createCli(
     .description('Run safe diagnostics')
     .action(async (_options, command: Command) => {
       const global = globals(command);
-      const result = await withClient(
-        global.home,
-        defaultActor(env, 'system', 'cli', global.actor),
-        (client) => client.doctor(),
-      );
+      const result = await withManagement(command, (service) => service.doctor());
       const human = result.diagnostics
         .map((item) => `${item.level.toUpperCase().padEnd(7)} ${item.code}: ${item.message}`)
         .join('\n');
@@ -3252,65 +3140,87 @@ export function createCli(
       if (!result.healthy) cliExitCodes.set(program, 5);
     });
 
+  /* ------------------------------------------------------------ mcp */
+
   program
     .command('mcp')
-    .description('Run the actor-bound MCP server over stdio')
-    .option('--agent-id <id>', 'bound agent, whose identity is read from Synomem')
-    .option('--actor-id <id>', 'bound non-agent actor ID')
-    .option('--actor-kind <kind>', 'human or system')
-    .option('--actor-name <display-name>', 'display name for a non-agent actor')
-    .action(
-      async (
-        options: { agentId?: string; actorId?: string; actorKind?: string; actorName?: string },
-        command: Command,
-      ) => {
-        const global = globals(command);
-        // An agent's name comes from its profile, never from the command line:
-        // the name is written into every event the session appends, and a
-        // harness must not be able to sign another agent's name to work.
-        const bound = options.agentId
-          ? await withClient(
-              global.home,
-              defaultActor(env, 'system', 'cli', global.actor),
-              async (client) => {
-                const resolution = await client.agents.resolve(options.agentId!);
-                if (!resolution.match) {
-                  throw new SynomemError(
-                    'AGENT_NOT_FOUND',
-                    resolution.candidates.length
-                      ? `"${options.agentId}" matches ${resolution.candidates.length} agents: ${resolution.candidates
-                          .map((candidate) => candidate.id)
-                          .join(', ')}. Name one of them.`
-                      : `Unknown agent: ${options.agentId}`,
-                  );
-                }
-                return actor('agent', resolution.match.id, resolution.match.displayName);
-              },
-            )
-          : undefined;
-        if (!bound && !(options.actorId && options.actorKind)) {
-          throw new SynomemError(
-            'INVALID_INPUT',
-            'Specify --agent-id, or --actor-id with --actor-kind for a non-agent actor.',
-          );
-        }
-        await startMcpServer({
-          ...(global.home ? { home: global.home } : {}),
-          actor: bound ?? actor(options.actorKind!, options.actorId!, options.actorName),
-        });
-      },
-    );
+    .description('Run the MCP server over stdio for a profile (fixed) or a preset (explicit)')
+    .addOption(
+      new Option('--contexts <mode>', 'fixed (a profile) or explicit (a preset)').choices([
+        'fixed',
+        'explicit',
+      ]),
+    )
+    .action(async (options: { contexts?: 'fixed' | 'explicit' }, command: Command) => {
+      const global = globals(command);
+      const config = profileStoreFor(global.home).read();
+      const selection = selectionFor(global, config);
+      if (!selection) throw noSelectionError();
+      if (selection.kind === 'preset' && options.contexts !== 'explicit') {
+        throw new SynomemError(
+          'INVALID_INPUT',
+          `Preset ${selection.name} serves several identities; start it with --contexts explicit so every tool call names its context.`,
+        );
+      }
+      if (selection.kind === 'profile' && options.contexts === 'explicit') {
+        throw new SynomemError(
+          'INVALID_INPUT',
+          'A profile is one fixed identity. Use --preset <name> --contexts explicit for several.',
+        );
+      }
+      const deps = resolverDeps(global.home);
+      const resolver: ContextResolver =
+        selection.kind === 'profile'
+          ? profileResolver(global.home, config, selection.name, deps)
+          : presetResolver(global.home, config, selection.name, deps);
+      await (dependencies.startMcpServer ?? runStdioServer)({ resolver });
+    });
 
   return program;
+}
+
+/**
+ * Serves one resolver over stdio until the client disconnects.
+ *
+ * Deliberately not imported from `mcp-server.js`: that file is the
+ * `synomem-mcp` entry point and delegates to this module at its own top level,
+ * so importing it back from here is a circular top-level await that never
+ * settles when `synomem-mcp` is the process entry.
+ */
+async function runStdioServer(options: { resolver: ContextResolver }): Promise<void> {
+  const runtime = await serveStdio(options.resolver, {});
+  await new Promise<void>((resolveClosed) => {
+    const previous = runtime.server.server.onclose;
+    runtime.server.server.onclose = () => {
+      previous?.();
+      resolveClosed();
+    };
+    // The stdio transport does not close itself when the client closes stdin;
+    // without this the process would exit with this promise unsettled.
+    process.stdin.once('end', () => resolveClosed());
+  });
+  await runtime.close().catch(() => undefined);
+  await options.resolver.close?.();
 }
 
 export async function runCli(
   argv = process.argv,
   io: CliIo = defaultIo,
-  serviceFactory: SynomemServiceFactory = configuredServiceFactory,
   dependencies: CliDependencies = {},
 ): Promise<number> {
-  const program = createCli(io, serviceFactory, dependencies, argv);
+  const env = dependencies.env ?? process.env;
+  const json = argv.includes('--json');
+  const obsolete = obsoleteIdentityInput(argv, env);
+  if (obsolete) {
+    const message = `${obsolete} is no longer supported: the acting identity comes from a profile. Pass --profile <name> (see \`synomem profile list\`), or create one with \`synomem profile create\`.`;
+    io.stderr(
+      json
+        ? `${JSON.stringify({ ok: false, error: { code: 'INVALID_INPUT', message } })}\n`
+        : `Error [INVALID_INPUT]: ${message}\n`,
+    );
+    return 2;
+  }
+  const program = createCli(io, dependencies);
   program.exitOverride();
   try {
     await program.parseAsync(argv);
@@ -3321,14 +3231,13 @@ export async function runCli(
       if (!error.message.startsWith('error:')) io.stderr(`${error.message}\n`);
       return 2;
     }
-    const kudosError = asSynomemError(error);
-    const json = argv.includes('--json');
+    const synomemError = asSynomemError(error);
     io.stderr(
       json
-        ? `${JSON.stringify({ ok: false, error: { code: kudosError.code, message: kudosError.message } })}\n`
-        : `Error [${kudosError.code}]: ${kudosError.message}\n`,
+        ? `${JSON.stringify({ ok: false, error: { code: synomemError.code, message: synomemError.message } })}\n`
+        : `Error [${synomemError.code}]: ${synomemError.message}\n`,
     );
-    return exitCode(kudosError.code);
+    return exitCode(synomemError.code);
   }
 }
 

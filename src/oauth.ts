@@ -1,16 +1,27 @@
+/**
+ * The CLI's own OAuth 2.1 client (RFC 8252 native app).
+ *
+ * Authorization code + PKCE S256 through the system browser and a loopback
+ * redirect, against the pre-registered public client `synomem-cli`. The token
+ * is audienced to the Synomem API itself: discovery starts from the API's own
+ * protected-resource metadata (RFC 9728), never from the MCP gateway, and the
+ * discovered issuer and resource are validated before any browser opens.
+ *
+ * Which agent and workspace the resulting connection may act as is chosen on
+ * the consent screen and enforced by the API; nothing here names an actor.
+ */
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
-import {
-  discoverOAuthServerInfo,
-  startAuthorization,
-} from '@modelcontextprotocol/sdk/client/auth.js';
+import { createHash, randomBytes } from 'node:crypto';
 import { SynomemError } from './errors.js';
-import type { CredentialStore, StoredOAuthCredential } from './credentials.js';
-import type { SynomemCredentialProvider } from './remote.js';
-import { readCredentialFile } from './configure.js';
+import type { StoredOAuthCredential } from './credentials.js';
 
-const defaultScope = 'synomem:read synomem:write offline_access';
+export const DEFAULT_CLI_CLIENT_ID = 'synomem-cli';
+export const DEFAULT_CALLBACK_PORT = 43_817;
+export const DEFAULT_CLI_SCOPE = 'openid offline_access synomem:read synomem:write';
+const maximumDocumentBytes = 64 * 1024;
+/** Access tokens are treated as expired this long before they actually are. */
+const expirySafetyMs = 30_000;
 
 interface TokenResponse {
   access_token: string;
@@ -19,35 +30,151 @@ interface TokenResponse {
   scope?: string;
 }
 
-function secureEndpoint(value: string, label: string): URL {
-  const url = new URL(value);
-  if (url.protocol !== 'https:') {
+export interface ApiAuthorizationMetadata {
+  resource: string;
+  issuer: string;
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+}
+
+function trimSlash(value: string): string {
+  return value.replace(/\/+$/, '');
+}
+
+/** HTTPS, or loopback HTTP (development against a local stack). */
+export function secureUrl(value: string, label: string): URL {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new SynomemError('AUTH_REQUIRED', `${label} is not a valid URL.`);
+  }
+  const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) {
     throw new SynomemError('AUTH_REQUIRED', `${label} must use HTTPS.`);
   }
+  if (url.username || url.password) {
+    throw new SynomemError('AUTH_REQUIRED', `${label} must not carry credentials.`);
+  }
   return url;
+}
+
+async function readJson(
+  url: URL,
+  fetchImplementation: typeof fetch,
+  label: string,
+): Promise<Record<string, unknown>> {
+  let response: Response;
+  try {
+    response = await fetchImplementation(url, {
+      redirect: 'error',
+      headers: { accept: 'application/json' },
+    });
+  } catch {
+    throw new SynomemError('REMOTE_UNAVAILABLE', `${label} is unavailable.`);
+  }
+  const text = await response.text();
+  if (Buffer.byteLength(text) > maximumDocumentBytes) {
+    throw new SynomemError('REMOTE_PROTOCOL', `${label} exceeded the safe size limit.`);
+  }
+  if (!response.ok) {
+    throw new SynomemError('REMOTE_PROTOCOL', `${label} returned HTTP ${response.status}.`);
+  }
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
+    return parsed as Record<string, unknown>;
+  } catch {
+    throw new SynomemError('REMOTE_PROTOCOL', `${label} is not valid JSON.`);
+  }
+}
+
+/**
+ * Where to sign in for this API, validated.
+ *
+ * The protected-resource metadata must name THIS API as its resource and at
+ * least one authorization server; the authorization server's metadata must
+ * name itself as issuer, publish HTTPS endpoints and support S256. A mismatch
+ * anywhere stops the login before a browser opens.
+ */
+export async function discoverApiAuthorization(
+  apiUrl: string,
+  fetchImplementation: typeof fetch = fetch,
+): Promise<ApiAuthorizationMetadata> {
+  const api = secureUrl(apiUrl, 'Synomem API URL');
+  const resourceMetadata = await readJson(
+    new URL('/.well-known/oauth-protected-resource', api.origin),
+    fetchImplementation,
+    'API protected-resource metadata',
+  );
+  const resource = resourceMetadata.resource;
+  if (typeof resource !== 'string' || trimSlash(resource) !== trimSlash(api.origin)) {
+    throw new SynomemError(
+      'AUTH_REQUIRED',
+      'The API protected-resource metadata does not describe this API.',
+    );
+  }
+  const servers = resourceMetadata.authorization_servers;
+  const issuerValue: unknown = Array.isArray(servers) ? (servers as unknown[])[0] : undefined;
+  if (typeof issuerValue !== 'string') {
+    throw new SynomemError('AUTH_REQUIRED', 'The API names no authorization server.');
+  }
+  const issuer = secureUrl(issuerValue, 'Authorization server');
+  const asMetadata = await readJson(
+    new URL(
+      `/.well-known/oauth-authorization-server${issuer.pathname === '/' ? '' : trimSlash(issuer.pathname)}`,
+      issuer.origin,
+    ),
+    fetchImplementation,
+    'Authorization server metadata',
+  );
+  if (
+    typeof asMetadata.issuer !== 'string' ||
+    trimSlash(asMetadata.issuer) !== trimSlash(issuer.href)
+  ) {
+    throw new SynomemError(
+      'AUTH_REQUIRED',
+      'The authorization server metadata issuer does not match.',
+    );
+  }
+  const authorizationEndpoint = asMetadata.authorization_endpoint;
+  const tokenEndpoint = asMetadata.token_endpoint;
+  if (typeof authorizationEndpoint !== 'string' || typeof tokenEndpoint !== 'string') {
+    throw new SynomemError('AUTH_REQUIRED', 'Authorization server discovery is incomplete.');
+  }
+  secureUrl(authorizationEndpoint, 'OAuth authorization endpoint');
+  secureUrl(tokenEndpoint, 'OAuth token endpoint');
+  const methods = asMetadata.code_challenge_methods_supported;
+  if (!Array.isArray(methods) || !methods.includes('S256')) {
+    throw new SynomemError('AUTH_REQUIRED', 'The authorization server must support PKCE S256.');
+  }
+  return {
+    resource: trimSlash(resource),
+    issuer: trimSlash(asMetadata.issuer),
+    authorizationEndpoint,
+    tokenEndpoint,
+  };
 }
 
 async function tokenRequest(
   endpoint: string,
   parameters: URLSearchParams,
   fetchImplementation: typeof fetch,
-  signal?: AbortSignal,
 ): Promise<TokenResponse> {
   let response: Response;
   try {
-    response = await fetchImplementation(secureEndpoint(endpoint, 'OAuth token endpoint'), {
+    response = await fetchImplementation(secureUrl(endpoint, 'OAuth token endpoint'), {
       method: 'POST',
       redirect: 'error',
       headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
       body: parameters,
-      ...(signal ? { signal } : {}),
     });
   } catch (error) {
     if (error instanceof SynomemError) throw error;
     throw new SynomemError('REMOTE_UNAVAILABLE', 'The OAuth token endpoint is unavailable.');
   }
   const text = await response.text();
-  if (Buffer.byteLength(text) > 64 * 1024) {
+  if (Buffer.byteLength(text) > maximumDocumentBytes) {
     throw new SynomemError('REMOTE_PROTOCOL', 'OAuth token response exceeded the safe limit.');
   }
   let parsed: Partial<TokenResponse>;
@@ -62,11 +189,17 @@ async function tokenRequest(
   return parsed as TokenResponse;
 }
 
+function expiresAt(expiresIn: number | undefined): number {
+  // A token without a lifetime is still refreshed on the API's schedule: 10
+  // minutes is the contract's maximum access-token lifetime.
+  return Date.now() + Math.max(0, (expiresIn ?? 600) * 1_000 - expirySafetyMs);
+}
+
 function launchBrowser(url: URL): void {
-  const command = process.platform === 'darwin' ? 'open' : 'xdg-open';
   if (process.platform !== 'darwin' && process.platform !== 'linux') {
     throw new SynomemError('CONFIG_INVALID', `Open this URL in a browser: ${url.href}`);
   }
+  const command = process.platform === 'darwin' ? 'open' : 'xdg-open';
   const child = spawn(command, [url.href], { detached: true, stdio: 'ignore' });
   child.once('error', () => undefined);
   child.unref();
@@ -92,7 +225,14 @@ async function authorizationCode(
       if (oauthError || !code || returnedState !== state) {
         response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
         response.end('Synomem authorization failed. Return to your terminal.');
-        finish(new SynomemError('AUTH_REQUIRED', 'OAuth callback validation failed.'));
+        finish(
+          new SynomemError(
+            'AUTH_REQUIRED',
+            oauthError === 'access_denied'
+              ? 'Authorization was declined.'
+              : 'OAuth callback validation failed.',
+          ),
+        );
         return;
       }
       response.writeHead(200, {
@@ -124,10 +264,8 @@ async function authorizationCode(
 }
 
 export interface OAuthLoginOptions {
-  baseUrl: string;
-  clientId: string;
-  credentialReference: string;
-  credentialStore: CredentialStore;
+  apiUrl: string;
+  clientId?: string;
   scope?: string;
   callbackPort?: number;
   fetch?: typeof fetch;
@@ -135,140 +273,101 @@ export interface OAuthLoginOptions {
   timeoutMs?: number;
 }
 
-export async function loginWithOAuth(options: OAuthLoginOptions): Promise<void> {
+/** Runs the browser flow and returns the credential for the caller to store. */
+export async function loginWithOAuth(options: OAuthLoginOptions): Promise<StoredOAuthCredential> {
   const fetchImplementation = options.fetch ?? fetch;
-  const mcpUrl = new URL('/mcp', options.baseUrl);
-  const discovered = await discoverOAuthServerInfo(mcpUrl, { fetchFn: fetchImplementation });
-  const metadata = discovered.authorizationServerMetadata;
-  if (!metadata?.authorization_endpoint || !metadata.token_endpoint) {
-    throw new SynomemError('AUTH_REQUIRED', 'OAuth server discovery is incomplete.');
-  }
-  secureEndpoint(metadata.authorization_endpoint, 'OAuth authorization endpoint');
-  secureEndpoint(metadata.token_endpoint, 'OAuth token endpoint');
-  if (!metadata.code_challenge_methods_supported?.includes('S256')) {
-    throw new SynomemError('AUTH_REQUIRED', 'The OAuth server must support PKCE S256.');
-  }
-  const callbackPort = options.callbackPort ?? 43_817;
-  const redirectUrl = new URL(`http://127.0.0.1:${callbackPort}/callback`);
+  const metadata = await discoverApiAuthorization(options.apiUrl, fetchImplementation);
+  const clientId = options.clientId ?? DEFAULT_CLI_CLIENT_ID;
+  const scope = options.scope ?? DEFAULT_CLI_SCOPE;
+  const callbackPort = options.callbackPort ?? DEFAULT_CALLBACK_PORT;
+  const redirectUri = `http://127.0.0.1:${callbackPort}/callback`;
   const state = randomBytes(32).toString('base64url');
-  const resource = new URL(discovered.resourceMetadata?.resource ?? mcpUrl.href);
-  const scope = options.scope ?? defaultScope;
-  const started = await startAuthorization(discovered.authorizationServerUrl, {
-    metadata,
-    clientInformation: { client_id: options.clientId },
-    redirectUrl,
-    scope,
-    state,
-    resource,
-  });
+  const verifier = randomBytes(32).toString('base64url');
+  const challenge = createHash('sha256').update(verifier).digest('base64url');
+
+  const authorizationUrl = new URL(metadata.authorizationEndpoint);
+  authorizationUrl.searchParams.set('response_type', 'code');
+  authorizationUrl.searchParams.set('client_id', clientId);
+  authorizationUrl.searchParams.set('redirect_uri', redirectUri);
+  authorizationUrl.searchParams.set('scope', scope);
+  authorizationUrl.searchParams.set('state', state);
+  authorizationUrl.searchParams.set('code_challenge', challenge);
+  authorizationUrl.searchParams.set('code_challenge_method', 'S256');
+  authorizationUrl.searchParams.set('resource', metadata.resource);
+
   const code = await authorizationCode(
-    started.authorizationUrl,
+    authorizationUrl,
     state,
     callbackPort,
     options.openBrowser ?? launchBrowser,
     options.timeoutMs ?? 5 * 60_000,
   );
   const tokens = await tokenRequest(
-    metadata.token_endpoint,
+    metadata.tokenEndpoint,
     new URLSearchParams({
       grant_type: 'authorization_code',
-      client_id: options.clientId,
+      client_id: clientId,
       code,
-      code_verifier: started.codeVerifier,
-      redirect_uri: redirectUrl.href,
-      resource: resource.href,
+      code_verifier: verifier,
+      redirect_uri: redirectUri,
+      resource: metadata.resource,
     }),
     fetchImplementation,
   );
-  await options.credentialStore.set(options.credentialReference, {
+  return {
+    kind: 'oauth',
+    issuer: metadata.issuer,
+    resource: metadata.resource,
+    clientId,
+    tokenEndpoint: metadata.tokenEndpoint,
+    scope: tokens.scope ?? scope,
     accessToken: tokens.access_token,
     ...(tokens.refresh_token ? { refreshToken: tokens.refresh_token } : {}),
-    ...(tokens.expires_in
-      ? { expiresAt: Date.now() + Math.max(0, tokens.expires_in - 30) * 1_000 }
-      : {}),
-    tokenEndpoint: metadata.token_endpoint,
-    clientId: options.clientId,
-    resource: resource.href,
-    scope: tokens.scope ?? scope,
-  });
+    expiresAt: expiresAt(tokens.expires_in),
+    generation: 0,
+  };
 }
 
-export class StoredCredentialProvider implements SynomemCredentialProvider {
-  private refresh?: Promise<string | undefined>;
-  private credential?: StoredOAuthCredential;
-  /** Set when the stored credential is an access key rather than an OAuth grant. */
-  private staticAccessToken?: string;
-  private loaded = false;
-
-  constructor(
-    private readonly reference: string,
-    private readonly store: CredentialStore,
-    private readonly env: NodeJS.ProcessEnv = process.env,
-    private readonly fetchImplementation: typeof fetch = fetch,
-    /**
-     * Where `synomem config`'s restricted-file credential store, if chosen,
-     * would have written an access key. Optional because local-only and
-     * environment-only callers have no such file to fall back to.
-     */
-    private readonly home?: string,
-  ) {}
-
-  async getAccessToken(signal?: AbortSignal): Promise<string | undefined> {
-    if (this.env.SYNOMEM_ACCESS_TOKEN) return this.env.SYNOMEM_ACCESS_TOKEN;
-    if (!this.loaded) {
-      const stored = await this.store.get(this.reference);
-      /*
-       * An access key is not an OAuth credential: it cannot be refreshed and
-       * has no client or token endpoint. It is used exactly as stored,
-       * whichever of the two places it was found.
-       */
-      if (stored && 'kind' in stored) {
-        this.staticAccessToken = stored.accessToken;
-      } else if (stored) {
-        this.credential = stored;
-      } else if (this.home) {
-        this.staticAccessToken = readCredentialFile(this.home);
-      }
-      this.loaded = true;
-    }
-    if (this.staticAccessToken) return this.staticAccessToken;
-    const credential = this.credential;
-    if (!credential) return undefined;
-    if (!credential.expiresAt || credential.expiresAt > Date.now()) return credential.accessToken;
-    if (!credential.refreshToken) return undefined;
-    this.refresh ??= this.refreshCredential(credential, signal).finally(() => {
-      this.refresh = undefined;
-    });
-    return await this.refresh;
+/**
+ * Spends the refresh token once. Callers hold the credential lock and write the
+ * result before releasing it; a failure here is never retried with the same
+ * (possibly consumed) refresh token.
+ */
+export async function refreshOAuthCredential(
+  credential: StoredOAuthCredential,
+  fetchImplementation: typeof fetch = fetch,
+): Promise<StoredOAuthCredential> {
+  if (!credential.refreshToken) {
+    throw new SynomemError(
+      'REAUTHORIZATION_REQUIRED',
+      'The stored credential cannot be refreshed.',
+    );
   }
-
-  private async refreshCredential(
-    credential: StoredOAuthCredential,
-    signal?: AbortSignal,
-  ): Promise<string> {
-    const tokens = await tokenRequest(
+  let tokens: TokenResponse;
+  try {
+    tokens = await tokenRequest(
       credential.tokenEndpoint,
       new URLSearchParams({
         grant_type: 'refresh_token',
         client_id: credential.clientId,
-        refresh_token: credential.refreshToken!,
+        refresh_token: credential.refreshToken,
         resource: credential.resource,
-        scope: credential.scope,
       }),
-      this.fetchImplementation,
-      signal,
+      fetchImplementation,
     );
-    const updated: StoredOAuthCredential = {
-      ...credential,
-      accessToken: tokens.access_token,
-      refreshToken: tokens.refresh_token ?? credential.refreshToken,
-      ...(tokens.expires_in
-        ? { expiresAt: Date.now() + Math.max(0, tokens.expires_in - 30) * 1_000 }
-        : { expiresAt: undefined }),
-      scope: tokens.scope ?? credential.scope,
-    };
-    await this.store.set(this.reference, updated);
-    this.credential = updated;
-    return updated.accessToken;
+  } catch (error) {
+    if (error instanceof SynomemError && error.code === 'REMOTE_UNAVAILABLE') throw error;
+    throw new SynomemError(
+      'REAUTHORIZATION_REQUIRED',
+      'The stored credential was refused when refreshing.',
+    );
   }
+  return {
+    ...credential,
+    accessToken: tokens.access_token,
+    ...(tokens.refresh_token ? { refreshToken: tokens.refresh_token } : {}),
+    scope: tokens.scope ?? credential.scope,
+    expiresAt: expiresAt(tokens.expires_in),
+    generation: credential.generation + 1,
+  };
 }

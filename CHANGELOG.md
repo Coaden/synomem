@@ -3,6 +3,44 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
+## [0.9.0] - 2026-09-23
+
+One identity model for the CLI, the stdio MCP server and the hosted gateway: every operation runs
+as exactly one **context** (one workspace, one actor), chosen by a named **profile** and authorized
+by the API on every request. Greenfield: the previous configuration, credential and flag formats are
+not read or migrated.
+
+### Added
+
+- `~/.synomem/profiles.json` (version 1): connections (credential references only), profiles, and
+  harness presets. One resolver — `--profile`/`--preset`, `SYNOMEM_PROFILE`/`SYNOMEM_PRESET`, a
+  project's `.synomem/config.json`, then `defaultProfile` — serves the CLI and both stdio entry
+  points.
+- `synomem connection login|add-key|list|status|remove`. Browser sign-in uses the pre-registered
+  public client `synomem-cli`, discovers the authorization server from the API's own
+  protected-resource metadata and validates issuer and resource. One stored credential serves every
+  profile on the connection.
+- `synomem profile create|list|show|remove|default|use` and `synomem preset create|list|remove`.
+  `profile create` selects only a context the connection may already use; it never creates agents or
+  grants access.
+- `synomem setup --backend local`: the first local agent and a same-named fixed profile in one
+  idempotent, resumable step. `agent create --create-profile` for later local agents.
+- `synomem whoami`, and `synomem mcp --profile <p>` (fixed) / `--preset <p> --contexts explicit`.
+- Credentials: a discriminated `oauth` / `access-key` schema stored in the macOS Keychain, Linux
+  Secret Service, an explicit mode-0600 file, or read from `SYNOMEM_ACCESS_TOKEN` for an explicit
+  environment connection. OAuth refresh runs under a cross-process lock with a generation
+  compare-and-swap, so concurrent processes refresh once and a spent refresh token is never retried.
+
+### Removed
+
+- `--actor`, `--as`, `--from`, `--actor-kind`, `--actor-id`, `--agent-id`, `--actor-name`,
+  `SYNOMEM_ACTOR_ID`/`_KIND`/`_NAME`, `SYNOMEM_AGENT_ID` and `SYNOMEM_WORKSPACE`: all are refused
+  with a pointer to `--profile`. List filters that named an actor are now `--author`/`--author-kind`.
+- `synomem config`, `config init|show`, `init`, `backend show|use|status`, `auth login|status|logout`,
+  `remote workspace list|use`, `remote workspaces`, and `workspace use`. A store's `config.json` can
+  no longer select a remote backend.
+- The `installation-key` credential format and actor/workspace-indexed credential storage.
+
 ## [0.6.0] - 2026-09-07
 
 ### Added

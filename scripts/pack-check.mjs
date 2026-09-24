@@ -112,7 +112,7 @@ try {
     [
       '--input-type=module',
       '--eval',
-      "import { SynomemClient, StoredCredentialProvider } from 'synomem'; if (!SynomemClient || !StoredCredentialProvider) process.exit(1)",
+      "import { SynomemClient, createRemoteResolver } from 'synomem'; if (!SynomemClient || !createRemoteResolver) process.exit(1)",
     ],
     consumer,
   );
@@ -138,16 +138,16 @@ try {
   run(synomemBin, ['skill', 'install', '--runtime', 'codex'], consumer, skillEnv);
   const installedSkill = join(codexHome, 'skills', 'synomem', 'SKILL.md');
   if (existsSync(installedSkill)) throw new Error('Skill dry run unexpectedly wrote files.');
-  // Binding to an agent that does not exist must stop before anything is
+  // Registering a profile that does not exist must stop before anything is
   // installed, rather than leaving a skill pointed at nobody.
   const refused = runExpectingFailure(
     synomemBin,
-    ['skill', 'install', '--runtime', 'codex', '--agent', 'ghost', '--yes'],
+    ['skill', 'install', '--runtime', 'codex', '--profile', 'ghost', '--yes'],
     consumer,
     skillEnv,
   );
-  if (!refused.includes('Unknown agent')) {
-    throw new Error(`Unknown agent was not reported clearly:\n${refused}`);
+  if (!refused.includes('Unknown profile')) {
+    throw new Error(`Unknown profile was not reported clearly:\n${refused}`);
   }
   if (existsSync(installedSkill)) throw new Error('A refused install still wrote files.');
 
@@ -165,22 +165,22 @@ try {
 
   const acceptanceHome = join(temporary, 'acceptance', '.synomem');
   const acceptanceEnv = { ...process.env, SYNOMEM_HOME: acceptanceHome };
-  run(synomemBin, ['init'], consumer, acceptanceEnv);
   run(
     synomemBin,
-    ['agent', 'create', 'gracie', '--name', 'Gracie P. Tienammè'],
+    ['setup', '--backend', 'local', '--agent', 'gracie', '--name', 'Gracie P. Tienammè'],
     consumer,
     acceptanceEnv,
   );
-  run(synomemBin, ['agent', 'create', 'codex', '--name', 'Codex'], consumer, acceptanceEnv);
+  run(
+    synomemBin,
+    ['agent', 'create', 'codex', '--name', 'Codex', '--create-profile'],
+    consumer,
+    acceptanceEnv,
+  );
   const giveArgs = [
     'kudos',
     'give',
     'codex',
-    '--from',
-    'gracie',
-    '--actor-kind',
-    'agent',
     '--title',
     'Caught a continuity contradiction',
     '--reason',
@@ -200,7 +200,9 @@ try {
   const given = JSON.parse(run(synomemBin, giveArgs, consumer, acceptanceEnv));
   const kudosId = given.record?.event?.id;
   if (!kudosId || given.deduplicated) throw new Error('Acceptance kudos was not created.');
-  if (!run(synomemBin, ['inbox', 'codex'], consumer, acceptanceEnv).includes(kudosId)) {
+  if (
+    !run(synomemBin, ['--profile', 'codex', 'inbox'], consumer, acceptanceEnv).includes(kudosId)
+  ) {
     throw new Error('Acceptance inbox did not contain the new kudos.');
   }
   if (
@@ -210,12 +212,7 @@ try {
   ) {
     throw new Error('Acceptance WINS.md did not contain the new kudos.');
   }
-  run(
-    synomemBin,
-    ['kudos', 'acknowledge', kudosId, '--as', 'codex', '--actor-kind', 'agent'],
-    consumer,
-    acceptanceEnv,
-  );
+  run(synomemBin, ['--profile', 'codex', 'kudos', 'acknowledge', kudosId], consumer, acceptanceEnv);
   run(synomemBin, ['kudos', 'show', kudosId, '--json'], consumer, acceptanceEnv);
   run(synomemBin, ['kudos', 'stats', '--json'], consumer, acceptanceEnv);
 
@@ -226,8 +223,6 @@ try {
         'memo',
         'send',
         'codex',
-        '--from',
-        'gracie',
         '--subject',
         'Review decision',
         '--body',
@@ -243,10 +238,10 @@ try {
     run(
       synomemBin,
       [
+        // As the default profile (gracie): notes are owner-private, and the
+        // unified list below runs as gracie.
         'note',
         'create',
-        '--as',
-        'codex',
         '--title',
         'Local convention',
         '--body',
@@ -265,8 +260,6 @@ try {
         'task',
         'create',
         'codex',
-        '--from',
-        'gracie',
         '--title',
         'Review package acceptance',
         '--due-date',
@@ -280,7 +273,7 @@ try {
   const taskId = task.record?.event?.id;
   if (!taskId || task.record?.status !== 'assigned')
     throw new Error('Assigned task was not created.');
-  run(synomemBin, ['task', 'accept', taskId, '--as', 'codex'], consumer, acceptanceEnv);
+  run(synomemBin, ['--profile', 'codex', 'task', 'accept', taskId], consumer, acceptanceEnv);
   const unified = JSON.parse(
     run(synomemBin, ['list', '--limit', '20', '--json'], consumer, acceptanceEnv),
   );

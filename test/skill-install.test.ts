@@ -166,7 +166,7 @@ describe('skill installation', () => {
       source,
       apply: true,
       link: true,
-      agentId: 'mycroft',
+      profile: 'mycroft',
       runtimes: ['codex', 'claude'],
     });
 
@@ -175,10 +175,10 @@ describe('skill installation', () => {
     expect(result.mcpCommands).toHaveLength(2);
     expect(result.mcpCommands[0]).toContain('codex mcp add synomem');
     expect(result.mcpCommands[1]).toContain('claude mcp add --scope user synomem');
-    // Only the canonical ID is registered: the display name is read from the
-    // agent's profile at startup, so a harness cannot sign another name.
-    expect(result.mcpCommands[0]).toContain("'--agent-id' 'mycroft'");
-    expect(result.mcpCommands[0]).not.toContain('--actor-name');
+    // Only a profile name is registered: the profile decides the identity, so
+    // a harness cannot name another agent on its own command line.
+    expect(result.mcpCommands[0]).toContain("'mcp' '--profile' 'mycroft'");
+    expect(result.mcpCommands[0]).not.toContain('--agent-id');
 
     uninstallSkill({ userHome, source, runtimes: ['codex', 'claude'], apply: true });
     expect(existsSync(join(userHome, '.codex', 'skills', 'synomem'))).toBe(false);
@@ -203,7 +203,7 @@ describe('skill installation', () => {
         GROK_HOME: grokHome,
       },
       runtimes: ['hermes', 'openclaw', 'cursor', 'grok'],
-      agentId: 'mycroft',
+      profile: 'mycroft',
       apply: true,
     });
 
@@ -228,6 +228,6 @@ describe('skill installation', () => {
     expect(result.mcpCommands.join('\n')).toContain('openclaw mcp add synomem');
     expect(result.mcpCommands.join('\n')).toContain('grok mcp add synomem');
     expect(result.mcpCommands.join('\n')).not.toContain('SYNOMEM_ACTOR_ID=');
-    expect(result.mcpCommands.join('\n')).toContain("'--agent-id' 'mycroft'");
+    expect(result.mcpCommands.join('\n')).toContain("'--profile' 'mycroft'");
   });
 });

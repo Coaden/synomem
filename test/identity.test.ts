@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { runCli } from '../src/cli.js';
 import { tempHome, testClient } from './helpers.js';
 
 describe('agent identity and discovery', () => {
@@ -118,10 +119,28 @@ describe('agent-bound MCP registration', () => {
     const client = await testClient(home);
     await client.agents.create({ handle: 'mycroft', displayName: 'Mycroft', aliases: ['mike'] });
     await client.close();
+    // The identity comes from a profile; the alias is resolved once, here.
+    const created = await runCli(
+      [
+        'node',
+        'synomem',
+        '--home',
+        home,
+        'profile',
+        'create',
+        'mike',
+        '--local',
+        '--agent',
+        'mike',
+      ],
+      { stdout: () => undefined, stderr: () => undefined },
+      { env: {}, cwd: home },
+    );
+    expect(created).toBe(0);
 
     const server = spawn(
       process.execPath,
-      [join(process.cwd(), 'dist', 'mcp-server.js'), '--home', home, '--agent-id', 'mike'],
+      [join(process.cwd(), 'dist', 'mcp-server.js'), '--home', home, '--profile', 'mike'],
       { stdio: ['pipe', 'pipe', 'pipe'] },
     );
     const stdout = await new Promise<string>((resolveOutput, rejectOutput) => {
@@ -164,7 +183,7 @@ describe('agent-bound MCP registration', () => {
     await verifier.close();
   });
 
-  it('refuses to start against an agent that does not exist', async () => {
+  it('refuses to start for a profile that does not exist', async () => {
     const home = tempHome();
     const client = await testClient(home);
     await client.close();
@@ -172,7 +191,7 @@ describe('agent-bound MCP registration', () => {
     const exit = await new Promise<{ code: number | null; stderr: string }>((resolveExit) => {
       const server = spawn(
         process.execPath,
-        [join(process.cwd(), 'dist', 'mcp-server.js'), '--home', home, '--agent-id', 'ghost'],
+        [join(process.cwd(), 'dist', 'mcp-server.js'), '--home', home, '--profile', 'ghost'],
         { stdio: ['ignore', 'ignore', 'pipe'] },
       );
       let stderr = '';
@@ -182,7 +201,7 @@ describe('agent-bound MCP registration', () => {
       server.on('close', (code) => resolveExit({ code, stderr }));
     });
     expect(exit.code).not.toBe(0);
-    expect(exit.stderr).toContain('Unknown agent');
+    expect(exit.stderr).toContain('Unknown profile "ghost"');
   });
 });
 

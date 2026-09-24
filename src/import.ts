@@ -169,6 +169,8 @@ export async function createLocalImportBundle(fromHome: string): Promise<ImportB
 export interface RemoteImportClientOptions {
   baseUrl: string;
   workspaceId: string;
+  /** The selected context; sent as Synomem-Context-Id (identity contract §3). */
+  contextId?: string;
   credentialProvider: SynomemCredentialProvider;
   fetch?: typeof fetch;
 }
@@ -176,6 +178,7 @@ export interface RemoteImportClientOptions {
 export class RemoteImportClient {
   private readonly baseUrl: URL;
   private readonly workspaceId: string;
+  private readonly contextId: string | undefined;
   private readonly credentialProvider: SynomemCredentialProvider;
   private readonly fetchImplementation: typeof fetch;
 
@@ -195,6 +198,7 @@ export class RemoteImportClient {
       throw new SynomemError('CONFIG_INVALID', 'Remote import baseUrl must be an origin.');
     }
     this.workspaceId = options.workspaceId;
+    this.contextId = options.contextId;
     this.credentialProvider = options.credentialProvider;
     this.fetchImplementation = options.fetch ?? fetch;
   }
@@ -224,6 +228,7 @@ export class RemoteImportClient {
           accept: 'application/json',
           authorization: `Bearer ${token}`,
           'content-type': 'application/json',
+          ...(this.contextId ? { 'synomem-context-id': this.contextId } : {}),
         },
         body: JSON.stringify(payload),
       });

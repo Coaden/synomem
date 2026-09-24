@@ -1,13 +1,17 @@
-import { describe, expect, it, vi } from 'vitest';
-import { existsSync, rmSync } from 'node:fs';
+import { Readable, Writable } from 'node:stream';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { SynomemClient } from '../src/client.js';
-import { runCli, type CliIo } from '../src/cli.js';
-import type { SynomemServiceFactory } from '../src/service.js';
+import { describe, expect, it } from 'vitest';
+import { runCli, type CliDependencies, type CliIo } from '../src/cli.js';
+import { FileCredentialStore, type CredentialStores } from '../src/credentials.js';
+import { ProfileStore, type ProfilesConfig } from '../src/profiles.js';
+import type { PromptIo } from '../src/prompt.js';
+import type { ContextResolver } from '../src/resolvers.js';
+import type { ContextSummary } from '../src/types.js';
 import { tempHome } from './helpers.js';
-import type { CredentialStore, StoredCredential } from '../src/credentials.js';
-import type { OAuthLoginOptions } from '../src/oauth.js';
-import { createLocalImportBundle } from '../src/import.js';
+
+const urlOf = (input: string | URL | Request): string =>
+  typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
 
 function capture(): { io: CliIo; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];
@@ -19,824 +23,586 @@ function capture(): { io: CliIo; stdout: string[]; stderr: string[] } {
   };
 }
 
-describe('CLI', () => {
-  it('creates its domain service through the injected factory', async () => {
-    const home = tempHome();
-    const actors: string[] = [];
-    const factory: SynomemServiceFactory = (options) => {
-      actors.push(`${options.actor?.kind}:${options.actor?.id}`);
-      return new SynomemClient(options);
-    };
+function piped(input = ''): PromptIo {
+  return {
+    input: Readable.from([input]),
+    output: new Writable({ write: (_chunk, _encoding, done) => done() }),
+    interactive: false,
+  };
+}
+
+function fileStores(home: string): CredentialStores {
+  // The keychain is replaced by a second file store so no test touches the
+  // real operating-system credential store.
+  return {
+    keychain: new FileCredentialStore(join(home, 'fake-keychain')),
+    file: new FileCredentialStore(home),
+  };
+}
+
+function harness(home: string, extra: CliDependencies = {}) {
+  const cwd = tempHome();
+  const run = async (args: string[], deps: CliDependencies = {}) => {
     const captured = capture();
-
-    expect(await runCli(['node', 'synomem', '--home', home, 'init'], captured.io, factory)).toBe(0);
-    expect(actors).toEqual(['system:cli']);
-  });
-
-  it('wires the global --actor flag into read commands, and marks the fallback unasserted otherwise', async () => {
-    // `memo show` (and the other list/show commands added in this fix) used
-    // to call defaultActor() without the parsed --actor value at all, so the
-    // flag documented as "act as this agent" silently did nothing for them.
-    // It also always fell back to a fixed human:local-cli guess with no way
-    // to tell a remote backend that guess wasn't a real identity -- which is
-    // exactly what made every one of these commands fail against a remote
-    // backend with AUTH_FORBIDDEN unless --actor/SYNOMEM_ACTOR_ID happened to
-    // already be set.
-    const home = tempHome();
-    const seen: Array<{ actor: string; assertActor?: boolean }> = [];
-    const factory: SynomemServiceFactory = (options) => {
-      seen.push({
-        actor: `${options.actor?.kind}:${options.actor?.id}`,
-        assertActor: options.assertActor,
-      });
-      return new SynomemClient(options);
-    };
-    const run = async (args: string[]) => {
-      const captured = capture();
-      const code = await runCli(['node', 'synomem', '--home', home, ...args], captured.io, factory);
-      expect(code, captured.stderr.join('')).toBe(0);
-      return captured.stdout.join('');
-    };
-
-    await run(['agent', 'create', 'codex', '--name', 'Codex']);
-    await run(['agent', 'create', 'gracie', '--name', 'Gracie']);
-    const sent = JSON.parse(
-      await run([
-        'memo',
-        'send',
-        'codex',
-        '--from',
-        'gracie',
-        '--subject',
-        'Review',
-        '--body',
-        'Please review the migration.',
-        '--json',
-      ]),
-    ) as { record: { event: { id: string } } };
-    const memoId = sent.record.event.id;
-    seen.length = 0;
-
-    // No --actor named anywhere: the fallback is a guess, not a real
-    // identity, so it must be marked unasserted (a remote backend adopts
-    // whichever actor the credential actually names instead of failing).
-    await run(['memo', 'show', memoId]);
-    expect(seen.pop()).toEqual({ actor: 'human:local-cli', assertActor: false });
-
-    // --actor is explicit: it must reach the command (previously it never
-    // did), and the resulting actor must be asserted for real.
-    await run(['memo', 'show', memoId, '--actor', 'gracie']);
-    expect(seen.pop()).toEqual({ actor: 'agent:gracie', assertActor: true });
-  });
-
-  it('provides useful help', async () => {
-    const captured = capture();
-    expect(await runCli(['node', 'synomem', '--help'], captured.io)).toBe(0);
-    expect(captured.stdout.join('')).toContain('Local-first communication');
-    expect(captured.stdout.join('')).toContain('memo');
-    expect(captured.stdout.join('')).toContain('skill');
-  });
-
-  it('selects and reports a remote backend without creating SQLite', async () => {
-    const home = tempHome();
-    let captured = capture();
-    expect(
-      await runCli(
-        [
-          'node',
-          'synomem',
-          '--home',
-          home,
-          'backend',
-          'use',
-          'remote',
-          '--url',
-          'https://api.synomem.example',
-          '--workspace',
-          'workspace-1',
-        ],
-        captured.io,
-      ),
-    ).toBe(0);
-    expect(captured.stdout.join('')).toContain('Selected remote');
-
-    captured = capture();
-    expect(
-      await runCli(['node', 'synomem', '--home', home, 'backend', 'show', '--json'], captured.io),
-    ).toBe(0);
-    expect(JSON.parse(captured.stdout.join(''))).toMatchObject({
-      backend: { kind: 'remote', workspaceId: 'workspace-1' },
-      initialized: true,
-    });
-    expect(existsSync(join(home, 'synomem', 'synomem.sqlite3'))).toBe(false);
-
-    captured = capture();
-    expect(await runCli(['node', 'synomem', '--home', home, 'init'], captured.io)).toBe(2);
-    expect(captured.stderr.join('')).toContain('requires a local backend');
-    expect(existsSync(join(home, 'synomem', 'synomem.sqlite3'))).toBe(false);
-  });
-
-  it('previews an explicit remote import as a bound human administrator', async () => {
-    const sourceHome = tempHome();
-    const source = new SynomemClient({ home: sourceHome });
-    await source.init();
-    await source.agents.create({ handle: 'codex', displayName: 'Codex' });
-    await source.close();
-    const targetHome = tempHome();
-    let captured = capture();
-    expect(
-      await runCli(
-        [
-          'node',
-          'synomem',
-          '--home',
-          targetHome,
-          'backend',
-          'use',
-          'remote',
-          '--url',
-          'https://api.synomem.example',
-          '--workspace',
-          'target',
-        ],
-        captured.io,
-      ),
-    ).toBe(0);
-    const remoteImport = vi.fn(async (input: { bundle: { checksum: string } }) => ({
-      planId: 'signed-plan',
-      expiresAt: '2026-09-02T22:00:00.000Z',
-      sourceWorkspaceId: 'source',
-      targetWorkspaceId: 'target',
-      checksum: input.bundle.checksum,
-      events: 1,
-      profiles: 1,
-      bytes: 100,
-    }));
-    captured = capture();
-    expect(
-      await runCli(
-        [
-          'node',
-          'synomem',
-          '--home',
-          targetHome,
-          'remote',
-          'import',
-          '--from-home',
-          sourceHome,
-          '--actor-id',
-          'troy',
-          '--preview',
-        ],
-        captured.io,
-        undefined,
-        { createImportBundle: createLocalImportBundle, remoteImport },
-      ),
-    ).toBe(0);
-    expect(captured.stdout.join('')).toContain('Nothing was imported');
-    expect(remoteImport).toHaveBeenCalledWith(
-      expect.objectContaining({ actor: { kind: 'human', id: 'troy' }, workspaceId: 'target' }),
-    );
-  });
-
-  it('reports environment authentication without exposing the token', async () => {
-    const previous = process.env.SYNOMEM_ACCESS_TOKEN;
-    process.env.SYNOMEM_ACCESS_TOKEN = 'do-not-print-this';
-    try {
-      const captured = capture();
-      expect(await runCli(['node', 'synomem', 'auth', 'status', '--json'], captured.io)).toBe(0);
-      expect(captured.stdout.join('')).not.toContain('do-not-print-this');
-      expect(JSON.parse(captured.stdout.join(''))).toMatchObject({
-        authenticated: true,
-        source: 'environment',
-      });
-    } finally {
-      if (previous === undefined) delete process.env.SYNOMEM_ACCESS_TOKEN;
-      else process.env.SYNOMEM_ACCESS_TOKEN = previous;
-    }
-  });
-
-  it('logs in, reports, and removes an OS-stored actor credential without printing it', async () => {
-    const home = tempHome();
-    const values = new Map<string, StoredCredential>();
-    const store: CredentialStore = {
-      async get(reference) {
-        return values.get(reference);
-      },
-      async set(reference, credential) {
-        values.set(reference, credential);
-      },
-      async delete(reference) {
-        return values.delete(reference);
-      },
-    };
-    const oauthLogin = vi.fn(async (options: OAuthLoginOptions) => {
-      await options.credentialStore.set(options.credentialReference, {
-        accessToken: 'stored-secret-token',
-        tokenEndpoint: 'https://identity.example.test/token',
-        clientId: options.clientId,
-        resource: 'https://api.example.test/mcp',
-        scope: 'synomem:read synomem:write',
-      });
-    });
-    const dependencies = {
-      credentialStore: store,
-      oauthLogin,
+    const code = await runCli(['node', 'synomem', '--home', home, ...args], captured.io, {
       env: {},
-      verifyRemoteCredential: vi.fn(async () => undefined),
-    };
-    let captured = capture();
-    expect(
-      await runCli(
-        [
-          'node',
-          'synomem',
-          '--home',
-          home,
-          'backend',
-          'use',
-          'remote',
-          '--url',
-          'https://api.example.test',
-          '--workspace',
-          'workspace-a',
-        ],
-        captured.io,
-        undefined,
-        dependencies,
-      ),
-    ).toBe(0);
-    captured = capture();
-    expect(
-      await runCli(
-        [
-          'node',
-          'synomem',
-          '--home',
-          home,
-          'auth',
-          'login',
-          '--actor-id',
-          'codex',
-          '--client-id',
-          'public-client',
-          '--json',
-        ],
-        captured.io,
-        undefined,
-        dependencies,
-      ),
-    ).toBe(0);
-    expect(captured.stdout.join('')).not.toContain('stored-secret-token');
-    expect(oauthLogin).toHaveBeenCalledOnce();
-    captured = capture();
-    expect(
-      await runCli(
-        ['node', 'synomem', '--home', home, 'auth', 'status', '--actor-id', 'codex', '--json'],
-        captured.io,
-        undefined,
-        dependencies,
-      ),
-    ).toBe(0);
-    expect(JSON.parse(captured.stdout.join(''))).toMatchObject({
-      authenticated: true,
-      source: 'os-credential-store',
+      cwd,
+      promptIo: piped(),
+      credentialStores: fileStores,
+      ...extra,
+      ...deps,
     });
-    captured = capture();
-    expect(
-      await runCli(
-        ['node', 'synomem', '--home', home, 'auth', 'logout', '--actor-id', 'codex', '--json'],
-        captured.io,
-        undefined,
-        dependencies,
-      ),
-    ).toBe(0);
-    expect(JSON.parse(captured.stdout.join(''))).toMatchObject({
-      authenticated: false,
-      removed: true,
-    });
+    return { code, stdout: captured.stdout.join(''), stderr: captured.stderr.join('') };
+  };
+  const ok = async (args: string[], deps: CliDependencies = {}) => {
+    const result = await run(args, deps);
+    expect(result.code, result.stderr).toBe(0);
+    return result.stdout;
+  };
+  const okJson = async <T>(args: string[], deps: CliDependencies = {}) =>
+    JSON.parse(await ok([...args, '--json'], deps)) as T;
+  return { run, ok, okJson, cwd };
+}
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
   });
+}
 
-  it('rejects unsupported skill runtimes', async () => {
-    const captured = capture();
-    expect(
-      await runCli(
-        ['node', 'synomem', 'skill', 'install', '--runtime', 'unverified-runtime'],
-        captured.io,
-      ),
-    ).toBe(2);
-    expect(captured.stderr.join('')).toContain('Unsupported skill runtime');
-  });
+const contexts: ContextSummary[] = [
+  {
+    contextId: 'ctx_gracie_eng',
+    organizationId: 'org_1',
+    workspaceId: 'ws_eng',
+    workspaceName: 'Engineering',
+    actor: { kind: 'agent', id: 'agt_gracie', displayName: 'Gracie', handle: 'gracie' },
+    actions: ['synomem:read', 'synomem:write'],
+    source: 'target',
+  },
+  {
+    contextId: 'ctx_gracie_personal',
+    organizationId: 'org_1',
+    workspaceId: 'ws_personal',
+    workspaceName: 'Personal',
+    actor: { kind: 'agent', id: 'agt_gracie', displayName: 'Gracie', handle: 'gracie' },
+    actions: ['synomem:read', 'synomem:write'],
+    source: 'rule',
+  },
+  {
+    contextId: 'ctx_astra_eng',
+    organizationId: 'org_1',
+    workspaceId: 'ws_eng',
+    workspaceName: 'Engineering',
+    actor: { kind: 'agent', id: 'agt_astra', displayName: 'Astra', handle: 'astra' },
+    actions: ['synomem:read'],
+    source: 'target',
+  },
+];
 
-  it('accepts grokbot as the local Grok runtime alias', async () => {
-    const captured = capture();
-    expect(
-      await runCli(
-        ['node', 'synomem', 'skill', 'status', '--runtime', 'grokbot', '--json'],
-        captured.io,
-      ),
-    ).toBe(0);
-    const result = JSON.parse(captured.stdout.join('')) as {
-      locations: Array<{ runtime: string }>;
-    };
-    expect(result.locations).toMatchObject([{ runtime: 'grok' }]);
-  });
-
-  it('emits human and JSON output and stable exit codes', async () => {
-    const home = tempHome();
-    let captured = capture();
-    expect(await runCli(['node', 'synomem', '--home', home, 'init'], captured.io)).toBe(0);
-    expect(captured.stdout.join('')).toContain('Initialized Synomem');
-
-    captured = capture();
-    expect(
-      await runCli(
-        [
-          'node',
-          'synomem',
-          '--home',
-          home,
-          'agent',
-          'create',
-          'codex',
-          '--name',
-          'Codex',
-          '--json',
-        ],
-        captured.io,
-      ),
-    ).toBe(0);
-    expect(JSON.parse(captured.stdout.join(''))).toMatchObject({
-      handle: 'codex',
-      displayName: 'Codex',
-    });
-
-    captured = capture();
-    expect(
-      await runCli(
-        [
-          'node',
-          'synomem',
-          '--home',
-          home,
-          'kudos',
-          'give',
-          'missing',
-          '--from',
-          'troy',
-          '--actor-kind',
-          'human',
-          '--title',
-          'No recipient',
-          '--reason',
-          'This identity does not exist.',
-          '--json',
-        ],
-        captured.io,
-      ),
-    ).toBe(3);
-    expect(JSON.parse(captured.stderr.join(''))).toMatchObject({
-      error: { code: 'AGENT_NOT_FOUND' },
-    });
-  });
-
-  it('does not leak a prior process exit code into a successful invocation', async () => {
-    const prior = process.exitCode;
-    process.exitCode = 5;
-    try {
-      const captured = capture();
-      expect(await runCli(['node', 'synomem', '--help'], captured.io)).toBe(0);
-    } finally {
-      process.exitCode = prior;
+/** A fake hosted API answering only the credential-level discovery routes. */
+function fakeApi(expectedBearer: string) {
+  const seen: string[] = [];
+  const fetchImplementation = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(urlOf(input));
+    const headers = new Headers(init?.headers);
+    seen.push(`${url.pathname} ${headers.get('authorization')}`);
+    if (headers.get('authorization') !== `Bearer ${expectedBearer}`) {
+      return json({ ok: false, error: { code: 'AUTH_REQUIRED', message: 'bad token' } }, 401);
     }
-  });
+    if (url.pathname === '/v1/identity') {
+      return json({
+        ok: true,
+        data: {
+          account: { id: 'acct_troy' },
+          organizationId: 'org_1',
+          connection: { id: 'con_1', label: 'Codex / Troy Mac', kind: 'access_key' },
+          grant: {
+            id: 'grt_1',
+            version: 1,
+            mode: 'explicit',
+            actions: ['synomem:read', 'synomem:write'],
+          },
+          fixedContextId: null,
+          effectiveContext: null,
+        },
+      });
+    }
+    if (url.pathname === '/v1/contexts') {
+      return json({
+        ok: true,
+        data: { mode: 'explicit', fixedContextId: null, contexts, nextCursor: null },
+      });
+    }
+    return json({ ok: false, error: { code: 'REMOTE_PROTOCOL', message: 'unexpected' } }, 404);
+  }) as typeof fetch;
+  return { fetch: fetchImplementation, seen };
+}
 
-  it('keeps doctor failure status local to that invocation', async () => {
+describe('CLI: local setup and profiles', () => {
+  it('sets up the first agent with a same-named default profile, idempotently', async () => {
     const home = tempHome();
-    const client = new SynomemClient({ home, actor: { kind: 'human', id: 'troy' } });
-    await client.init();
-    await client.agents.create({ handle: 'codex', displayName: 'Codex' });
-    client.storage
-      .db()
-      .prepare(
-        `INSERT INTO events(id, schema_version, type, created_at, actor_kind, actor_id, payload, sequence)
-         VALUES (?, 1, 'future', ?, 'system', 'future', ?,
-           (SELECT COALESCE(MAX(sequence), 0) + 1 FROM events))`,
-      )
-      .run(
-        '01ARZ3NDEKTSV4RRFFQ69G5FAB',
-        new Date().toISOString(),
-        JSON.stringify({ schemaVersion: 1, type: 'future' }),
-      );
-    await client.close();
+    const { okJson, ok } = harness(home);
+    const first = await okJson<{
+      applied: boolean;
+      profile: string;
+      agentId: string;
+      contextId: string;
+      default: boolean;
+    }>(['setup', '--backend', 'local', '--agent', 'gracie', '--name', 'Gracie']);
+    expect(first).toMatchObject({ applied: true, profile: 'gracie', default: true });
+    expect(first.contextId).toMatch(/^lctx_[0-9a-f]{24}$/);
 
-    let captured = capture();
-    expect(await runCli(['node', 'synomem', '--home', home, 'doctor'], captured.io)).toBe(5);
-    captured = capture();
-    expect(await runCli(['node', 'synomem', '--home', home, 'agent', 'list'], captured.io)).toBe(0);
-    expect(captured.stdout.join('')).toContain('codex');
-  });
-
-  it('returns a useful error when WINS.md generation is disabled', async () => {
-    const home = tempHome();
-    const client = new SynomemClient({
-      home,
-      actor: { kind: 'human', id: 'troy' },
-      config: { projection: { writeWinsMarkdown: false } },
-    });
-    await client.init();
-    await client.agents.create({ handle: 'codex', displayName: 'Codex' });
-    await client.close();
-
-    const captured = capture();
-    expect(
-      await runCli(
-        ['node', 'synomem', '--home', home, 'kudos', 'wins', 'codex', '--print'],
-        captured.io,
-      ),
-    ).toBe(2);
-    expect(captured.stderr.join('')).toContain('Enable projection.writeWinsMarkdown');
-    expect(captured.stderr.join('')).not.toContain(`${home}/codex/WINS.md`);
-  });
-
-  /*
-   * The three status commands, which exist to answer "is this actually
-   * working?" -- so each one has to reach the thing it reports on rather than
-   * reprinting configuration back at the caller.
-   */
-  it('reports backend, projection, and runtime status from live state', async () => {
-    const home = tempHome();
-    const client = new SynomemClient({ home, actor: { kind: 'human', id: 'troy' } });
-    await client.init();
-    const codex = await client.agents.create({ handle: 'codex', displayName: 'Codex' });
-    await client.agents.bindRuntime({ agentId: codex.id, runtime: 'claude-code' });
-    await client.close();
-
-    const invoke = async (args: string[]) => {
-      const captured = capture();
-      const code = await runCli(['node', 'synomem', '--home', home, ...args], captured.io);
-      return { code, stdout: captured.stdout.join(''), stderr: captured.stderr.join('') };
-    };
-
-    const backend = await invoke(['backend', 'status', '--json']);
-    expect(backend.code).toBe(0);
-    expect(JSON.parse(backend.stdout)).toMatchObject({
-      reachable: true,
-      info: { backend: 'local', home },
-      capabilities: { backend: 'local' },
-    });
-
-    // A rebuild just ran as part of every write above, so nothing is stale.
-    const projection = await invoke(['projection', 'status', '--json']);
-    expect(projection.code).toBe(0);
-    expect(JSON.parse(projection.stdout)).toMatchObject({
-      directory: home,
-      current: true,
-      counts: { missing: 0, unexpected: 0 },
-    });
-    expect((JSON.parse(projection.stdout) as { lastRebuiltAt?: string }).lastRebuiltAt).toBeTypeOf(
-      'string',
-    );
-
-    // Deleting a generated file is drift, and naming it is the whole point.
-    rmSync(join(home, 'codex', 'WINS.md'));
-    const stale = await invoke(['projection', 'status', '--json']);
-    expect(JSON.parse(stale.stdout)).toMatchObject({
-      current: false,
-      counts: { missing: 1 },
-      missing: ['codex/WINS.md'],
-    });
-    expect((await invoke(['projection', 'status'])).stdout).toContain('synomem rebuild');
-
-    // Without an agent named, every agent that runs anywhere.
-    const runtimes = await invoke(['agent', 'runtime', 'list', '--json']);
-    expect(runtimes.code).toBe(0);
-    const listed = JSON.parse(runtimes.stdout) as { agents: unknown[] };
-    expect(listed.agents).toMatchObject([
-      { profile: { handle: 'codex', id: codex.id }, runtimeBindings: [{ runtime: 'claude-code' }] },
+    const again = await okJson<{ applied: boolean; agentId: string }>([
+      'setup',
+      '--backend',
+      'local',
+      '--agent',
+      'gracie',
+      '--name',
+      'Gracie',
     ]);
-    expect((await invoke(['agent', 'runtime', 'list'])).stdout).toContain('codex');
+    expect(again).toMatchObject({ applied: false, agentId: first.agentId });
+    const agents = await okJson<{ agents: unknown[] }>(['agent', 'list']);
+    expect(agents.agents).toHaveLength(1);
+    expect(await ok(['whoami'])).toContain('Gracie');
   });
 
-  /*
-   * The isolation claim, exercised rather than asserted.
-   *
-   * Two workspaces on one machine, each with an agent of the SAME handle, must
-   * see only their own records. This is the property that makes a workspace
-   * per repository or per topic worth having, and locally it comes from the
-   * databases being separate files rather than from a filtered column.
-   */
-  it('keeps local workspaces isolated, including agents of the same name', async () => {
-    const root = tempHome();
-    const invoke = async (args: string[]) => {
-      const captured = capture();
-      const code = await runCli(['node', 'synomem', '--home', root, ...args], captured.io);
-      return { code, out: captured.stdout.join(''), err: captured.stderr.join('') };
+  it('resumes after a profile-write failure without creating a second agent', async () => {
+    const home = tempHome();
+    let failNext = true;
+    const flaky = (profileHome: string) => {
+      const store = new ProfileStore(profileHome);
+      const write = store.write.bind(store);
+      store.write = (config: ProfilesConfig) => {
+        if (failNext) {
+          failNext = false;
+          throw new Error('disk full');
+        }
+        write(config);
+      };
+      return store;
     };
+    const { run, okJson } = harness(home, { profileStore: flaky });
+    const failed = await run(['setup', '--agent', 'gracie', '--name', 'Gracie']);
+    expect(failed.code).not.toBe(0);
+    const resumed = await okJson<{ resumed: boolean; profile: string }>([
+      'setup',
+      '--agent',
+      'gracie',
+      '--name',
+      'Gracie',
+    ]);
+    expect(resumed).toMatchObject({ resumed: true, profile: 'gracie' });
+    expect((await okJson<{ agents: unknown[] }>(['agent', 'list'])).agents).toHaveLength(1);
+  });
 
-    expect((await invoke(['config', 'init', '--backend', 'local', '--yes'])).code).toBe(0);
-    expect((await invoke(['workspace', 'create', 'lumina'])).code).toBe(0);
+  it('refuses to rebind an existing profile to something else', async () => {
+    const home = tempHome();
+    const { ok, run } = harness(home);
+    await ok(['setup', '--agent', 'gracie', '--name', 'Gracie']);
+    const clash = await run([
+      'setup',
+      '--agent',
+      'astra',
+      '--name',
+      'Astra',
+      '--profile-name',
+      'gracie',
+    ]);
+    expect(clash.code).toBe(2);
+    expect(clash.stderr).toContain('will not overwrite');
+  });
 
-    // The same handle in both, which a shared database would have refused.
-    expect((await invoke(['agent', 'create', 'claude', '--name', 'Claude'])).code).toBe(0);
-    expect(
-      (await invoke(['--workspace', 'lumina', 'agent', 'create', 'claude', '--name', 'Claude']))
-        .code,
-    ).toBe(0);
+  it('acts as the profile for every domain command — no per-command actor', async () => {
+    const home = tempHome();
+    const { ok, okJson } = harness(home);
+    await ok(['setup', '--agent', 'gracie', '--name', 'Gracie']);
+    // A second local agent, created independently, gets no profile or default…
+    const codex = await okJson<{ id: string; profileCreated?: string }>([
+      'agent',
+      'create',
+      'codex',
+      '--name',
+      'Codex',
+    ]);
+    expect(codex.profileCreated).toBeUndefined();
+    // …until one is asked for explicitly.
+    await ok(['profile', 'create', 'codex', '--local', '--agent', 'codex']);
 
-    await invoke(['--actor', 'claude', 'note', 'create', '--title', 'Root note', '--body', 'Here']);
-    await invoke([
-      '--workspace',
-      'lumina',
-      '--actor',
-      'claude',
+    const note = await okJson<{ record: { event: { actor: { kind: string; id: string } } } }>([
       'note',
       'create',
       '--title',
-      'Lumina note',
+      'Deploy',
       '--body',
-      'There',
+      'rsync, then build',
     ]);
+    expect(note.record.event.actor.kind).toBe('agent');
 
-    const root_notes = await invoke(['note', 'list']);
-    expect(root_notes.out).toContain('Root note');
-    expect(root_notes.out).not.toContain('Lumina note');
+    const memo = await okJson<{ record: { event: { id: string; actor: { id: string } } } }>([
+      'memo',
+      'send',
+      'codex',
+      '--subject',
+      'Review',
+      '--body',
+      'Please review.',
+    ]);
+    const inbox = await okJson<{ items: Array<{ id: string }> }>(['--profile', 'codex', 'inbox']);
+    expect(inbox.items.map((item) => item.id)).toContain(memo.record.event.id);
+    const read = await okJson<{ status: string }>([
+      '--profile',
+      'codex',
+      'memo',
+      'read',
+      memo.record.event.id,
+    ]);
+    expect(read.status).toBe('read');
 
-    const lumina_notes = await invoke(['--workspace', 'lumina', 'note', 'list']);
-    expect(lumina_notes.out).toContain('Lumina note');
-    expect(lumina_notes.out).not.toContain('Root note');
-
-    // Both are listed, and the default is the root itself so nothing moved.
-    const listed = await invoke(['workspace', 'list', '--json']);
-    expect(
-      JSON.parse(listed.out) as { workspaces: Array<{ name: string; home: string }> },
-    ).toMatchObject({
-      workspaces: [
-        { name: 'default', home: root, initialized: true },
-        { name: 'lumina', initialized: true },
-      ],
-    });
+    const whoami = await okJson<{ effectiveContext: { actor: { id: string }; contextId: string } }>(
+      ['--profile', 'codex', 'whoami'],
+    );
+    expect(whoami.effectiveContext.actor.id).toBe(codex.id);
   });
 
-  it('exercises the complete local administration and recognition workflow', async () => {
+  it('creates a profile together with a local agent only when asked', async () => {
     const home = tempHome();
-    const invoke = async (args: string[]) => {
-      const captured = capture();
-      const code = await runCli(['node', 'synomem', '--home', home, ...args], captured.io);
-      expect(code, captured.stderr.join('')).toBe(0);
-      return captured.stdout.join('');
-    };
-
-    await invoke(['init']);
-    await invoke(['agent', 'create', 'codex', '--name', 'Codex', '--alias', 'reviewer']);
-    await invoke(['agent', 'create', 'gracie', '--name', 'Gracie']);
-    expect(await invoke(['agent', 'list'])).toContain('codex');
-    expect(await invoke(['agent', 'show', 'reviewer'])).toContain('Codex');
-    await invoke(['agent', 'update', 'codex', '--description', 'Careful reviewer']);
-
-    const given = JSON.parse(
-      await invoke([
-        'kudos',
-        'give',
-        'codex',
-        '--from',
-        'gracie',
-        '--actor-kind',
-        'agent',
-        '--title',
-        'Complete review',
-        '--reason',
-        'Found and explained a release-blocking problem.',
-        '--tag',
-        'review',
-        '--evidence',
-        'task:review-1',
-        '--idempotency-key',
-        'cli-flow-1',
-        '--json',
-      ]),
-    ) as { record: { event: { id: string } } };
-    const id = given.record.event.id;
-    expect(await invoke(['inbox', 'codex'])).toContain(id);
-    expect(await invoke(['list', '--tag', 'review'])).toContain(id);
-    const compact = JSON.parse(await invoke(['list', '--tag', 'review', '--json'])) as {
-      items: Array<Record<string, unknown>>;
-      limit: number;
-    };
-    expect(compact.limit).toBe(10);
-    expect(compact.items[0]).not.toHaveProperty('reason');
-    expect(await invoke(['changes'])).toContain('kudos.given');
-    expect(await invoke(['kudos', 'show', id])).toContain('Complete review');
-    expect(await invoke(['kudos', 'wins', 'codex', '--print'])).toContain(id);
-    await invoke(['kudos', 'acknowledge', id, '--as', 'codex', '--note', 'Reviewed.']);
-    expect(await invoke(['kudos', 'stats'])).toContain('Acknowledged: 1');
-    await invoke([
-      'kudos',
-      'revoke',
-      id,
-      '--as',
-      'gracie',
-      '--actor-kind',
+    const { okJson } = harness(home);
+    const created = await okJson<{ profileCreated: string }>([
       'agent',
-      '--reason',
-      'Corrected.',
-    ]);
-    await invoke(['rebuild']);
-    expect(await invoke(['doctor'])).toContain('EVENTS_VALID');
-
-    const output = join(tempHome(), 'events.jsonl');
-    await invoke(['export', '--format', 'jsonl', '--output', output]);
-    const backup = join(tempHome(), 'backup.sqlite3');
-    await invoke(['backup', backup]);
-  });
-
-  it('exercises memo, note, task, and unified list commands', async () => {
-    const home = tempHome();
-    const invoke = async (args: string[]) => {
-      const captured = capture();
-      const code = await runCli(['node', 'synomem', '--home', home, ...args], captured.io);
-      expect(code, captured.stderr.join('')).toBe(0);
-      return captured.stdout.join('');
-    };
-    await invoke(['init']);
-    await invoke(['agent', 'create', 'codex', '--name', 'Codex']);
-    await invoke(['agent', 'create', 'gracie', '--name', 'Gracie']);
-    expect(
-      await invoke([
-        'memo',
-        'send',
-        'codex',
-        '--from',
-        'gracie',
-        '--subject',
-        'Review',
-        '--body',
-        'Please review the migration.',
-      ]),
-    ).toContain('Sent memo');
-    const note = JSON.parse(
-      await invoke([
-        'note',
-        'create',
-        '--as',
-        'gracie',
-        '--title',
-        'Invariant',
-        '--body',
-        'Events remain append-only.',
-        '--json',
-      ]),
-    ) as { record: { event: { id: string } } };
-    expect(await invoke(['note', 'show', note.record.event.id])).toContain(
-      'Events remain append-only',
-    );
-    const task = JSON.parse(
-      await invoke([
-        'task',
-        'create',
-        'codex',
-        '--from',
-        'gracie',
-        '--title',
-        'Review migration',
-        '--due-date',
-        '2026-09-15',
-        '--json',
-      ]),
-    ) as {
-      record: { event: { id: string } };
-    };
-    expect(await invoke(['task', 'accept', task.record.event.id, '--as', 'codex'])).toContain(
-      'is open',
-    );
-    expect(await invoke(['task', 'show', task.record.event.id])).toContain('Review migration');
-    const list = await invoke(['list']);
-    expect(list).toContain('memo');
-    expect(list).toContain('note');
-    expect(list).toContain('task');
-  });
-
-  it('creates a topic, files a todo under it, and filters the generic list by it', async () => {
-    const home = tempHome();
-    const invoke = async (args: string[]) => {
-      const captured = capture();
-      const code = await runCli(['node', 'synomem', '--home', home, ...args], captured.io);
-      expect(code, captured.stderr.join('')).toBe(0);
-      return captured.stdout.join('');
-    };
-    await invoke(['init']);
-    const topic = JSON.parse(
-      await invoke(['topic', 'create', 'Synomem', '--alias', 'syno', '--json']),
-    ) as { id: string; displayName: string };
-    expect(await invoke(['topic', 'resolve', 'SYNO'])).toContain(topic.id);
-
-    await invoke(['agent', 'create', 'gracie', '--name', 'Gracie']);
-    await invoke([
-      'todo',
       'create',
-      '--as',
-      'gracie',
-      '--title',
-      'File under Synomem',
-      '--topic',
-      topic.id,
+      'mike',
+      '--name',
+      'Mike',
+      '--create-profile',
     ]);
-    const filtered = await invoke(['list', '--topic', topic.id, '--actor', 'gracie']);
-    expect(filtered).toContain('File under Synomem');
-
-    const renamed = JSON.parse(
-      await invoke(['topic', 'rename', topic.id, 'Synomem Project', '--json']),
-    ) as { id: string; displayName: string };
-    expect(renamed.id).toBe(topic.id);
-    expect(renamed.displayName).toBe('Synomem Project');
+    expect(created.profileCreated).toBe('mike');
+    const profiles = await okJson<{ profiles: Record<string, { backend: string }> }>([
+      'profile',
+      'list',
+    ]);
+    expect(profiles.profiles.mike?.backend).toBe('local');
   });
 
-  it('lists reachable workspaces via /v1/identity, not the control-plane-only /v1/me', async () => {
-    // `remote workspaces` used to call discoverOrganizations() -> GET /v1/me,
-    // a control-plane route gated by a service secret the CLI never holds --
-    // guaranteed 401 against the real hosted API. This asserts the fix calls
-    // discoverIdentity() instead, and that the deprecated alias still works.
+  it('says how to get a profile when none is selected', async () => {
     const home = tempHome();
-    let calls = 0;
-    const dependencies = {
-      env: { SYNOMEM_ACCESS_TOKEN: 'test-token' } as NodeJS.ProcessEnv,
-      discoverIdentity: async (options: { baseUrl: string; accessToken: string }) => {
-        calls += 1;
-        expect(options.accessToken).toBe('test-token');
+    const { run } = harness(home);
+    const result = await run(['note', 'list']);
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('No profile selected');
+    expect(result.stderr).toContain('--profile');
+  });
+});
+
+describe('CLI: obsolete identity overrides', () => {
+  it.each([
+    [['post', 'list', '--as', 'gracie']],
+    [['--actor', 'gracie', 'note', 'list']],
+    [['memo', 'send', 'codex', '--from', 'gracie', '--subject', 's', '--body', 'b']],
+    [['mcp', '--agent-id', 'gracie']],
+    [['kudos', 'give', 'codex', '--actor-kind', 'agent', '--title', 't', '--reason', 'r']],
+  ])('rejects %j with a pointer to --profile', async (args) => {
+    const home = tempHome();
+    const { run } = harness(home);
+    const result = await run(args);
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('no longer supported');
+    expect(result.stderr).toContain('--profile');
+  });
+
+  it('rejects SYNOMEM_ACTOR_ID in the environment', async () => {
+    const home = tempHome();
+    const { run } = harness(home);
+    const result = await run(['note', 'list'], { env: { SYNOMEM_ACTOR_ID: 'gracie' } });
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('SYNOMEM_ACTOR_ID is no longer supported');
+  });
+});
+
+describe('CLI: connections and hosted profiles', () => {
+  it('adds an access key from stdin and creates a profile for a permitted context', async () => {
+    const home = tempHome();
+    const api = fakeApi('syn_key.secret');
+    const { ok, okJson, run } = harness(home, { fetch: api.fetch });
+    const added = await okJson<{ key: string; contexts: unknown[] }>(
+      [
+        'connection',
+        'add-key',
+        '--name',
+        'codex-mac',
+        '--store',
+        'file',
+        '--api-url',
+        'https://api.synomem.example',
+      ],
+      { promptIo: piped('syn_key.secret\n') },
+    );
+    expect(added.key).not.toContain('secret');
+    expect(added.contexts).toHaveLength(3);
+    // The profiles file holds only a reference; the secret is in the store.
+    const profilesFile = readFileSync(join(home, 'profiles.json'), 'utf8');
+    expect(profilesFile).not.toContain('syn_key.secret');
+
+    const ambiguous = await run([
+      'profile',
+      'create',
+      'gracie',
+      '--connection',
+      'codex-mac',
+      '--agent',
+      'gracie',
+    ]);
+    expect(ambiguous.code).toBe(2);
+    expect(ambiguous.stderr).toContain('ctx_gracie_personal');
+
+    const created = await okJson<{ contextId: string; workspaceName: string }>([
+      'profile',
+      'create',
+      'gracie-eng',
+      '--connection',
+      'codex-mac',
+      '--agent',
+      'gracie',
+      '--workspace',
+      'engineering',
+    ]);
+    expect(created).toMatchObject({ contextId: 'ctx_gracie_eng', workspaceName: 'Engineering' });
+
+    const refused = await run([
+      'profile',
+      'create',
+      'mike',
+      '--connection',
+      'codex-mac',
+      '--agent',
+      'mike',
+    ]);
+    expect(refused.code).toBe(4);
+    expect(refused.stderr).toContain('never create agents');
+
+    const listed = await okJson<{ connections: Array<{ name: string; profiles: string[] }> }>([
+      'connection',
+      'list',
+    ]);
+    expect(listed.connections).toEqual([
+      expect.objectContaining({ name: 'codex-mac', profiles: ['gracie-eng'] }),
+    ]);
+    expect(await ok(['connection', 'status'])).toContain('codex-mac  ok');
+
+    const blocked = await run(['connection', 'remove', '--name', 'codex-mac']);
+    expect(blocked.code).toBe(2);
+    expect(blocked.stderr).toContain('gracie-eng');
+    await ok(['connection', 'remove', '--name', 'codex-mac', '--force']);
+    const after = new ProfileStore(home).read();
+    expect(after.credentials).toEqual({});
+    expect(after.profiles).toEqual({});
+  });
+
+  it('stores a browser sign-in once, reused by every profile on the connection', async () => {
+    const home = tempHome();
+    const api = fakeApi('oauth-access');
+    let logins = 0;
+    const { okJson } = harness(home, {
+      fetch: api.fetch,
+      oauthLogin: async (options) => {
+        logins += 1;
+        expect(options.apiUrl).toBe('https://api.synomem.example');
+        expect(options.clientId).toBeUndefined();
         return {
-          workspaceId: 'ws-current',
-          workspaces: [
-            {
-              id: 'ws-current',
-              displayName: 'Current',
-              roles: ['owner'],
-              addressableWithThisToken: true,
-            },
-            {
-              id: 'ws-other',
-              displayName: 'Other',
-              roles: ['member'],
-              addressableWithThisToken: true,
-            },
-            {
-              id: 'ws-unreachable',
-              displayName: 'Elsewhere',
-              roles: ['member'],
-              addressableWithThisToken: false,
-            },
-          ],
+          kind: 'oauth',
+          issuer: 'https://auth.synomem.example',
+          resource: 'https://api.synomem.example',
+          clientId: 'synomem-cli',
+          tokenEndpoint: 'https://auth.synomem.example/api/auth/oauth2/token',
+          scope: 'openid synomem:read synomem:write',
+          accessToken: 'oauth-access',
+          refreshToken: 'oauth-refresh',
+          expiresAt: Date.now() + 600_000,
+          generation: 0,
         };
       },
-    };
-    const invoke = async (args: string[]) => {
-      const captured = capture();
-      const code = await runCli(
-        ['node', 'synomem', '--home', home, ...args],
-        captured.io,
-        undefined,
-        dependencies,
-      );
-      expect(code, captured.stderr.join('')).toBe(0);
-      return captured.stdout.join('');
-    };
-
-    const listed = JSON.parse(await invoke(['remote', 'workspace', 'list', '--json'])) as {
-      workspaceId: string;
-      workspaces: Array<{ id: string; addressableWithThisToken: boolean }>;
-    };
-    expect(listed.workspaceId).toBe('ws-current');
-    expect(listed.workspaces.map((workspace) => workspace.id)).toEqual([
-      'ws-current',
-      'ws-other',
-      'ws-unreachable',
+    });
+    await okJson([
+      'connection',
+      'login',
+      '--name',
+      'codex-mac',
+      '--store',
+      'file',
+      '--api-url',
+      'https://api.synomem.example',
     ]);
-    const humanReadable = await invoke(['remote', 'workspace', 'list']);
-    expect(humanReadable).toContain(
-      'ws-unreachable  Elsewhere  (not reachable with this credential)',
-    );
-    expect(humanReadable).not.toContain('ws-current  Current  (not reachable');
-
-    // Deprecated alias, still working.
-    expect(await invoke(['remote', 'workspaces'])).toContain('ws-other  Other');
-    expect(calls).toBe(3);
+    await okJson([
+      'profile',
+      'create',
+      'gracie',
+      '--connection',
+      'codex-mac',
+      '--context',
+      'ctx_gracie_eng',
+    ]);
+    await okJson([
+      'profile',
+      'create',
+      'astra',
+      '--connection',
+      'codex-mac',
+      '--context',
+      'ctx_astra_eng',
+    ]);
+    const config = new ProfileStore(home).read();
+    expect(logins).toBe(1);
+    expect(Object.keys(config.credentials)).toEqual(['codex-mac']);
+    const secretRef = config.credentials['codex-mac']!.secretRef!;
+    expect(existsSync(join(home, 'credentials', `${secretRef}.json`))).toBe(true);
   });
 
-  it('switches which workspace a stored remote credential addresses with no re-authentication', async () => {
+  it('routes a remote profile through a pinned remote resolver', async () => {
     const home = tempHome();
-    const invoke = async (args: string[]) => {
-      const captured = capture();
-      const code = await runCli(['node', 'synomem', '--home', home, ...args], captured.io);
-      expect(code, captured.stderr.join('')).toBe(0);
-      return captured.stdout.join('');
-    };
-    await invoke(['backend', 'use', 'remote', '--workspace', 'ws-a']);
-    expect(JSON.parse(await invoke(['backend', 'show', '--json']))).toMatchObject({
-      backend: { kind: 'remote', workspaceId: 'ws-a' },
+    const api = fakeApi('syn_key.secret');
+    const pinned: Array<string | undefined> = [];
+    const { ok } = harness(home, {
+      fetch: api.fetch,
+      createRemoteResolver: (options) => {
+        pinned.push(options.pinnedContextId);
+        return {
+          mode: () => 'fixed',
+          resolve: async () => ({
+            service: {} as never,
+            context: {
+              contextId: options.pinnedContextId!,
+              organizationId: 'org_1',
+              workspaceId: 'ws_eng',
+              actor: { kind: 'agent', id: 'agt_gracie', displayName: 'Gracie' },
+            },
+          }),
+          list: async () => ({
+            mode: 'fixed',
+            fixedContextId: options.pinnedContextId!,
+            contexts: [],
+          }),
+        } satisfies ContextResolver;
+      },
     });
+    await ok(
+      [
+        'connection',
+        'add-key',
+        '--name',
+        'codex-mac',
+        '--store',
+        'file',
+        '--api-url',
+        'https://api.synomem.example',
+      ],
+      {
+        promptIo: piped('syn_key.secret'),
+      },
+    );
+    await ok([
+      'profile',
+      'create',
+      'gracie',
+      '--connection',
+      'codex-mac',
+      '--context',
+      'ctx_gracie_eng',
+    ]);
+    expect(await ok(['--profile', 'gracie', 'whoami'])).toContain(
+      'Gracie (agent:agt_gracie) in ws_eng',
+    );
+    expect(pinned).toEqual(['ctx_gracie_eng']);
+  });
+});
 
-    await invoke(['remote', 'workspace', 'use', 'ws-b']);
-    expect(JSON.parse(await invoke(['backend', 'show', '--json']))).toMatchObject({
-      backend: { kind: 'remote', workspaceId: 'ws-b' },
-    });
+describe('CLI: MCP launch', () => {
+  it('starts a fixed server for a profile and an explicit one for a preset', async () => {
+    const home = tempHome();
+    const started: ContextResolver[] = [];
+    const startMcpServer = async (options: { resolver: ContextResolver }) => {
+      started.push(options.resolver);
+    };
+    const { ok, run } = harness(home, { startMcpServer });
+    await ok(['setup', '--agent', 'gracie', '--name', 'Gracie']);
+    await ok(['agent', 'create', 'codex', '--name', 'Codex', '--create-profile']);
+    await ok(['preset', 'create', 'both', 'gracie', 'codex']);
+
+    await ok(['mcp', '--profile', 'gracie']);
+    expect(started[0]?.mode()).toBe('fixed');
+
+    const refused = await run(['mcp', '--preset', 'both']);
+    expect(refused.code).toBe(2);
+    expect(refused.stderr).toContain('--contexts explicit');
+
+    await ok(['mcp', '--preset', 'both', '--contexts', 'explicit']);
+    const preset = started[1]!;
+    expect(preset.mode()).toBe('explicit');
+    await expect(preset.resolve()).rejects.toMatchObject({ code: 'CONTEXT_REQUIRED' });
+    const listing = await preset.list();
+    expect(listing.contexts).toHaveLength(2);
+    const [first, second] = listing.contexts;
+    expect((await preset.resolve(first!.contextId)).context.actor.id).toBe(first!.actor.id);
+    expect((await preset.resolve(second!.contextId)).context.actor.id).toBe(second!.actor.id);
+    await preset.close?.();
+    await started[0]?.close?.();
+  });
+});
+
+describe('CLI: stores, skills and reset', () => {
+  it('creates and lists local stores', async () => {
+    const home = tempHome();
+    const { okJson } = harness(home);
+    await okJson(['workspace', 'create', 'lumina']);
+    const listed = await okJson<{ workspaces: Array<{ name: string; initialized: boolean }> }>([
+      'workspace',
+      'list',
+    ]);
+    expect(listed.workspaces.map((workspace) => workspace.name)).toContain('lumina');
+  });
+
+  it('prints MCP registration for a named profile', async () => {
+    const home = tempHome();
+    const { ok } = harness(home);
+    await ok(['setup', '--agent', 'gracie', '--name', 'Gracie']);
+    const status = await ok(['--profile', 'gracie', 'skill', 'status', '--runtime', 'codex']);
+    expect(status).toContain("synomem 'mcp' '--profile' 'gracie'");
+  });
+
+  it('plans a reset that names profiles.json and stored secrets, and applies it', async () => {
+    const home = tempHome();
+    const api = fakeApi('syn_key.secret');
+    const { ok, okJson } = harness(home, { fetch: api.fetch });
+    await ok(['setup', '--agent', 'gracie', '--name', 'Gracie']);
+    await ok(
+      [
+        'connection',
+        'add-key',
+        '--name',
+        'ci',
+        '--store',
+        'file',
+        '--api-url',
+        'https://api.synomem.example',
+      ],
+      {
+        promptIo: piped('syn_key.secret'),
+      },
+    );
+    const plan = await okJson<{ targets: string[] }>(['reset']);
+    expect(plan.targets).toContain(join(home, 'profiles.json'));
+    expect(plan.targets.some((path) => path.startsWith(join(home, 'credentials')))).toBe(true);
+    await ok(['reset', '--yes']);
+    expect(existsSync(join(home, 'profiles.json'))).toBe(false);
+  });
+
+  it('requires a hosted profile to import', async () => {
+    const home = tempHome();
+    const { ok, run } = harness(home);
+    await ok(['setup', '--agent', 'gracie', '--name', 'Gracie']);
+    const result = await run(['remote', 'import', '--from-home', home, '--preview']);
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('hosted profile');
   });
 });

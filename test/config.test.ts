@@ -1,14 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import {
-  createConfiguredService,
-  SynomemClient,
-  RemoteSynomemService,
-  defaultConfig,
-  readSynomemConfig,
-  writeSynomemBackend,
-} from '../src/index.js';
+import { SynomemClient, defaultConfig, readSynomemConfig } from '../src/index.js';
+import { ensureLocalStore } from '../src/backend.js';
 import { mergeConfig } from '../src/config.js';
 import { tempHome, testClient } from './helpers.js';
 
@@ -121,47 +115,31 @@ describe('configuration and cancellation', () => {
     expect(existsSync(join(home, 'synomem.sqlite3'))).toBe(false);
   });
 
-  it('persists backend selection without storing credentials', () => {
+  it('creates a local store once, keeping its persistent workspace identity', () => {
     const home = tempHome();
-    const config = writeSynomemBackend(
-      {
-        kind: 'remote',
-        baseUrl: 'https://api.synomem.example',
-        workspaceId: 'workspace-1',
-      },
-      home,
-    );
-    expect(config.backend.kind).toBe('remote');
+    const first = ensureLocalStore(home);
+    expect(first.backend.kind).toBe('local');
+    const second = ensureLocalStore(home);
+    expect(second.workspaceId).toBe(first.workspaceId);
     const serialized = readFileSync(join(home, 'config.json'), 'utf8');
     expect(serialized).not.toContain('token');
-    expect(readSynomemConfig(home, {})).toMatchObject({ backend: config.backend });
+    expect(readSynomemConfig(home, {})?.workspaceId).toBe(first.workspaceId);
   });
 
-  it('selects the remote service without creating local canonical state', () => {
+  it('refuses an old remote-backend store config with the replacement commands', () => {
     const home = tempHome();
-    writeSynomemBackend(
-      {
-        kind: 'remote',
-        baseUrl: 'https://api.synomem.example',
-        workspaceId: 'workspace-1',
-      },
-      home,
+    writeFileSync(
+      join(home, 'config.json'),
+      JSON.stringify({
+        ...defaultConfig,
+        backend: { kind: 'remote', baseUrl: 'https://api.synomem.example', workspaceId: 'w1' },
+      }),
     );
-    const service = createConfiguredService(
-      { home, actor: { kind: 'agent', id: 'gracie' } },
-      { SYNOMEM_ACCESS_TOKEN: 'test-only-token' },
+    expect(() => readSynomemConfig(home, {})).toThrowError(
+      expect.objectContaining({
+        code: 'CONFIG_INVALID',
+        message: expect.stringContaining('connection login') as string,
+      }),
     );
-    expect(service).toBeInstanceOf(RemoteSynomemService);
-    expect(existsSync(join(home, 'synomem.sqlite3'))).toBe(false);
-  });
-
-  it('rejects non-loopback plaintext remote origins before persisting them', () => {
-    const home = tempHome();
-    expect(() =>
-      writeSynomemBackend(
-        { kind: 'remote', baseUrl: 'http://api.synomem.example', workspaceId: 'workspace-1' },
-        home,
-      ),
-    ).toThrowError(expect.objectContaining({ code: 'CONFIG_INVALID' }));
   });
 });
