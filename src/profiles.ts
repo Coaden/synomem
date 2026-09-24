@@ -214,7 +214,7 @@ export interface SelectionInput {
  *
  *   1. `--profile` / `--preset` on this invocation
  *   2. `SYNOMEM_PROFILE` / `SYNOMEM_PRESET` for this process
- *   3. the nearest project `.synomem/config.json` (names a profile/preset only)
+ *   3. the nearest project `.synomem/project.json` (names a profile/preset only)
  *   4. `defaultProfile` in profiles.json
  *
  * Returns undefined when nothing selects anything. Naming something that does

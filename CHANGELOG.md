@@ -14,7 +14,7 @@ not read or migrated.
 
 - `~/.synomem/profiles.json` (version 1): connections (credential references only), profiles, and
   harness presets. One resolver — `--profile`/`--preset`, `SYNOMEM_PROFILE`/`SYNOMEM_PRESET`, a
-  project's `.synomem/config.json`, then `defaultProfile` — serves the CLI and both stdio entry
+  project's `.synomem/project.json`, then `defaultProfile` — serves the CLI and both stdio entry
   points.
 - `synomem connection login|add-key|list|status|remove`. Browser sign-in uses the pre-registered
   public client `synomem-cli`, discovers the authorization server from the API's own

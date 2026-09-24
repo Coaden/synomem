@@ -70,7 +70,7 @@ synomem profile create gracie-eng --connection codex-mac --agent gracie --worksp
 ```
 
 Every record command acts as the selected profile — `--profile <name>`, `SYNOMEM_PROFILE`, a
-project's `.synomem/config.json`, or the default. There are no per-command identity flags.
+project's `.synomem/project.json`, or the default. There are no per-command identity flags.
 
 ```bash
 export SYNOMEM_HOME="$(mktemp -d)/.synomem"

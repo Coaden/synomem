@@ -2,7 +2,7 @@
  * Per-project profile selection.
  *
  * Opening an agent in a repository should be enough to act as the right
- * identity: a `.synomem/config.json` found by walking up from the working
+ * identity: a `.synomem/project.json` found by walking up from the working
  * directory may name a profile (or an MCP preset) from the user's own
  * `profiles.json`.
  *
@@ -18,7 +18,13 @@ import { z } from 'zod';
 import { SynomemError } from './errors.js';
 
 export const PROJECT_DIRECTORY = '.synomem';
-export const PROJECT_CONFIG_FILE = 'config.json';
+/*
+ * `project.json`, never `config.json`: a Synomem home (a local store) keeps its
+ * own policy in `.synomem/config.json`, and the walk up from a project directory
+ * passes through the user's home — so a shared name would read the store's
+ * config as a project pointer and break every command run beneath it.
+ */
+export const PROJECT_CONFIG_FILE = 'project.json';
 
 const nameSchema = z
   .string()

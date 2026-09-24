@@ -25,7 +25,7 @@ Which profile a command uses, most specific first:
 
 1. `--profile <name>` (or `--preset <name>` for `synomem mcp`)
 2. `SYNOMEM_PROFILE` / `SYNOMEM_PRESET`
-3. the nearest project `.synomem/config.json` — it may name a profile or preset, nothing else
+3. the nearest project `.synomem/project.json` — it may name a profile or preset, nothing else
 4. `defaultProfile` in `~/.synomem/profiles.json`
 
 Naming a profile that does not exist is an error; it never falls through to the next source.
@@ -120,7 +120,7 @@ synomem profile create astra-eng --connection codex-mac --context ctx_…
 synomem profile list
 synomem profile show gracie-eng
 synomem profile default gracie-eng
-synomem profile use gracie-eng        # writes .synomem/config.json in this directory
+synomem profile use gracie-eng        # writes .synomem/project.json in this directory
 synomem profile remove astra-eng      # keeps the connection
 
 synomem preset create codex gracie-eng astra-eng

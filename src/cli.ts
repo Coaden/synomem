@@ -1242,7 +1242,7 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
 
   profileCommand
     .command('use <name>')
-    .description('Bind this directory to a profile (writes .synomem/config.json)')
+    .description('Bind this directory to a profile (writes .synomem/project.json)')
     .action((name: string, _options, command: Command) => {
       const global = globals(command);
       const config = profileStoreFor(global.home).read();
