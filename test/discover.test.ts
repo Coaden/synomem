@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  discoverAccessKeyWorkspaces,
+  describeIdentity,
+  discoverContexts,
   discoverOrganizations,
   workspaceChoices,
 } from '../src/discover.js';
@@ -27,42 +28,68 @@ function router(routes: Record<string, unknown>): typeof globalThis.fetch {
 }
 
 describe('workspace discovery', () => {
-  it('lists every workspace a member-owned access key can reach', async () => {
+  const listing = {
+    mode: 'explicit',
+    fixedContextId: null,
+    contexts: [
+      {
+        contextId: 'ctx_gracie_eng',
+        organizationId: 'org-1',
+        workspaceId: 'ws-1',
+        workspaceName: 'Engineering',
+        actor: { kind: 'agent', id: 'agt-gracie', displayName: 'Gracie' },
+        actions: ['synomem:read'],
+        source: 'target',
+      },
+    ],
+    nextCursor: null,
+  };
+
+  it('lists every context a credential may use, with no context chosen first', async () => {
     await expect(
-      discoverAccessKeyWorkspaces({
+      discoverContexts({
         baseUrl: 'https://api.synomem.example.test',
         accessToken: 'access-secret',
-        fetch: router({
-          '/v1/access-keys/workspaces': {
-            organizationId: 'org-1',
-            workspaces: [
-              { id: 'ws-04psqx2rkt8ttft7a1t2z69r97', displayName: 'Production' },
-              { id: 'ws-2', displayName: 'Staging' },
-            ],
-          },
-        }),
+        fetch: router({ '/v1/contexts': listing }),
       }),
-    ).resolves.toMatchObject({
-      organizationId: 'org-1',
-      workspaces: [{ id: 'ws-04psqx2rkt8ttft7a1t2z69r97' }, { id: 'ws-2' }],
+    ).resolves.toMatchObject({ mode: 'explicit', contexts: [{ contextId: 'ctx_gracie_eng' }] });
+  });
+
+  it('describes the credential and names the selected context only via Synomem-Context-Id', async () => {
+    const seen: Headers[] = [];
+    const fetcher = (async (input: unknown, init?: RequestInit) => {
+      seen.push(new Headers(init?.headers));
+      return respond(200, {
+        ok: true,
+        data: { account: { id: 'acct-1' }, fixedContextId: null, effectiveContext: null },
+      });
+    }) as typeof globalThis.fetch;
+    await describeIdentity({
+      baseUrl: 'https://api.synomem.example.test',
+      accessToken: 'access-secret',
+      contextId: 'ctx_gracie_eng',
+      fetch: fetcher,
     });
+    expect(seen[0]!.get('synomem-context-id')).toBe('ctx_gracie_eng');
+    expect(seen[0]!.get('synomem-workspace-id')).toBeNull();
+    expect(seen[0]!.get('synomem-agent-id')).toBeNull();
   });
 
   it('keeps a base URL with no trailing slash and one with it interchangeable', async () => {
     const workspaces = {
-      '/v1/access-keys/workspaces': { organizationId: 'org-1', workspaces: [{ id: 'ws-1' }] },
+      '/v1/contexts': listing,
     };
     for (const baseUrl of [
       'https://api.synomem.example.test',
       'https://api.synomem.example.test/',
     ]) {
       await expect(
-        discoverAccessKeyWorkspaces({
+        discoverContexts({
           baseUrl,
           accessToken: 'access-secret',
           fetch: router(workspaces),
         }),
-      ).resolves.toMatchObject({ workspaces: [{ id: 'ws-1' }] });
+      ).resolves.toMatchObject({ contexts: [{ workspaceId: 'ws-1' }] });
     }
   });
 
@@ -73,7 +100,7 @@ describe('workspace discovery', () => {
         error: { code: 'AUTH_REQUIRED', message: 'Access token is invalid.' },
       })) as typeof globalThis.fetch;
     await expect(
-      discoverAccessKeyWorkspaces({
+      discoverContexts({
         baseUrl: 'https://api.synomem.example.test',
         accessToken: 'expired',
         fetch: unauthorized,
@@ -86,7 +113,7 @@ describe('workspace discovery', () => {
       throw new Error('connect ECONNREFUSED');
     }) as typeof globalThis.fetch;
     await expect(
-      discoverAccessKeyWorkspaces({
+      discoverContexts({
         baseUrl: 'https://api.synomem.example.test',
         accessToken: 'access-secret',
         fetch: offline,

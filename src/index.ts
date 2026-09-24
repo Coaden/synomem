@@ -2,22 +2,24 @@ export { SynomemClient, SynomemCore } from './client.js';
 export type { SynomemCoreOptions } from './client.js';
 export type { ProjectionWriter } from './ports/projections.js';
 export type { SynomemRepository } from './ports/repository.js';
-export {
-  configuredServiceFactory,
-  createConfiguredService,
-  readSynomemConfig,
-  writeSynomemBackend,
-} from './backend.js';
+export { readSynomemConfig } from './backend.js';
 export { RemoteSynomemService, environmentCredentialProvider } from './remote.js';
-export type { SynomemCredentialProvider, RemoteSynomemOptions } from './remote.js';
-export { credentialReference, OsCredentialStore } from './credentials.js';
+export type {
+  RemoteCredential,
+  RemoteCredentialSource,
+  SynomemCredentialProvider,
+  RemoteSynomemOptions,
+} from './remote.js';
+export { createLocalResolver, createRemoteResolver, localContextId } from './resolvers.js';
+export type { ContextResolver, ResolvedContext } from './resolvers.js';
+export { OsCredentialStore } from './credentials.js';
 export type {
   CredentialStore,
+  StoredAccessKey,
   StoredCredential,
-  StoredInstallationKey,
   StoredOAuthCredential,
 } from './credentials.js';
-export { loginWithOAuth, StoredCredentialProvider } from './oauth.js';
+export { loginWithOAuth } from './oauth.js';
 export type { OAuthLoginOptions } from './oauth.js';
 export {
   createLocalImportBundle,
@@ -54,22 +56,16 @@ export {
   PROJECT_CONFIG_FILE,
   PROJECT_DIRECTORY,
   projectConfigSchema,
-  resolveWorkspaceSelection,
   writeProjectSelection,
 } from './project.js';
 export type { ProjectConfig, ProjectSelection } from './project.js';
 export {
-  discoverAccessKeyWorkspaces,
-  discoverIdentity,
+  describeIdentity,
+  discoverContexts,
   discoverOrganizations,
   workspaceChoices,
 } from './discover.js';
-export type {
-  DiscoveredOrganization,
-  DiscoveredWorkspace,
-  DiscoveryOptions,
-  WorkspaceMembership,
-} from './discover.js';
+export type { DiscoveredOrganization, DiscoveredWorkspace, DiscoveryOptions } from './discover.js';
 export { asSynomemError, errorCodes, SynomemError } from './errors.js';
 export {
   dueInstant,

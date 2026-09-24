@@ -25,8 +25,7 @@ describe('remote Synomem service', () => {
         new RemoteSynomemService({
           baseUrl: 'http://api.example.test',
           workspaceId: 'workspace',
-          expectedActor: actor,
-          credentialProvider: credentials,
+          credential: credentials,
         }),
     ).toThrowError(/requires HTTPS/i);
     expect(
@@ -34,8 +33,7 @@ describe('remote Synomem service', () => {
         new RemoteSynomemService({
           baseUrl: 'http://127.0.0.1:8787',
           workspaceId: 'workspace',
-          expectedActor: actor,
-          credentialProvider: credentials,
+          credential: credentials,
         }),
     ).not.toThrow();
   });
@@ -77,8 +75,8 @@ describe('remote Synomem service', () => {
     const service = new RemoteSynomemService({
       baseUrl: 'https://api.example.test',
       workspaceId: 'workspace-a',
-      expectedActor: actor,
-      credentialProvider: credentials,
+      contextId: 'ctx_codex_a',
+      credential: { bearer: async () => 'test-token-not-a-secret' },
       fetch: fetchImplementation,
     });
 
@@ -99,6 +97,15 @@ describe('remote Synomem service', () => {
       'Bearer test-token-not-a-secret',
     );
     expect(new Headers(mutation.headers).get('idempotency-key')).toBe('retry-1');
+    // The context is the ONLY selector; the obsolete authority headers are never sent.
+    for (const request of requests) {
+      const headers = new Headers(request.init!.headers);
+      expect(headers.get('synomem-context-id')).toBe('ctx_codex_a');
+      expect(headers.get('synomem-workspace-id')).toBeNull();
+      expect(headers.get('synomem-agent-id')).toBeNull();
+    }
+    // The actor is learned from the server, never asserted by the client.
+    expect(service.actor).toEqual(actor);
     if (typeof mutation.body !== 'string') throw new Error('Expected a JSON request body.');
     const body = JSON.parse(mutation.body) as Record<string, unknown>;
     expect(body).not.toHaveProperty('idempotencyKey');
@@ -112,12 +119,7 @@ describe('remote Synomem service', () => {
     const service = new RemoteSynomemService({
       baseUrl: 'https://api.example.test',
       workspaceId: 'workspace',
-      expectedActor: actor,
-      credentialProvider: {
-        async getAccessToken() {
-          return undefined;
-        },
-      },
+      credential: async () => undefined,
       fetch: fetchImplementation,
     });
 
@@ -125,13 +127,16 @@ describe('remote Synomem service', () => {
     expect(fetchImplementation).not.toHaveBeenCalled();
   });
 
-  it('fails closed when the server binds a different workspace or actor', async () => {
-    let binding = { workspaceId: 'other-workspace', actor };
+  it('fails closed when the server binds a different workspace or context', async () => {
+    let binding: { workspaceId: string; actor: typeof actor; contextId?: string } = {
+      workspaceId: 'other-workspace',
+      actor,
+    };
     const service = new RemoteSynomemService({
       baseUrl: 'https://api.example.test',
       workspaceId: 'workspace',
-      expectedActor: actor,
-      credentialProvider: credentials,
+      contextId: 'ctx_expected',
+      credential: credentials,
       fetch: async () =>
         json({
           ok: true,
@@ -152,47 +157,41 @@ describe('remote Synomem service', () => {
           },
         }),
     });
-    await expect(service.init()).rejects.toMatchObject({ code: 'AUTH_FORBIDDEN' });
+    await expect(service.init()).rejects.toMatchObject({ code: 'CONTEXT_FORBIDDEN' });
 
-    binding = { workspaceId: 'workspace', actor: { ...actor, id: 'mycroft' } };
-    await expect(service.init()).rejects.toMatchObject({ code: 'AUTH_FORBIDDEN' });
+    binding = { workspaceId: 'workspace', actor, contextId: 'ctx_someone_else' };
+    await expect(service.init()).rejects.toMatchObject({ code: 'CONTEXT_FORBIDDEN' });
+
+    binding = {
+      workspaceId: 'workspace',
+      actor: { ...actor, id: 'mycroft' },
+      contextId: 'ctx_expected',
+    };
+    await service.init();
+    expect(service.actor.id).toBe('mycroft');
   });
 
-  it("adopts the credential's real actor instead of failing when assertActor is false", async () => {
-    // A caller whose "actor" is only a historical fallback guess (the CLI's
-    // list/show commands before this fix) has no business asserting a match
-    // against the credential -- it should defer to whatever the credential
-    // actually names, exactly like the pre-existing kind: 'system' bootstrap
-    // placeholder already does.
-    const binding = { workspaceId: 'workspace', actor: { kind: 'agent' as const, id: 'mycroft' } };
+  it('keeps context error codes instead of collapsing them into AUTH_* by status', async () => {
     const service = new RemoteSynomemService({
       baseUrl: 'https://api.example.test',
       workspaceId: 'workspace',
-      expectedActor: { kind: 'human', id: 'local-cli' },
-      assertActor: false,
-      credentialProvider: credentials,
+      credential: credentials,
       fetch: async () =>
-        json({
-          ok: true,
-          data: {
-            backend: 'remote',
-            binding,
-            administration: {
-              agentCreationViaMcp: false,
-              agentArchiveViaMcp: false,
-              rebuildViaMcp: false,
-            },
-            projections: {
-              writeWinsMarkdown: false,
-              writeMemoryMarkdown: false,
-              writeTasksMarkdown: false,
-              writeInboxEntries: false,
-            },
-          },
-        }),
+        json({ ok: false, error: { code: 'CONTEXT_FORBIDDEN', message: 'Not yours.' } }, 403),
     });
-    await service.init();
-    expect(service.actor).toEqual(binding.actor);
+    await expect(service.init()).rejects.toMatchObject({ code: 'CONTEXT_FORBIDDEN' });
+  });
+
+  it('rejects a malformed context id before any request', () => {
+    expect(
+      () =>
+        new RemoteSynomemService({
+          baseUrl: 'https://api.example.test',
+          workspaceId: 'workspace',
+          contextId: 'ctx with spaces',
+          credential: credentials,
+        }),
+    ).toThrowError(/contextId/);
   });
 
   it('does not follow redirects and bounds response bytes', async () => {
@@ -200,8 +199,7 @@ describe('remote Synomem service', () => {
     const service = new RemoteSynomemService({
       baseUrl: 'https://api.example.test',
       workspaceId: 'workspace',
-      expectedActor: actor,
-      credentialProvider: credentials,
+      credential: credentials,
       maximumResponseBytes: 1024,
       fetch: async () => response,
     });
@@ -221,8 +219,7 @@ describe('remote Synomem service', () => {
     const service = new RemoteSynomemService({
       baseUrl: 'https://api.example.test',
       workspaceId: 'workspace',
-      expectedActor: actor,
-      credentialProvider: credentials,
+      credential: credentials,
       fetch: async () => response,
     });
     await expect(service.init()).rejects.toMatchObject({
@@ -238,8 +235,7 @@ describe('remote Synomem service', () => {
     const service = new RemoteSynomemService({
       baseUrl: 'https://api.example.test',
       workspaceId: 'workspace',
-      expectedActor: actor,
-      credentialProvider: credentials,
+      credential: credentials,
       fetch: async () => {
         throw new Error('request with test-token-not-a-secret failed');
       },

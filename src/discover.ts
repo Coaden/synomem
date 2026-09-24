@@ -1,24 +1,18 @@
 /*
- * Finding out which workspaces a credential can reach, so nobody has to type
- * one from memory.
+ * Finding out what a credential can reach, so nobody has to type an id from memory.
  *
- * A hosted workspace ID looks like `ws-04psqx2rkt8ttft7a1t2z69r97`. Asking a
- * person to enter that during setup is asking them to leave and go find it, and
- * the credential they just authorized already knows the answer -- or knows
- * enough to offer a short list.
+ * Two questions, two routes, because they carry different authority:
  *
- * Two credentials, two routes, because they carry different authority:
+ *   `discoverContexts` / `describeIdentity` ask the DATA plane, with any credential
+ *   (OAuth access token or `syn_` access key), which workspace/actor targets that
+ *   credential's grant may use right now (identity contract §4). No context has to be
+ *   chosen first — that is the point.
  *
- *   A member-owned access key authenticates the ACCOUNT that created it, and
- *   reaches every workspace in that account's organization -- never just one
- *   -- so `discoverAccessKeyWorkspaces` lists them off the data plane, with no
- *   workspace chosen yet, which is exactly what setup cannot supply up front.
- *
- *   A browser sign-in also authorizes an ACCOUNT, which may reach several
- *   organizations, each with several workspaces. `discoverOrganizations` lists
- *   them for selection.
+ *   `discoverOrganizations` asks the control plane which organizations an account
+ *   belongs to, for first-party setup flows that hold an account session.
  */
 import { SynomemError } from './errors.js';
+import type { ContextListing, IdentityDescription } from './types.js';
 
 export interface DiscoveredWorkspace {
   id: string;
@@ -31,19 +25,6 @@ export interface DiscoveredOrganization {
   displayName: string;
   role: string;
   workspaces: DiscoveredWorkspace[];
-}
-
-export interface WorkspaceMembership {
-  id: string;
-  displayName: string;
-  roles: string[];
-  /**
-   * Reachable right now, with this same credential, by naming it as
-   * Synomem-Workspace-Id — no new token or re-authentication. A human
-   * credential's own organization is the boundary; an agent credential has
-   * only ever one such entry, its own.
-   */
-  addressableWithThisToken: boolean;
 }
 
 export interface DiscoveryOptions {
@@ -60,7 +41,11 @@ interface Envelope<T> {
   error?: { code?: string; message?: string };
 }
 
-async function readJson<T>(options: DiscoveryOptions, path: string): Promise<T> {
+async function readJson<T>(
+  options: DiscoveryOptions,
+  path: string,
+  extraHeaders?: Record<string, string>,
+): Promise<T> {
   const request = options.fetch ?? globalThis.fetch;
   const url = new URL(
     path,
@@ -69,7 +54,11 @@ async function readJson<T>(options: DiscoveryOptions, path: string): Promise<T> 
   let response: Response;
   try {
     response = await request(url, {
-      headers: { authorization: `Bearer ${options.accessToken}`, accept: 'application/json' },
+      headers: {
+        authorization: `Bearer ${options.accessToken}`,
+        accept: 'application/json',
+        ...extraHeaders,
+      },
       ...(options.signal ? { signal: options.signal } : {}),
     });
   } catch (error) {
@@ -87,30 +76,22 @@ async function readJson<T>(options: DiscoveryOptions, path: string): Promise<T> 
   if (!response.ok || body.ok !== true || body.data === undefined) {
     // 401 and 403 are the ones a person can act on, so they keep their own
     // codes rather than being flattened into a generic protocol error.
+    const reported = body.error?.code;
     const code =
-      response.status === 401 ? 'AUTH_REQUIRED' : response.status === 403 ? 'AUTH_FORBIDDEN' : null;
+      reported === 'CONTEXT_REQUIRED' ||
+      reported === 'CONTEXT_FORBIDDEN' ||
+      reported === 'CONTEXT_AMBIGUOUS' ||
+      reported === 'REAUTHORIZATION_REQUIRED'
+        ? reported
+        : response.status === 401
+          ? 'AUTH_REQUIRED'
+          : response.status === 403
+            ? 'AUTH_FORBIDDEN'
+            : null;
     const message = body.error?.message ?? `${url.pathname} returned ${response.status}.`;
     throw new SynomemError(code ?? 'REMOTE_PROTOCOL', message);
   }
   return body.data;
-}
-
-/**
- * Every workspace a member-owned access key can reach, asked before any one
- * of them has been chosen.
- *
- * Answered by the data plane rather than the control plane: an access key is
- * not an account principal the control plane recognizes, but the data plane
- * already knows which organization owns it and can list that organization's
- * workspaces without requiring one to be named first.
- */
-export async function discoverAccessKeyWorkspaces(
-  options: DiscoveryOptions,
-): Promise<{ organizationId: string; workspaces: DiscoveredWorkspace[] }> {
-  return await readJson<{ organizationId: string; workspaces: DiscoveredWorkspace[] }>(
-    options,
-    'v1/access-keys/workspaces',
-  );
 }
 
 /**
@@ -147,19 +128,32 @@ export async function discoverOrganizations(
 }
 
 /**
- * Every workspace this credential's account belongs to, and which are
- * reachable right now without a new token — the data-plane counterpart to
- * `discoverOrganizations`, and the one that actually works with an ordinary
- * bearer token (OAuth or access key alike). `/v1/me` requires a first-party
- * control-plane credential a CLI never holds; `/v1/identity` requires only
- * the normal `synomem:read` scope every credential already has.
+ * Every context this credential's grant may use right now, with canonical ids
+ * (`GET /v1/contexts`). Follows `nextCursor` until the listing is complete, bounded.
  */
-export async function discoverIdentity(
-  options: DiscoveryOptions,
-): Promise<{ workspaceId: string; workspaces: WorkspaceMembership[] }> {
-  return await readJson<{ workspaceId: string; workspaces: WorkspaceMembership[] }>(
+export async function discoverContexts(options: DiscoveryOptions): Promise<ContextListing> {
+  let listing: ContextListing | undefined;
+  let cursor: string | null | undefined;
+  for (let page = 0; page < 20; page += 1) {
+    const next: ContextListing = await readJson<ContextListing>(
+      options,
+      `v1/contexts?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`,
+    );
+    listing = listing ? { ...next, contexts: [...listing.contexts, ...next.contexts] } : next;
+    cursor = next.nextCursor;
+    if (!cursor) break;
+  }
+  return { ...listing!, nextCursor: null };
+}
+
+/** Who this credential is: account, connection, grant, and effective context if selected. */
+export async function describeIdentity(
+  options: DiscoveryOptions & { contextId?: string },
+): Promise<IdentityDescription> {
+  return await readJson<IdentityDescription>(
     options,
     'v1/identity',
+    options.contextId ? { 'synomem-context-id': options.contextId } : undefined,
   );
 }
 

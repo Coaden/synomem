@@ -1,9 +1,8 @@
 import { actorSchema } from './schemas.js';
-import { asSynomemError, errorCodes, SynomemError, type SynomemErrorCode } from './errors.js';
+import { errorCodes, SynomemError, type SynomemErrorCode } from './errors.js';
 import type { SynomemService, SynomemServiceCapabilities, SynomemServiceInfo } from './service.js';
 import type {
   ActorIdentity,
-  WorkspaceIdentity,
   ChangesInput,
   BindRuntimeInput,
   CreateAgentInput,
@@ -32,26 +31,40 @@ export interface SynomemCredentialProvider {
   getAccessToken(signal?: AbortSignal): Promise<string | undefined>;
 }
 
+/**
+ * Where a remote service gets its bearer: an OAuth access token or a `syn_` access key
+ * (identity contract §6.1). It may refresh; it must never be logged.
+ */
+export interface RemoteCredentialSource {
+  bearer(): Promise<string>;
+}
+
+export type RemoteCredential =
+  RemoteCredentialSource | SynomemCredentialProvider | (() => Promise<string | undefined>);
+
 export interface RemoteSynomemOptions {
   baseUrl: string;
+  /** The workspace in the route. Must equal the selected context's workspace. */
   workspaceId: string;
-  expectedActor: ActorIdentity;
-  credentialProvider: SynomemCredentialProvider;
+  /**
+   * The stable target this service acts as. Sent as `Synomem-Context-Id` on every request.
+   * Omit only for a fixed credential, whose single pinned context the API selects itself.
+   */
+  contextId?: string;
+  credential: RemoteCredential;
   fetch?: typeof fetch;
   signal?: AbortSignal;
   timeoutMs?: number;
   maximumResponseBytes?: number;
-  /**
-   * False when `expectedActor` is only a historical CLI fallback guess (a
-   * caller named no real identity via `--actor`, `SYNOMEM_ACTOR_ID`, or a
-   * project binding), not an identity the caller actually asserted. Defaults
-   * to true, so every existing caller keeps its current strict behavior.
-   * `kind: 'system'` already bypasses the match unconditionally (its own
-   * historical bootstrap placeholder); this is the same bypass for a
-   * fallback of any other kind, without pretending that fallback IS a real
-   * identity.
-   */
-  assertActor?: boolean;
+}
+
+/** Normalizes any accepted credential shape into one bearer lookup. */
+export function bearerFrom(
+  credential: RemoteCredential,
+): (signal?: AbortSignal) => Promise<string | undefined> {
+  if (typeof credential === 'function') return () => credential();
+  if ('bearer' in credential) return () => credential.bearer();
+  return (signal) => credential.getAccessToken(signal);
 }
 
 interface ApiErrorEnvelope {
@@ -111,6 +124,14 @@ function queryString(input: object): string {
   return encoded ? `?${encoded}` : '';
 }
 
+/** Codes a caller must be able to branch on, never collapsed into AUTH_* by status. */
+const contextCodes = new Set<SynomemErrorCode>([
+  'CONTEXT_REQUIRED',
+  'CONTEXT_FORBIDDEN',
+  'CONTEXT_AMBIGUOUS',
+  'REAUTHORIZATION_REQUIRED',
+]);
+
 function knownErrorCode(value: string): SynomemErrorCode {
   return errorCodes.some((code) => code === value)
     ? (value as SynomemErrorCode)
@@ -158,17 +179,19 @@ export function environmentCredentialProvider(
 }
 
 export class RemoteSynomemService implements SynomemService {
-  // Not `readonly`: `init()` resolves it from the server's response when the
-  // caller didn't assert a real identity up front (see `assertedRealActor`).
-  actor: ActorIdentity;
+  /**
+   * The actor this service acts as, learned from the server during `init()` — never asserted
+   * by the caller. Before `init()` it is a placeholder that no request uses.
+   */
+  actor: ActorIdentity = { kind: 'system', id: 'unbound' };
+  readonly contextId?: string;
   private readonly baseUrl: URL;
   private readonly workspaceId: string;
-  private readonly credentialProvider: SynomemCredentialProvider;
+  private readonly bearer: (signal?: AbortSignal) => Promise<string | undefined>;
   private readonly fetchImplementation: typeof fetch;
   private readonly signal?: AbortSignal;
   private readonly timeoutMs: number;
   private readonly maximumResponseBytes: number;
-  private readonly assertActor: boolean;
   private initialized = false;
   private cachedCapabilities?: SynomemServiceCapabilities;
 
@@ -541,13 +564,13 @@ export class RemoteSynomemService implements SynomemService {
       throw new SynomemError('CONFIG_INVALID', 'Remote Synomem workspaceId is required.');
     }
     this.workspaceId = options.workspaceId;
-    try {
-      this.actor = actorSchema.parse(options.expectedActor);
-    } catch (error) {
-      throw asSynomemError(error);
+    if (options.contextId !== undefined) {
+      if (!/^[A-Za-z0-9_-]{1,100}$/.test(options.contextId)) {
+        throw new SynomemError('CONFIG_INVALID', 'Remote Synomem contextId is malformed.');
+      }
+      this.contextId = options.contextId;
     }
-    this.credentialProvider = options.credentialProvider;
-    this.assertActor = options.assertActor ?? true;
+    this.bearer = bearerFrom(options.credential);
     this.fetchImplementation = options.fetch ?? fetch;
     this.signal = options.signal;
     this.timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
@@ -573,30 +596,21 @@ export class RemoteSynomemService implements SynomemService {
       throw new SynomemError('REMOTE_PROTOCOL', 'The configured server is not a remote backend.');
     }
     const binding = this.cachedCapabilities.binding;
-    // `kind: 'system'` is this client's own placeholder for "no actor
-    // asserted" — historically the CLI default for commands that run before
-    // any identity exists (`doctor`, `agent list`, `agent create`, …). No
-    // credential the server authenticates ever reports that kind back, so
-    // asserting it here would make every one of those commands fail against
-    // a remote backend no matter who is actually calling — exactly the
-    // bootstrap deadlock the server-side half of this already fixed.
-    // `assertActor: false` is the same bypass for a fallback of any other
-    // kind: a caller whose "actor" is only a historical guess (never a real
-    // --actor, SYNOMEM_ACTOR_ID, or project binding) that should adopt
-    // whatever the credential actually names rather than fail outright.
-    // Either way, only a caller that named a real identity gets it enforced.
-    const assertedRealActor = this.assertActor && this.actor.kind !== 'system';
-    if (
-      binding.workspaceId !== this.workspaceId ||
-      (assertedRealActor &&
-        (binding.actor.kind !== this.actor.kind || binding.actor.id !== this.actor.id))
-    ) {
+    if (binding.workspaceId !== this.workspaceId) {
       throw new SynomemError(
-        'AUTH_FORBIDDEN',
-        'The authenticated Synomem actor does not match the configured actor.',
+        'CONTEXT_FORBIDDEN',
+        'The selected Synomem context does not belong to the workspace this service addresses.',
       );
     }
-    if (!assertedRealActor) this.actor = binding.actor;
+    if (this.contextId && binding.contextId && binding.contextId !== this.contextId) {
+      throw new SynomemError('CONTEXT_FORBIDDEN', 'The server bound a different context.');
+    }
+    const actor = actorSchema.safeParse(binding.actor);
+    if (!actor.success) {
+      throw new SynomemError('REMOTE_PROTOCOL', 'The server reported an invalid bound actor.');
+    }
+    // The server decides who this is; the client only learns it (plan §5 rule 7).
+    this.actor = actor.data;
     this.initialized = true;
   }
 
@@ -640,10 +654,6 @@ export class RemoteSynomemService implements SynomemService {
 
   async info(): Promise<SynomemServiceInfo> {
     return { backend: 'remote', baseUrl: this.baseUrl.href, workspaceId: this.workspaceId };
-  }
-
-  async workspaces(): Promise<WorkspaceIdentity> {
-    return this.request<WorkspaceIdentity>('GET', '../../identity');
   }
 
   getCanonicalEvent(id: string) {
@@ -703,7 +713,7 @@ export class RemoteSynomemService implements SynomemService {
     body?: object,
     idempotencyKey?: string,
   ): Promise<T> {
-    const accessToken = await this.credentialProvider.getAccessToken(this.signal);
+    const accessToken = await this.bearer(this.signal);
     if (!accessToken) {
       throw new SynomemError('AUTH_REQUIRED', 'Remote Synomem authentication is required.');
     }
@@ -726,15 +736,9 @@ export class RemoteSynomemService implements SynomemService {
         headers: {
           accept: 'application/json',
           authorization: `Bearer ${accessToken}`,
-          /*
-           * Harmless for an OAuth actor token (its workspace and identity are
-           * already bound into the token itself), and required for an access
-           * key: an access key authenticates the member who owns it, not a
-           * machine or a workspace, so which workspace and which agent are
-           * meant have to be named on every request.
-           */
-          'synomem-workspace-id': this.workspaceId,
-          ...(this.actor.kind === 'agent' ? { 'synomem-agent-id': this.actor.id } : {}),
+          // The ONLY selector (identity contract §3). The server authorizes it against the
+          // credential's grant on every request; knowing an id grants nothing.
+          ...(this.contextId ? { 'synomem-context-id': this.contextId } : {}),
           ...(body ? { 'content-type': 'application/json' } : {}),
           ...(idempotencyKey ? { 'idempotency-key': idempotencyKey } : {}),
         },
@@ -765,8 +769,10 @@ export class RemoteSynomemService implements SynomemService {
       if (envelope.ok !== false || !envelope.error || typeof envelope.error.message !== 'string') {
         throw new SynomemError('REMOTE_PROTOCOL', 'Remote Synomem returned an invalid error.');
       }
-      const code =
-        response.status === 401
+      const reported = knownErrorCode(envelope.error.code);
+      const code = contextCodes.has(reported)
+        ? reported
+        : response.status === 401
           ? 'AUTH_REQUIRED'
           : response.status === 403
             ? 'AUTH_FORBIDDEN'

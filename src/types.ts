@@ -822,25 +822,50 @@ export interface DoctorResult {
   diagnostics: Diagnostic[];
 }
 /**
- * Every workspace this credential's account belongs to, and which of them
- * are reachable right now without a new token. A human actor's token
- * authorizes an organization, not permanently one workspace: any
- * `addressableWithThisToken: true` entry can be reached on the very next
- * request by sending it as `Synomem-Workspace-Id` — no re-authentication.
- * An agent-bound token has only ever one such entry, its own.
+ * The one workspace/actor target an operation actually ran as (identity contract §4).
+ * `contextId` is a stable, grant-independent identifier: `ctx_…` for a hosted target,
+ * `lctx_…` for a local SQLite target.
  */
-export interface WorkspaceIdentity {
-  actor: ActorIdentity;
-  /** The workspace this credential currently addresses. */
+export interface EffectiveContext {
+  contextId: string;
+  organizationId: string | null;
   workspaceId: string;
-  roles: string[];
-  scopes: string[];
-  workspaces: Array<{
+  actor: ActorIdentity;
+  connectionId?: string;
+}
+
+/** One entry of `GET /v1/contexts`: a target this credential may currently use. */
+export interface ContextSummary {
+  contextId: string;
+  organizationId: string | null;
+  workspaceId: string;
+  workspaceName?: string;
+  actor: ActorIdentity & { handle?: string };
+  actions: string[];
+  source: 'target' | 'rule' | 'local';
+}
+
+/** `GET /v1/contexts`. `fixed` means omitting a context selects `fixedContextId`. */
+export interface ContextListing {
+  mode: 'fixed' | 'explicit';
+  fixedContextId: string | null;
+  contexts: ContextSummary[];
+  nextCursor?: string | null;
+}
+
+/** `GET /v1/identity`: the credential, its grant, and (optionally) the effective context. */
+export interface IdentityDescription {
+  account: { id: string };
+  organizationId: string | null;
+  connection: { id: string; label: string; kind: 'oauth' | 'access_key' | 'local' } | null;
+  grant: {
     id: string;
-    displayName: string;
-    roles: string[];
-    addressableWithThisToken: boolean;
-  }>;
+    version: number;
+    mode: 'fixed' | 'explicit';
+    actions: string[];
+  } | null;
+  fixedContextId: string | null;
+  effectiveContext: EffectiveContext | null;
 }
 /**
  * What the projected files on disk look like next to what they should be.

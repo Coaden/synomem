@@ -1,9 +1,14 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it } from 'vitest';
-import { createSynomemMcpServer } from '../src/mcp/index.js';
-import { SynomemClient } from '../src/client.js';
-import type { SynomemServiceFactory } from '../src/service.js';
+import {
+  CONTEXT_TOOLS,
+  DISCOVERY_TOOLS,
+  createSynomemMcpServer,
+  type ContextResolver,
+} from '../src/mcp/index.js';
+import { createLocalResolver } from '../src/resolvers.js';
+import { SynomemError } from '../src/errors.js';
 import type { SynomemConfigOverrides } from '../src/types.js';
 import { tempHome, testClient } from './helpers.js';
 
@@ -20,11 +25,11 @@ async function connectRuntime(
   actor: { kind: 'agent'; id: string; displayName: string },
   config?: SynomemConfigOverrides,
 ) {
-  const runtime = await createSynomemMcpServer({
-    home,
-    actor,
-    ...(config ? { config } : {}),
-  });
+  return connectResolver(createLocalResolver({ home, actor, ...(config ? { config } : {}) }));
+}
+
+async function connectResolver(resolver: ContextResolver) {
+  const runtime = await createSynomemMcpServer({}, resolver);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const protocolClient = new Client({ name: 'synomem-test', version: '1.0.0' });
   await Promise.all([
@@ -35,19 +40,43 @@ async function connectRuntime(
 }
 
 describe('MCP protocol integration', () => {
-  it('creates its domain service through the injected factory', async () => {
+  it('binds a local session to one stable lctx_ context and reports it on every result', async () => {
     const home = tempHome();
-    const actors: string[] = [];
-    const factory: SynomemServiceFactory = (options) => {
-      actors.push(`${options.actor?.kind}:${options.actor?.id}`);
-      return new SynomemClient(options);
-    };
-    const runtime = await createSynomemMcpServer(
-      { home, actor: { kind: 'agent', id: 'codex', displayName: 'Codex' } },
-      factory,
-    );
+    const { runtime, protocolClient } = await setupRuntime(home);
+    const listed = await protocolClient.callTool({ name: 'synomem_context_list', arguments: {} });
+    const listing = (
+      listed.structuredContent as {
+        data: { mode: string; fixedContextId: string; contexts: Array<{ contextId: string }> };
+      }
+    ).data;
+    expect(listing.mode).toBe('fixed');
+    expect(listing.fixedContextId).toMatch(/^lctx_[0-9a-f]{24}$/);
+    expect(listing.contexts).toHaveLength(1);
 
-    expect(actors).toEqual(['agent:codex']);
+    const result = await protocolClient.callTool({ name: 'synomem_list', arguments: {} });
+    expect(result.structuredContent).toMatchObject({
+      ok: true,
+      effectiveContext: { contextId: listing.fixedContextId, actor: { kind: 'agent' } },
+    });
+
+    // Naming the fixed context explicitly is fine; naming any other is refused.
+    const explicit = await protocolClient.callTool({
+      name: 'synomem_list',
+      arguments: { contextId: listing.fixedContextId },
+    });
+    expect(explicit.isError).toBeFalsy();
+    const other = await protocolClient.callTool({
+      name: 'synomem_list',
+      arguments: { contextId: 'lctx_000000000000000000000000' },
+    });
+    expect(other.structuredContent).toMatchObject({ errorCode: 'CONTEXT_FORBIDDEN' });
+
+    const whoami = await protocolClient.callTool({ name: 'synomem_whoami', arguments: {} });
+    expect(whoami.structuredContent).toMatchObject({
+      data: { mode: 'fixed' },
+      effectiveContext: { contextId: listing.fixedContextId },
+    });
+    await protocolClient.close();
     await runtime.close();
   });
 
@@ -91,8 +120,9 @@ describe('MCP protocol integration', () => {
         'synomem_topic_resolve',
         'synomem_topic_archive',
         'synomem_topic_restore',
-        'synomem_workspace_list',
-        'synomem_workspace_use',
+        'synomem_context_list',
+        'synomem_context_resolve',
+        'synomem_whoami',
         'synomem_rebuild',
         'synomem_doctor',
       ]),
@@ -117,7 +147,7 @@ describe('MCP protocol integration', () => {
     expect(giveSchema.properties?.tags?.items?.pattern).toBeTruthy();
     const templates = await protocolClient.listResourceTemplates();
     expect(templates.resourceTemplates.map((resource) => resource.uriTemplate)).toContain(
-      'synomem://agents/{agentId}/inbox',
+      'synomem://contexts/{contextId}/agents/{agentId}/inbox',
     );
     const prompts = await protocolClient.listPrompts();
     expect(prompts.prompts.map((prompt) => prompt.name)).toEqual(
@@ -130,93 +160,6 @@ describe('MCP protocol integration', () => {
         'synomem_create_actionable_task',
       ]),
     );
-    await protocolClient.close();
-    await runtime.client.close();
-  });
-
-  it('reports workspace tools as unsupported on the local backend, not a crash', async () => {
-    const home = tempHome();
-    const { runtime, protocolClient } = await setupRuntime(home);
-
-    const list = await protocolClient.callTool({ name: 'synomem_workspace_list', arguments: {} });
-    expect(list.isError).toBe(true);
-    expect((list.structuredContent as { errorCode?: string }).errorCode).toBe(
-      'UNSUPPORTED_BACKEND',
-    );
-
-    const use = await protocolClient.callTool({
-      name: 'synomem_workspace_use',
-      arguments: { workspaceId: 'ws-elsewhere' },
-    });
-    expect(use.isError).toBe(true);
-    expect((use.structuredContent as { errorCode?: string }).errorCode).toBe('UNSUPPORTED_BACKEND');
-
-    await protocolClient.close();
-    await runtime.client.close();
-  });
-
-  it('switches which workspace every subsequent tool call addresses, in the same session', async () => {
-    const home = tempHome();
-    const setup = await testClient(home);
-    await setup.agents.create({ handle: 'gracie', displayName: 'Gracie' });
-    await setup.close();
-
-    // A second, independent local store stands in for "a different
-    // workspace" -- switchWorkspace only has to construct and init() a new
-    // SynomemService for the requested ID; what backend it happens to be is
-    // the caller's business, not this tool's.
-    const otherHome = tempHome();
-    const otherAdmin = await testClient(otherHome);
-    await otherAdmin.agents.create({ handle: 'gracie', displayName: 'Gracie' });
-    await otherAdmin.close();
-    const other = await testClient(otherHome, {
-      kind: 'agent',
-      id: 'gracie',
-      displayName: 'Gracie',
-    });
-    await other.notes.create({ title: 'Only in the other workspace', body: 'x' });
-    await other.close();
-
-    const runtime = await createSynomemMcpServer({
-      home,
-      actor: { kind: 'agent', id: 'gracie', displayName: 'Gracie' },
-      switchWorkspace: async (workspaceId) => {
-        expect(workspaceId).toBe('ws-other');
-        return new SynomemClient({
-          home: otherHome,
-          actor: { kind: 'agent', id: 'gracie', displayName: 'Gracie' },
-        });
-      },
-    });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const protocolClient = new Client({ name: 'synomem-test', version: '1.0.0' });
-    await Promise.all([
-      runtime.server.connect(serverTransport),
-      protocolClient.connect(clientTransport),
-    ]);
-
-    const before = await protocolClient.callTool({ name: 'synomem_list', arguments: {} });
-    expect(before.isError).toBeFalsy();
-    const beforeNotes = (
-      before.structuredContent as { data: { items: Array<{ title: string }> } }
-    ).data.items.map((item) => item.title);
-    expect(beforeNotes).not.toContain('Only in the other workspace');
-
-    const switched = await protocolClient.callTool({
-      name: 'synomem_workspace_use',
-      arguments: { workspaceId: 'ws-other' },
-    });
-    expect(switched.isError).toBeFalsy();
-
-    // No new session, no reconnection -- the SAME already-open MCP session
-    // now sees the other workspace's data, because synomem_workspace_use
-    // reassigns the one client/actor closure every tool handler shares.
-    const after = await protocolClient.callTool({ name: 'synomem_list', arguments: {} });
-    const afterNotes = (
-      after.structuredContent as { data: { items: Array<{ title: string }> } }
-    ).data.items.map((item) => item.title);
-    expect(afterNotes).toContain('Only in the other workspace');
-
     await protocolClient.close();
     await runtime.close();
   });
@@ -240,7 +183,7 @@ describe('MCP protocol integration', () => {
       .map((tool) => tool.name);
     expect(offenders).toEqual([]);
     await protocolClient.close();
-    await runtime.client.close();
+    await runtime.close();
   });
 
   it('binds the actor, returns structured content, enforces policy, and exposes resources', async () => {
@@ -340,9 +283,13 @@ describe('MCP protocol integration', () => {
     const rebuild = await protocolClient.callTool({ name: 'synomem_rebuild', arguments: {} });
     expect(rebuild.structuredContent).toMatchObject({ errorCode: 'POLICY_FORBIDDEN' });
 
-    const inbox = await protocolClient.readResource({ uri: 'synomem://agents/gracie/inbox' });
+    const inbox = await protocolClient.readResource({
+      uri: 'synomem://contexts/default/agents/gracie/inbox',
+    });
     expect(inbox.contents).toHaveLength(1);
-    const wins = await protocolClient.readResource({ uri: 'synomem://agents/codex/wins' });
+    const wins = await protocolClient.readResource({
+      uri: 'synomem://contexts/default/agents/codex/wins',
+    });
     const winsPage = JSON.parse((wins.contents[0] as { text: string }).text) as {
       items: Array<{ id: string }>;
       limit: number;
@@ -354,11 +301,11 @@ describe('MCP protocol integration', () => {
       hasMore: false,
     });
     await expect(
-      protocolClient.readResource({ uri: 'synomem://agents/codex/inbox' }),
+      protocolClient.readResource({ uri: 'synomem://contexts/default/agents/codex/inbox' }),
     ).rejects.toThrow();
 
     await protocolClient.close();
-    await runtime.client.close();
+    await runtime.close();
   });
 
   it('exposes actor-bound memos, notes, tasks, and the unified feed', async () => {
@@ -405,7 +352,7 @@ describe('MCP protocol integration', () => {
     expect(new Set(items.map((item) => item.kind))).toEqual(new Set(['memo', 'note', 'task']));
     expect(items.every((item) => !('body' in item) && !('description' in item))).toBe(true);
     await protocolClient.close();
-    await runtime.client.close();
+    await runtime.close();
   });
 
   it('enforces private visibility through tools and resources', async () => {
@@ -442,11 +389,11 @@ describe('MCP protocol integration', () => {
     expect(list.structuredContent).toMatchObject({ data: { total: 0, items: [] } });
     await expect(
       mycroft.protocolClient.readResource({
-        uri: `synomem://events/${privateKudos.record.event.id}`,
+        uri: `synomem://contexts/default/events/${privateKudos.record.event.id}`,
       }),
     ).rejects.toThrow();
     await mycroft.protocolClient.close();
-    await mycroft.runtime.client.close();
+    await mycroft.runtime.close();
 
     const codex = await connectRuntime(home, {
       kind: 'agent',
@@ -459,7 +406,7 @@ describe('MCP protocol integration', () => {
     });
     expect(visible.isError).not.toBe(true);
     await codex.protocolClient.close();
-    await codex.runtime.client.close();
+    await codex.runtime.close();
   });
 
   it('keeps private statistics scoped to the configured actor', async () => {
@@ -498,7 +445,7 @@ describe('MCP protocol integration', () => {
       data: { stats: { total: 1, byAgent: { [gracieId]: 1 } } },
     });
     await mycroft.protocolClient.close();
-    await mycroft.runtime.client.close();
+    await mycroft.runtime.close();
   });
 
   it('creates a topic, resolves it by alias, and files a todo under it through the protocol', async () => {
@@ -534,6 +481,138 @@ describe('MCP protocol integration', () => {
     ).toHaveLength(1);
 
     await protocolClient.close();
-    await runtime.client.close();
+    await runtime.close();
+  });
+  it('registers every tool in exactly one of the context or discovery inventories', async () => {
+    const home = tempHome();
+    const { runtime, protocolClient } = await setupRuntime(home);
+    const tools = (await protocolClient.listTools()).tools;
+    const contextTools = new Set<string>(CONTEXT_TOOLS);
+    const discoveryTools = new Set<string>(DISCOVERY_TOOLS);
+    for (const tool of tools) {
+      const inContext = contextTools.has(tool.name);
+      const inDiscovery = discoveryTools.has(tool.name);
+      expect(inContext !== inDiscovery, tool.name).toBe(true);
+      const properties = (tool.inputSchema as { properties?: Record<string, unknown> }).properties;
+      // A context tool that forgot the shared selector would silently run as the default.
+      if (inContext) expect(properties, tool.name).toHaveProperty('contextId');
+    }
+    expect(tools.map((tool) => tool.name).sort()).toEqual(
+      [...CONTEXT_TOOLS, ...DISCOVERY_TOOLS].sort(),
+    );
+    const templates = (await protocolClient.listResourceTemplates()).resourceTemplates;
+    expect(templates.every((template) => template.uriTemplate.includes('{contextId}'))).toBe(true);
+    await protocolClient.close();
+    await runtime.close();
+  });
+
+  it('requires contextId in explicit mode and keeps interleaved calls on their own contexts', async () => {
+    // Two independent stores stand in for two hosted contexts: Gracie in one, Codex in the
+    // other. The resolver never has a "current" context — each call names its own.
+    const gracieHome = tempHome();
+    const codexHome = tempHome();
+    for (const [home, handle, name] of [
+      [gracieHome, 'gracie', 'Gracie'],
+      [codexHome, 'codex', 'Codex'],
+    ] as const) {
+      const admin = await testClient(home);
+      await admin.agents.create({ handle, displayName: name });
+      await admin.close();
+    }
+    const gracie = createLocalResolver({
+      home: gracieHome,
+      actor: { kind: 'agent', id: 'gracie', displayName: 'Gracie' },
+    });
+    const codex = createLocalResolver({
+      home: codexHome,
+      actor: { kind: 'agent', id: 'codex', displayName: 'Codex' },
+    });
+    const gracieId = (await gracie.list()).fixedContextId!;
+    const codexId = (await codex.list()).fixedContextId!;
+    const byId = new Map([
+      [gracieId, gracie],
+      [codexId, codex],
+    ]);
+    const explicit: ContextResolver = {
+      mode: () => 'explicit',
+      async resolve(contextId) {
+        const target = contextId ? byId.get(contextId) : undefined;
+        if (!contextId) throw new SynomemError('CONTEXT_REQUIRED', 'Pass contextId.');
+        if (!target) throw new SynomemError('CONTEXT_FORBIDDEN', 'Not available.');
+        return target.resolve(contextId);
+      },
+      async list() {
+        const entries = [...(await gracie.list()).contexts, ...(await codex.list()).contexts];
+        return { mode: 'explicit', fixedContextId: null, contexts: entries, nextCursor: null };
+      },
+      async close() {
+        await gracie.close?.();
+        await codex.close?.();
+      },
+    };
+    const { runtime, protocolClient } = await connectResolver(explicit);
+
+    const missing = await protocolClient.callTool({
+      name: 'synomem_note_create',
+      arguments: { title: 'No context', body: 'Must not be written anywhere.' },
+    });
+    expect(missing.isError).toBe(true);
+    expect(missing.structuredContent).toMatchObject({ ok: false, errorCode: 'CONTEXT_REQUIRED' });
+
+    const writes = await Promise.all(
+      Array.from({ length: 6 }, (_, index) => {
+        const contextId = index % 2 === 0 ? gracieId : codexId;
+        return protocolClient.callTool({
+          name: 'synomem_note_create',
+          arguments: { contextId, title: `Note ${index}`, body: `Written as ${contextId}.` },
+        });
+      }),
+    );
+    const gracieActor = (await gracie.resolve()).context.actor.id;
+    const codexActor = (await codex.resolve()).context.actor.id;
+    expect(gracieActor).not.toBe(codexActor);
+    writes.forEach((result, index) => {
+      const expected = index % 2 === 0 ? gracieActor : codexActor;
+      const content = result.structuredContent as {
+        effectiveContext: { actor: { id: string } };
+        data: { record: { event: { actor: { id: string } } } };
+      };
+      expect(result.isError, JSON.stringify(result.structuredContent)).toBeFalsy();
+      expect(content.effectiveContext.actor.id).toBe(content.data.record.event.actor.id);
+      expect(content.data.record.event.actor.id).toBe(expected);
+    });
+    const gracieList = await protocolClient.callTool({
+      name: 'synomem_list',
+      arguments: { contextId: gracieId, kinds: ['note'] },
+    });
+    const codexList = await protocolClient.callTool({
+      name: 'synomem_list',
+      arguments: { contextId: codexId, kinds: ['note'] },
+    });
+    const titles = (result: typeof gracieList) =>
+      (result.structuredContent as { data: { items: Array<{ title: string }> } }).data.items
+        .map((item) => item.title)
+        .sort();
+    expect(titles(gracieList)).toEqual(['Note 0', 'Note 2', 'Note 4']);
+    expect(titles(codexList)).toEqual(['Note 1', 'Note 3', 'Note 5']);
+
+    const resolved = await protocolClient.callTool({
+      name: 'synomem_context_resolve',
+      arguments: { query: 'gracie' },
+    });
+    expect(resolved.structuredContent).toMatchObject({ data: { match: { contextId: gracieId } } });
+    const ambiguous = await protocolClient.callTool({
+      name: 'synomem_context_resolve',
+      arguments: { actorKind: 'agent' },
+    });
+    expect(ambiguous.structuredContent).toMatchObject({ errorCode: 'CONTEXT_AMBIGUOUS' });
+    const unknown = await protocolClient.callTool({
+      name: 'synomem_context_resolve',
+      arguments: { query: 'astra' },
+    });
+    expect(unknown.structuredContent).toMatchObject({ errorCode: 'CONTEXT_FORBIDDEN' });
+
+    await protocolClient.close();
+    await runtime.close();
   });
 });
