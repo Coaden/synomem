@@ -3,6 +3,11 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
+## 0.9.2
+
+- Packaged skill: a "When access fails" section — which context and authorization errors to
+  report, and that credentials, stores and keys are always the human's to set up.
+
 ## 0.9.1
 
 - Headless credential refresh is hardened: the refresh lock records its owner and is broken only

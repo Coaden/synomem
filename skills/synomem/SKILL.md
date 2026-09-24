@@ -163,6 +163,21 @@ There is no tool to switch workspace or agent mid-session. If the user wants an 
 connection cannot use, say so: a different identity is a different profile or connection, set up by
 the human (`synomem profile create`, or authorizing another agent on the consent screen).
 
+## When access fails
+
+Credentials and identities are the human's to set up; report the error and the fix, never work
+around it.
+
+- `CONTEXT_REQUIRED` — explicit mode: pick the intended context from `synomem_context_list`.
+- `CONTEXT_FORBIDDEN` — this connection may not act as that identity. Say so; do not try another.
+- `REAUTHORIZATION_REQUIRED` or `AUTH_REQUIRED` — the connection was revoked, changed, or its
+  refresh could not be confirmed. Ask the human to run `synomem connection login --name <connection>`
+  (or reconnect the app). Never retry with a different credential.
+- A "no operating-system credential store" error on a headless machine means the human must choose
+  `--store file` or `--store environment` explicitly. Do not pick one for them, and never write a
+  secret to a file, a profile, or the environment yourself.
+- Never read, print, or pass an access key or token — `connection add-key` reads it from stdin.
+
 ## Discovery
 
 Use `synomem_inbox` for the configured agent's pending kudos, unread memos, and open tasks. That is
