@@ -3,6 +3,18 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
+## 0.9.1
+
+- Headless credential refresh is hardened: the refresh lock records its owner and is broken only
+  when that owner is provably dead (or stale from another host), a refresh whose outcome is unknown
+  removes the stored refresh token instead of risking a replay, token requests time out inside the
+  lock window, and protected-file credentials that other users can read are refused like ssh keys.
+  A missing Secret Service gives a guided error naming `--store file` — never a silent fallback.
+- Local context ids (`lctx_…`) are 128-bit random values minted per store in `contexts.json`,
+  never derived from names or the canonical tuple. Profiles created with 0.9.0 must be recreated.
+- Project pointers are `.synomem/project.json` (a `.synomem/config.json` in a parent directory is a
+  store's own config, not a pointer).
+
 ## [0.9.0] - 2026-09-23
 
 One identity model for the CLI, the stdio MCP server and the hosted gateway: every operation runs
