@@ -152,8 +152,16 @@ describe('credential stores', () => {
         platform,
         run: async (executable, args, input) => {
           calls.push(`${executable} ${args[0]}`);
+          if (args[0] === '-i') {
+            // `security -i` reads one command from stdin; the secret is -X hex.
+            const words = (input ?? '').trim().split(/\s+/);
+            const account = words[words.indexOf('-a') + 1]!;
+            const hex = words[words.indexOf('-X') + 1]!;
+            vault.set(account, Buffer.from(hex, 'hex').toString('utf8'));
+            return { stdout: '', stderr: '', code: 0 };
+          }
           const account = args[args.indexOf(platform === 'darwin' ? '-a' : 'account') + 1]!;
-          if (args[0] === 'add-generic-password' || args[0] === 'store') {
+          if (args[0] === 'store') {
             vault.set(account, (input ?? '').trim());
             return { stdout: '', stderr: '', code: 0 };
           }
@@ -176,6 +184,25 @@ describe('credential stores', () => {
       expect(calls[0]).toContain(platform === 'darwin' ? '/usr/bin/security' : 'secret-tool');
     }
   });
+
+  // The real macOS Keychain, not a mock: a mock that modelled the helper
+  // wrongly is how an empty stored secret once shipped. Local only — CI
+  // runners have no unlocked login keychain.
+  it.runIf(process.platform === 'darwin' && !process.env.CI)(
+    'round-trips through the real macOS Keychain',
+    async () => {
+      const store = new OsCredentialStore();
+      const reference = `synomem-test-${process.pid}-${Date.now()}`;
+      const credential = { kind: 'access-key' as const, secret: 'syn_test_"quoted"_$value' };
+      try {
+        await store.set(reference, credential);
+        expect(await store.get(reference)).toEqual(credential);
+      } finally {
+        await store.delete(reference);
+      }
+      expect(await store.get(reference)).toBeUndefined();
+    },
+  );
 
   it('names the explicit alternative when the keychain refuses a write, never falling back', async () => {
     const store = new OsCredentialStore({

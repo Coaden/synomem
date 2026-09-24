@@ -149,6 +149,13 @@ async function command(
   });
 }
 
+function safeReference(reference: string): string {
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(reference)) {
+    throw new SynomemError('CONFIG_INVALID', 'Credential reference is malformed.');
+  }
+  return reference;
+}
+
 /** macOS Keychain or Linux Secret Service. */
 export class OsCredentialStore implements CredentialStore {
   private readonly platform: NodeJS.Platform;
@@ -192,20 +199,18 @@ export class OsCredentialStore implements CredentialStore {
     const serialized = JSON.stringify(storedCredentialSchema.parse(credential));
     const result =
       this.platform === 'darwin'
-        ? await this.run(
+        ? /*
+           * `add-generic-password -w` with no value reads the password from the
+           * TERMINAL, not stdin, so piping the secret stored an empty item. The
+           * command goes to `security -i` on stdin instead, with the secret
+           * hex-encoded (-X): it never appears in argv or the process list, and
+           * no quoting of the JSON is involved. The reference is validated to
+           * [A-Za-z0-9_-] and the service name is a constant.
+           */
+          await this.run(
             '/usr/bin/security',
-            [
-              'add-generic-password',
-              '-a',
-              reference,
-              '-s',
-              serviceName,
-              '-l',
-              'Synomem credential',
-              '-U',
-              '-w',
-            ],
-            `${serialized}\n`,
+            ['-i'],
+            `add-generic-password -U -a ${safeReference(reference)} -s ${serviceName} -l Synomem-credential -X ${Buffer.from(serialized, 'utf8').toString('hex')}\n`,
           )
         : this.platform === 'linux'
           ? await this.run(
@@ -214,10 +219,14 @@ export class OsCredentialStore implements CredentialStore {
               serialized,
             )
           : this.unsupported();
-    if (result.code !== 0) {
+    // `security -i` exits 0 even when its command fails, so success is
+    // proven by reading the secret back — a store that silently kept nothing
+    // must fail here, never on the next command.
+    const stored = result.code === 0 ? await this.get(reference).catch(() => undefined) : undefined;
+    if (!stored || JSON.stringify(stored) !== serialized) {
       throw new SynomemError(
         'CONFIG_INVALID',
-        'The operating-system credential store rejected the credential. Re-run with --store file to use a restricted file instead.',
+        'The operating-system credential store did not keep the credential. Re-run with --store file to use a restricted file instead.',
       );
     }
   }

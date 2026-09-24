@@ -3,6 +3,14 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
+## 0.9.4
+
+- macOS Keychain: credentials are now actually stored. `security add-generic-password -w`
+  reads the secret from the terminal, not stdin, so 0.9.0–0.9.3 saved an empty item and the next
+  command reported "Stored Synomem credential is malformed". The secret now goes to `security -i`
+  on stdin, hex-encoded, and every write is verified by reading it back. Re-run
+  `synomem connection add-key` / `connection login` for connections created with those versions.
+
 ## 0.9.3
 
 - Windows: credential locking, atomic replace, reads and lock release treat file-sharing
