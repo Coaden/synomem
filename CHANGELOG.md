@@ -3,6 +3,12 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
+## 0.9.3
+
+- Windows: credential locking, atomic replace, reads and lock release treat file-sharing
+  violations (EPERM/EACCES/EBUSY on a name still open elsewhere) as transient instead of failing a
+  concurrent refresh.
+
 ## 0.9.2
 
 - Packaged skill: a "When access fails" section — which context and authorization errors to
