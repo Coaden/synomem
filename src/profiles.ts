@@ -27,7 +27,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { localStoreWorkspaceId, readSynomemConfig } from './backend.js';
+import { readSynomemConfig } from './backend.js';
 import { resolveHome } from './config.js';
 import {
   withCredentialLock,
@@ -96,7 +96,7 @@ const localProfileSchema = z
     home: z.string().optional(),
     actorId: z.string().min(1),
     actorName: z.string().optional(),
-    contextId: z.string().regex(/^lctx_[0-9a-f]{24}$/),
+    contextId: z.string().regex(/^lctx_[0-9a-f]{32}$/),
   })
   .strict();
 
@@ -374,7 +374,24 @@ export class ConnectionCredentialSource implements RemoteCredentialSource {
       try {
         refreshed = await refreshOAuthCredential(current, this.options.fetch ?? fetch);
       } catch (error) {
-        if (error instanceof SynomemError && error.code === 'REMOTE_UNAVAILABLE') throw error;
+        if (
+          error instanceof SynomemError &&
+          error.code === 'REMOTE_UNAVAILABLE' &&
+          error.details?.delivery === 'not_sent'
+        ) {
+          // The refresh token provably never left this machine: safe to retry later.
+          throw error;
+        }
+        // Refused, or delivery unknown (the server may have rotated it): the
+        // stored refresh token is treated as spent and removed, so no process
+        // can replay it and trip reuse detection for the whole family.
+        const withoutRefresh: StoredOAuthCredential = { ...current };
+        delete withoutRefresh.refreshToken;
+        await store.set(entry.secretRef!, {
+          ...withoutRefresh,
+          expiresAt: 0,
+          generation: current.generation + 1,
+        });
         throw this.reauthorize(`Connection ${name} could not be refreshed.`);
       }
       // Compare-and-swap: only this process may have spent the refresh token
@@ -440,7 +457,7 @@ export function localProfileTarget(
     id: profile.actorId,
     ...(profile.actorName ? { displayName: profile.actorName } : {}),
   };
-  const expected = localContextId(localStoreWorkspaceId(home), actor);
+  const expected = localContextId(home, actor);
   if (expected !== profile.contextId) {
     throw new SynomemError(
       'CONTEXT_FORBIDDEN',

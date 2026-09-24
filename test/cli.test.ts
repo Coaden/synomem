@@ -152,7 +152,7 @@ describe('CLI: local setup and profiles', () => {
       default: boolean;
     }>(['setup', '--backend', 'local', '--agent', 'gracie', '--name', 'Gracie']);
     expect(first).toMatchObject({ applied: true, profile: 'gracie', default: true });
-    expect(first.contextId).toMatch(/^lctx_[0-9a-f]{24}$/);
+    expect(first.contextId).toMatch(/^lctx_[0-9a-f]{32}$/);
 
     const again = await okJson<{ applied: boolean; agentId: string }>([
       'setup',

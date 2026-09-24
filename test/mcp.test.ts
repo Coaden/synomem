@@ -50,7 +50,7 @@ describe('MCP protocol integration', () => {
       }
     ).data;
     expect(listing.mode).toBe('fixed');
-    expect(listing.fixedContextId).toMatch(/^lctx_[0-9a-f]{24}$/);
+    expect(listing.fixedContextId).toMatch(/^lctx_[0-9a-f]{32}$/);
     expect(listing.contexts).toHaveLength(1);
 
     const result = await protocolClient.callTool({ name: 'synomem_list', arguments: {} });

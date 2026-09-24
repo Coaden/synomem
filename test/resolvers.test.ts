@@ -167,17 +167,23 @@ describe('remote context resolver', () => {
 });
 
 describe('local context resolver', () => {
-  it('derives a stable id from the store and canonical actor, never a display name', () => {
-    const a = localContextId('01STORE', { kind: 'agent', id: '01AGENT', displayName: 'Gracie' });
-    const renamed = localContextId('01STORE', {
+  it('mints a random 128-bit id per store and actor, stable across renames, never derived', () => {
+    const store = tempHome();
+    const other = tempHome();
+    const a = localContextId(store, { kind: 'agent', id: '01AGENT', displayName: 'Gracie' });
+    const renamed = localContextId(store, {
       kind: 'agent',
       id: '01AGENT',
       displayName: 'Gracie Renamed',
     });
-    const otherStore = localContextId('01OTHER', { kind: 'agent', id: '01AGENT' });
-    expect(a).toMatch(/^lctx_[0-9a-f]{24}$/);
+    const otherStore = localContextId(other, { kind: 'agent', id: '01AGENT' });
+    const otherActor = localContextId(store, { kind: 'agent', id: '01OTHER' });
+    expect(a).toMatch(/^lctx_[0-9a-f]{32}$/);
     expect(renamed).toBe(a);
     expect(otherStore).not.toBe(a);
+    expect(otherActor).not.toBe(a);
+    // Not a function of the tuple: a fresh store gives the same actor a new id.
+    expect(localContextId(tempHome(), { kind: 'agent', id: '01AGENT' })).not.toBe(otherStore);
   });
 
   it('binds one canonical actor in fixed mode and refuses any other context', async () => {

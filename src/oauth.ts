@@ -156,6 +156,20 @@ export async function discoverApiAuthorization(
   };
 }
 
+export const TOKEN_REQUEST_TIMEOUT_MS = 20_000;
+
+/*
+ * Failures that prove the request never reached the server. Anything else — a
+ * timeout, a reset mid-response — may have followed a committed rotation, so
+ * the refresh token it carried must be treated as spent (plan §6: never retry
+ * a possibly consumed token; reauthorize instead).
+ */
+const NOT_SENT = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH']);
+function neverDelivered(error: unknown): boolean {
+  const cause = (error as { cause?: { code?: unknown } } | undefined)?.cause;
+  return typeof cause?.code === 'string' && NOT_SENT.has(cause.code);
+}
+
 async function tokenRequest(
   endpoint: string,
   parameters: URLSearchParams,
@@ -168,10 +182,15 @@ async function tokenRequest(
       redirect: 'error',
       headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
       body: parameters,
+      // Well inside the credential lock's stale window, so a refresh can never
+      // outlive the lock that serializes it.
+      signal: AbortSignal.timeout(TOKEN_REQUEST_TIMEOUT_MS),
     });
   } catch (error) {
     if (error instanceof SynomemError) throw error;
-    throw new SynomemError('REMOTE_UNAVAILABLE', 'The OAuth token endpoint is unavailable.');
+    throw new SynomemError('REMOTE_UNAVAILABLE', 'The OAuth token endpoint is unavailable.', {
+      delivery: neverDelivered(error) ? 'not_sent' : 'indeterminate',
+    });
   }
   const text = await response.text();
   if (Buffer.byteLength(text) > maximumDocumentBytes) {

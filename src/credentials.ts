@@ -21,19 +21,21 @@
  * that names the explicit alternative.
  */
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
   existsSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
-  unlinkSync,
   writeSync,
 } from 'node:fs';
+import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { SynomemError } from './errors.js';
@@ -154,7 +156,18 @@ export class OsCredentialStore implements CredentialStore {
 
   constructor(options: { platform?: NodeJS.Platform; run?: CredentialCommandRunner } = {}) {
     this.platform = options.platform ?? process.platform;
-    this.run = options.run ?? command;
+    const run = options.run ?? command;
+    // A missing helper (a headless Linux box with no Secret Service) is a
+    // configuration answer, not a crash: name the explicit alternatives. There
+    // is still no fallback — the caller chooses --store file deliberately.
+    this.run = async (executable, arguments_, input) => {
+      try {
+        return await run(executable, arguments_, input);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') this.unsupported();
+        throw error;
+      }
+    };
   }
 
   async get(reference: string): Promise<StoredCredential | undefined> {
@@ -235,7 +248,7 @@ export class OsCredentialStore implements CredentialStore {
       'CONFIG_INVALID',
       this.platform === 'win32'
         ? 'Windows Credential Manager storage is not supported yet. Use --store file, or --store environment with SYNOMEM_ACCESS_TOKEN.'
-        : 'Operating-system credential storage needs the macOS Keychain, or secret-tool on Linux. Use --store file, or --store environment with SYNOMEM_ACCESS_TOKEN.',
+        : 'No operating-system credential store is available here (it needs the macOS Keychain, or secret-tool with a Secret Service on Linux). Choose one explicitly: --store file keeps it in a 0600 file under your Synomem home; --store environment reads SYNOMEM_ACCESS_TOKEN.',
     );
   }
 }
@@ -261,6 +274,8 @@ export class FileCredentialStore implements CredentialStore {
   async get(reference: string): Promise<StoredCredential | undefined> {
     const path = this.path(reference);
     if (!existsSync(path)) return undefined;
+    assertPrivate(this.directory, 0o700);
+    assertPrivate(path, 0o600);
     return parseStoredCredential(readFileSync(path, 'utf8'));
   }
 
@@ -282,6 +297,31 @@ export class FileCredentialStore implements CredentialStore {
   }
 }
 
+/*
+ * Like ssh with a private key: a credential file (or its directory) that other
+ * users can read, or that another user owns, is refused rather than used. The
+ * fix is the owner's to make; silently tightening it would hide that the
+ * secret may already have been exposed.
+ */
+function assertPrivate(path: string, expected: number): void {
+  if (process.platform === 'win32') return;
+  const stat = statSync(path);
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    throw new SynomemError(
+      'CONFIG_INVALID',
+      `${path} is owned by another user; refusing to use it.`,
+    );
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    throw new SynomemError(
+      'CONFIG_INVALID',
+      `${path} is accessible to other users (mode ${(stat.mode & 0o777).toString(8)}). ` +
+        `Run \`chmod ${expected.toString(8)} ${path}\` if you are sure it was not exposed, ` +
+        'otherwise remove it and sign in again.',
+    );
+  }
+}
+
 export interface CredentialStores {
   keychain: CredentialStore;
   file: CredentialStore;
@@ -294,10 +334,19 @@ export function defaultCredentialStores(home: string): CredentialStores {
 /**
  * A cross-process lock around one credential's refresh.
  *
- * `O_EXCL` creation is the mutual exclusion; a lock older than `staleMs` is
- * from a crashed process and is broken. The lock only serializes refreshes —
- * correctness against a concurrent writer is the generation compare-and-swap
- * in `refreshCredential`.
+ * `O_EXCL` creation is the mutual exclusion. The lock file records its owner
+ * (pid, host) and a random token. A lock is broken only when its owner is
+ * provably gone — a dead pid on this host — or, for an owner on another host
+ * or an unreadable file, once it is older than `staleMs`. A live owner is never
+ * preempted however long its refresh takes (the refresh request itself times
+ * out well inside `staleMs`).
+ *
+ * Breaking renames the file aside first and checks the token: if another
+ * process already broke and re-acquired it in between, the fresh lock is put
+ * back rather than deleted. Correctness against a concurrent writer is still
+ * the generation compare-and-swap in the refresh path; the lock exists so that
+ * only one process ever spends a given refresh token. Locks assume one host's
+ * filesystem; a home shared over a network filesystem is not supported.
  */
 export async function withCredentialLock<T>(
   home: string,
@@ -314,22 +363,16 @@ export async function withCredentialLock<T>(
   const staleMs = options.staleMs ?? 60_000;
   const deadline = Date.now() + (options.timeoutMs ?? 30_000);
   const pollMs = options.pollMs ?? 50;
+  const token = randomBytes(16).toString('hex');
+  const host = hostname();
   let descriptor: number | undefined;
   while (descriptor === undefined) {
     try {
       descriptor = openSync(path, 'wx', 0o600);
-      writeSync(descriptor, `${process.pid}\n`);
+      writeSync(descriptor, `${process.pid}\n${host}\n${token}\n`);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      try {
-        if (Date.now() - statSync(path).mtimeMs > staleMs) {
-          unlinkSync(path);
-          continue;
-        }
-      } catch {
-        // Removed between the failed open and the stat: try again at once.
-        continue;
-      }
+      if (breakIfAbandoned(path, host, staleMs)) continue;
       if (Date.now() > deadline) {
         throw new SynomemError(
           'DATABASE_BUSY',
@@ -343,6 +386,70 @@ export async function withCredentialLock<T>(
     return await operation();
   } finally {
     closeSync(descriptor);
-    rmSync(path, { force: true });
+    // Release only our own lock.
+    if (readLock(path)?.token === token) rmSync(path, { force: true });
   }
+}
+
+interface LockOwner {
+  pid: number;
+  host: string;
+  token: string;
+}
+
+function readLock(path: string): LockOwner | undefined {
+  try {
+    const [pid, host, token] = readFileSync(path, 'utf8').split('\n');
+    const parsed = Number(pid);
+    if (!Number.isSafeInteger(parsed) || !host || !token) return undefined;
+    return { pid: parsed, host, token };
+  } catch {
+    return undefined;
+  }
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: it exists but belongs to someone else — alive.
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** Returns true when the caller should immediately retry acquiring. */
+function breakIfAbandoned(path: string, host: string, staleMs: number): boolean {
+  let age: number;
+  try {
+    age = Date.now() - statSync(path).mtimeMs;
+  } catch {
+    return true; // Released between the failed open and now.
+  }
+  const owner = readLock(path);
+  // A lock whose contents are still being written is fresh, not abandoned.
+  if (!owner && age < 1_000) return false;
+  const abandoned = owner
+    ? owner.host === host
+      ? !processAlive(owner.pid)
+      : age > staleMs
+    : age > staleMs;
+  if (!abandoned) return false;
+  const aside = `${path}.broken-${randomBytes(6).toString('hex')}`;
+  try {
+    renameSync(path, aside);
+  } catch {
+    return true; // Someone else broke or released it first.
+  }
+  const taken = readLock(aside);
+  if (owner && taken?.token !== owner.token) {
+    // We grabbed a lock re-acquired after our inspection: restore it.
+    try {
+      linkSync(aside, path);
+    } catch {
+      /* a third process holds the path now; ours is the one to discard */
+    }
+  }
+  rmSync(aside, { force: true });
+  return true;
 }

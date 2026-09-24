@@ -8,7 +8,18 @@
  * each other's attribution. The resolver narrows (pins a context, restricts to a
  * preset); the server alone authorizes.
  */
-import { createHash } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeSync,
+} from 'node:fs';
+import { join } from 'node:path';
+import { atomicWriteFile } from './fs-utils.js';
 import { SynomemClient } from './client.js';
 import { describeIdentity, discoverContexts } from './discover.js';
 import { SynomemError } from './errors.js';
@@ -68,15 +79,90 @@ function required(): SynomemError {
 }
 
 /**
- * Stable local context id: derived from the store's persistent workspace id and the
- * canonical actor — never from a display name — so it survives renames and moving the
- * store, and an unrelated store with a same-named agent gets a different id.
+ * The stable local context id for one actor in one store, from the store's own
+ * context registry (`<home>/contexts.json`).
+ *
+ * The id is cryptographically random (128 bits) and minted the first time the
+ * actor is addressed, never derived from a name or from the canonical tuple:
+ * an id reveals nothing about its target and cannot be guessed. It survives
+ * renames and moving the store (the registry moves with it), and an unrelated
+ * store with a same-named agent has its own registry and so its own id.
+ * Minting is serialized across processes so two harnesses opening the store
+ * at once agree on one id.
  */
-export function localContextId(storeWorkspaceId: string, actor: ActorIdentity): string {
-  const digest = createHash('sha256')
-    .update(`${storeWorkspaceId}\0${actor.kind}\0${actor.id}`)
-    .digest('hex');
-  return `lctx_${digest.slice(0, 24)}`;
+export function localContextId(home: string, actor: ActorIdentity): string {
+  const path = join(home, 'contexts.json');
+  const key = `${actor.kind}:${actor.id}`;
+  const existing = readRegistry(path).contexts[key];
+  if (existing) return existing;
+  return withRegistryLock(home, () => {
+    const registry = readRegistry(path);
+    const current = registry.contexts[key];
+    if (current) return current;
+    const id = `lctx_${randomBytes(16).toString('hex')}`;
+    registry.contexts[key] = id;
+    atomicWriteFile(path, `${JSON.stringify(registry, null, 2)}\n`, 0o600);
+    return id;
+  });
+}
+
+interface ContextRegistry {
+  version: 1;
+  contexts: Record<string, string>;
+}
+
+function readRegistry(path: string): ContextRegistry {
+  if (!existsSync(path)) return { version: 1, contexts: {} };
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<ContextRegistry>;
+    if (parsed.version === 1 && parsed.contexts && typeof parsed.contexts === 'object') {
+      return { version: 1, contexts: { ...parsed.contexts } };
+    }
+  } catch {
+    /* fall through */
+  }
+  throw new SynomemError('CONFIG_INVALID', `${path} is not a valid Synomem context registry.`);
+}
+
+/** A short synchronous O_EXCL lock; a dead or old owner is broken. */
+function withRegistryLock<T>(home: string, operation: () => T): T {
+  const lock = join(home, 'contexts.json.lock');
+  const deadline = Date.now() + 10_000;
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) {
+    try {
+      const descriptor = openSync(lock, 'wx', 0o600);
+      writeSync(descriptor, `${process.pid}\n`);
+      closeSync(descriptor);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      try {
+        const pid = Number(readFileSync(lock, 'utf8').trim());
+        const old = Date.now() - statSync(lock).mtimeMs > 5_000;
+        let alive = Number.isSafeInteger(pid) && pid > 0;
+        if (alive) {
+          try {
+            process.kill(pid, 0);
+          } catch (probe) {
+            alive = (probe as NodeJS.ErrnoException).code === 'EPERM';
+          }
+        }
+        if (!alive || old) rmSync(lock, { force: true });
+      } catch {
+        /* released meanwhile */
+      }
+      if (Date.now() > deadline) {
+        throw new SynomemError('DATABASE_BUSY', 'The local context registry is locked. Try again.');
+      }
+      Atomics.wait(sleeper, 0, 0, 20);
+    }
+  }
+  try {
+    return operation();
+  } finally {
+    rmSync(lock, { force: true });
+  }
 }
 
 /**
@@ -240,7 +326,7 @@ export function createLocalResolver(
       return {
         service: client,
         context: {
-          contextId: localContextId(capabilities.binding.workspaceId, actor),
+          contextId: localContextId(options.home, actor),
           organizationId: null,
           workspaceId: capabilities.binding.workspaceId,
           actor,

@@ -1,4 +1,4 @@
-import { statSync, writeFileSync, mkdirSync } from 'node:fs';
+import { chmodSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
@@ -96,13 +96,45 @@ describe('credential stores', () => {
 
   it('refuses the old installation-key format instead of reading it', async () => {
     const home = tempHome();
-    mkdirSync(join(home, 'credentials'), { recursive: true });
+    mkdirSync(join(home, 'credentials'), { recursive: true, mode: 0o700 });
     writeFileSync(
       join(home, 'credentials', 'old.json'),
       JSON.stringify({ kind: 'installation-key', accessToken: 'syn_old' }),
+      { mode: 0o600 },
     );
     await expect(new FileCredentialStore(home).get('old')).rejects.toMatchObject({
       code: 'AUTH_REQUIRED',
+    });
+  });
+
+  it('explains a missing OS credential store instead of crashing, with no fallback', async () => {
+    const missing = Object.assign(new Error('spawn secret-tool ENOENT'), { code: 'ENOENT' });
+    const store = new OsCredentialStore({
+      platform: 'linux',
+      run: async () => {
+        throw missing;
+      },
+    });
+    const refused: unknown = await store
+      .set('ref-x', { kind: 'access-key', secret: 'syn_secret' })
+      .catch((error: unknown) => error);
+    expect(refused).toMatchObject({ code: 'CONFIG_INVALID' });
+    expect((refused as Error).message).toContain('--store file');
+  });
+
+  it('refuses a credential file or directory other users can read, like ssh', async () => {
+    const home = tempHome();
+    const store = new FileCredentialStore(home);
+    await store.set('ref-open', { kind: 'access-key', secret: 'syn_secret' });
+    chmodSync(join(home, 'credentials', 'ref-open.json'), 0o644);
+    await expect(store.get('ref-open')).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
+    chmodSync(join(home, 'credentials', 'ref-open.json'), 0o600);
+    chmodSync(join(home, 'credentials'), 0o755);
+    await expect(store.get('ref-open')).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
+    chmodSync(join(home, 'credentials'), 0o700);
+    await expect(store.get('ref-open')).resolves.toEqual({
+      kind: 'access-key',
+      secret: 'syn_secret',
     });
   });
 

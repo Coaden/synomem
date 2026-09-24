@@ -4,12 +4,7 @@ import { spawn } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Command, CommanderError, Option } from 'commander';
-import {
-  ensureLocalStore,
-  LOCAL_OPERATOR,
-  localStoreWorkspaceId,
-  openLocalService,
-} from './backend.js';
+import { ensureLocalStore, LOCAL_OPERATOR, openLocalService } from './backend.js';
 import { cloudApiUrl } from './cloud.js';
 import { resolveHome } from './config.js';
 import {
@@ -509,7 +504,7 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         if (!handle) throw new SynomemError('INVALID_INPUT', 'An agent handle is required.');
         const profileName = assertName(options.profileName ?? handle, 'profile');
         const store = profileStoreFor(global.home);
-        const storeConfig = ensureLocalStore(global.home);
+        ensureLocalStore(global.home);
         const config = store.read();
 
         const existing = config.profiles[profileName];
@@ -568,7 +563,7 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
           ...(global.explicitHome ? { home: global.home } : {}),
           actorId: agent.id,
           actorName: agent.displayName,
-          contextId: localContextId(storeConfig.workspaceId, actor),
+          contextId: localContextId(global.home, actor),
         };
         const next: ProfilesConfig = {
           ...config,
@@ -1017,7 +1012,7 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
             ...(storeHome !== global.home ? { home: storeHome } : {}),
             actorId: agent.id,
             actorName: agent.displayName,
-            contextId: localContextId(localStoreWorkspaceId(storeHome), {
+            contextId: localContextId(storeHome, {
               kind: 'agent',
               id: agent.id,
             }),
@@ -1629,7 +1624,7 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
             ...(created.storeHome !== global.home ? { home: created.storeHome } : {}),
             actorId: agent.id,
             actorName: agent.displayName,
-            contextId: localContextId(localStoreWorkspaceId(created.storeHome), {
+            contextId: localContextId(created.storeHome, {
               kind: 'agent',
               id: agent.id,
             }),
