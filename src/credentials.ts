@@ -39,7 +39,7 @@ import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { SynomemError } from './errors.js';
-import { atomicWriteFile } from './fs-utils.js';
+import { atomicWriteFile, isTransientSharingError } from './fs-utils.js';
 
 const serviceName = 'ai.synomem.credentials';
 const maximumOutputBytes = 128 * 1024;
@@ -276,7 +276,7 @@ export class FileCredentialStore implements CredentialStore {
     if (!existsSync(path)) return undefined;
     assertPrivate(this.directory, 0o700);
     assertPrivate(path, 0o600);
-    return parseStoredCredential(readFileSync(path, 'utf8'));
+    return parseStoredCredential(readWithRetry(path));
   }
 
   async set(reference: string, credential: StoredCredential): Promise<void> {
@@ -294,6 +294,18 @@ export class FileCredentialStore implements CredentialStore {
     if (!existsSync(path)) return false;
     rmSync(path, { force: true });
     return true;
+  }
+}
+
+/** A read that tolerates a concurrent atomic replace on Windows. */
+function readWithRetry(path: string): string {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return readFileSync(path, 'utf8');
+    } catch (error) {
+      if (!isTransientSharingError(error) || attempt >= 40) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
   }
 }
 
@@ -371,8 +383,12 @@ export async function withCredentialLock<T>(
       descriptor = openSync(path, 'wx', 0o600);
       writeSync(descriptor, `${process.pid}\n${host}\n${token}\n`);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      if (breakIfAbandoned(path, host, staleMs)) continue;
+      // On Windows a just-released lock can linger as "delete pending" while
+      // another process still has it open: creating it again fails with a
+      // sharing error rather than EEXIST. That is "busy", not a failure.
+      const busy = isTransientSharingError(error);
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST' && !busy) throw error;
+      if (!busy && breakIfAbandoned(path, host, staleMs)) continue;
       if (Date.now() > deadline) {
         throw new SynomemError(
           'DATABASE_BUSY',
@@ -386,8 +402,19 @@ export async function withCredentialLock<T>(
     return await operation();
   } finally {
     closeSync(descriptor);
-    // Release only our own lock.
-    if (readLock(path)?.token === token) rmSync(path, { force: true });
+    // Release only our own lock. On Windows another process may be reading it
+    // at this instant; that is a transient sharing error, retried briefly.
+    if (readLock(path)?.token === token) {
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          rmSync(path, { force: true });
+          break;
+        } catch (error) {
+          if (!isTransientSharingError(error) || attempt >= 40) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
+    }
   }
 }
 

@@ -48,6 +48,35 @@ export function atomicWriteDerivedFile(path: string, content: string, mode = 0o6
   atomicWrite(path, content, mode, false);
 }
 
+/*
+ * Windows sharing violations are transient: a rename onto (or a create of) a
+ * name another process still holds open, or that was just deleted while open,
+ * fails with EPERM/EACCES/EBUSY until that handle closes. POSIX never reports
+ * these for a rename, so outside Windows they are real errors, surfaced at once.
+ */
+export function isTransientSharingError(error: unknown): boolean {
+  if (process.platform !== 'win32') return false;
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'EPERM' || code === 'EACCES' || code === 'EBUSY';
+}
+
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+function pause(ms: number): void {
+  Atomics.wait(sleeper, 0, 0, ms);
+}
+
+function renameWithRetry(from: string, to: string): void {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      renameSync(from, to);
+      return;
+    } catch (error) {
+      if (!isTransientSharingError(error) || attempt >= 40) throw error;
+      pause(25);
+    }
+  }
+}
+
 function atomicWrite(path: string, content: string, mode: number, durable: boolean): void {
   ensureDirectory(dirname(path));
   const temporary = resolve(
@@ -61,7 +90,7 @@ function atomicWrite(path: string, content: string, mode: number, durable: boole
     if (durable) fsyncSync(descriptor);
     closeSync(descriptor);
     descriptor = undefined;
-    renameSync(temporary, path);
+    renameWithRetry(temporary, path);
     if (durable)
       try {
         const directoryDescriptor = openSync(dirname(path), 'r');
