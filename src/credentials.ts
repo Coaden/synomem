@@ -402,18 +402,23 @@ export async function withCredentialLock<T>(
     return await operation();
   } finally {
     closeSync(descriptor);
-    // Release only our own lock. On Windows another process may be reading it
-    // at this instant; that is a transient sharing error, retried briefly.
-    if (readLock(path)?.token === token) {
-      for (let attempt = 0; ; attempt += 1) {
-        try {
-          rmSync(path, { force: true });
-          break;
-        } catch (error) {
-          if (!isTransientSharingError(error) || attempt >= 40) throw error;
-          await new Promise((resolve) => setTimeout(resolve, 25));
-        }
-      }
+    // Release only our own lock.
+    if (readLock(path)?.token === token) await removeLock(path);
+  }
+}
+
+/**
+ * On Windows another process may be reading the lock at the instant it is
+ * released; that is a transient sharing error, retried briefly.
+ */
+async function removeLock(path: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      rmSync(path, { force: true });
+      return;
+    } catch (error) {
+      if (!isTransientSharingError(error) || attempt >= 40) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
 }
