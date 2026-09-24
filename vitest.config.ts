@@ -8,6 +8,7 @@ export default defineConfig({
       include: ['src/**/*.ts'],
       exclude: ['src/mcp-server.ts'],
     },
-    testTimeout: 15_000,
+    // The Windows runner's filesystem makes SQLite-heavy tests several times slower.
+    testTimeout: process.platform === 'win32' ? 60_000 : 15_000,
   },
 });

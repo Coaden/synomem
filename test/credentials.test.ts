@@ -88,8 +88,11 @@ describe('credential stores', () => {
       oauthCredential({ expiresAt: expect.any(Number) as number }),
     );
     expect(await store.get('ref-key')).toEqual({ kind: 'access-key', secret: 'syn_abc.def' });
-    expect(statSync(join(home, 'credentials', 'ref-key.json')).mode & 0o777).toBe(0o600);
-    expect(statSync(join(home, 'credentials')).mode & 0o777).toBe(0o700);
+    // Windows has no POSIX modes; there the file relies on the user profile's ACLs.
+    if (process.platform !== 'win32') {
+      expect(statSync(join(home, 'credentials', 'ref-key.json')).mode & 0o777).toBe(0o600);
+      expect(statSync(join(home, 'credentials')).mode & 0o777).toBe(0o700);
+    }
     expect(await store.delete('ref-key')).toBe(true);
     expect(await store.get('ref-key')).toBeUndefined();
   });
@@ -122,21 +125,24 @@ describe('credential stores', () => {
     expect((refused as Error).message).toContain('--store file');
   });
 
-  it('refuses a credential file or directory other users can read, like ssh', async () => {
-    const home = tempHome();
-    const store = new FileCredentialStore(home);
-    await store.set('ref-open', { kind: 'access-key', secret: 'syn_secret' });
-    chmodSync(join(home, 'credentials', 'ref-open.json'), 0o644);
-    await expect(store.get('ref-open')).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
-    chmodSync(join(home, 'credentials', 'ref-open.json'), 0o600);
-    chmodSync(join(home, 'credentials'), 0o755);
-    await expect(store.get('ref-open')).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
-    chmodSync(join(home, 'credentials'), 0o700);
-    await expect(store.get('ref-open')).resolves.toEqual({
-      kind: 'access-key',
-      secret: 'syn_secret',
-    });
-  });
+  it.skipIf(process.platform === 'win32')(
+    'refuses a credential file or directory other users can read, like ssh',
+    async () => {
+      const home = tempHome();
+      const store = new FileCredentialStore(home);
+      await store.set('ref-open', { kind: 'access-key', secret: 'syn_secret' });
+      chmodSync(join(home, 'credentials', 'ref-open.json'), 0o644);
+      await expect(store.get('ref-open')).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
+      chmodSync(join(home, 'credentials', 'ref-open.json'), 0o600);
+      chmodSync(join(home, 'credentials'), 0o755);
+      await expect(store.get('ref-open')).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
+      chmodSync(join(home, 'credentials'), 0o700);
+      await expect(store.get('ref-open')).resolves.toEqual({
+        kind: 'access-key',
+        secret: 'syn_secret',
+      });
+    },
+  );
 
   it('round-trips through the macOS keychain and Linux secret-tool helpers', async () => {
     for (const platform of ['darwin', 'linux'] as const) {

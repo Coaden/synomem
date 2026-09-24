@@ -44,14 +44,15 @@ describe('posts', () => {
     // getItem() dispatched every kind except 'post' and 'todo' to getTask,
     // so items.get('post id') failed with a task-store "not found" even
     // though posts.get on the same id works fine.
-    const { operator, mycroft } = await workspace();
+    const { operator, mycroft, atlas } = await workspace();
     const post = await mycroft.posts.create({
       title: 'Migration is landing tonight',
       body: 'Expect a short read-only window around 22:00.',
     });
     const seen = (await operator.items.get(post.record.event.id)) as { title: string };
     expect(seen.title).toBe('Migration is landing tonight');
-    await Promise.all([operator.close(), mycroft.close()]);
+    // Every client must close: Windows cannot delete a directory with an open SQLite handle.
+    await Promise.all([operator.close(), mycroft.close(), atlas.close()]);
   });
 
   it('records an acknowledgement per actor, and only for that actor', async () => {

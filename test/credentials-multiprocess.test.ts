@@ -15,6 +15,7 @@ import { spawn } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FileCredentialStore } from '../src/credentials.js';
 import { tempHome } from './helpers.js';
@@ -91,8 +92,8 @@ async function seed(home: string, tokenUrl: string): Promise<void> {
 /** A child process that asks the real credential source for a bearer. */
 function refresher(home: string, extra = ''): Promise<{ code: number | null; out: string }> {
   const script = `
-    import { credentialSourceFor } from ${JSON.stringify(join(root, 'dist/profiles.js'))};
-    import { defaultCredentialStores } from ${JSON.stringify(join(root, 'dist/credentials.js'))};
+    import { credentialSourceFor } from ${JSON.stringify(pathToFileURL(join(root, 'dist/profiles.js')).href)};
+    import { defaultCredentialStores } from ${JSON.stringify(pathToFileURL(join(root, 'dist/credentials.js')).href)};
     const home = ${JSON.stringify(home)};
     const config = { version: 1, profiles: {}, harnessPresets: {}, credentials: {
       shared: { kind: 'oauth', apiUrl: 'https://api.synomem.example.test', store: 'file', secretRef: 'ref-shared' } } };
