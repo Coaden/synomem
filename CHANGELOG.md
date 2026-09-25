@@ -3,6 +3,13 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
+## 0.9.6
+
+- Local stores: a human now sees agents' todos, as the hosted API already lets workspace owners and
+  admins. Todos and notes are hidden from other agents, not from the humans responsible for them.
+- Skill, MCP and docs wording: notes and todos are "not visible to other agents" instead of
+  "private", and the dashboard caveat is gone.
+
 ## 0.9.5
 
 - MCP: tag fields no longer advertise the `\p{L}\p{N}` Unicode pattern in tool JSON Schemas.

@@ -1375,22 +1375,20 @@ export class SynomemStorage implements SynomemRepository {
     }
 
     /*
-     * Private todos are owner-only for EVERY viewer, including a human.
-     *
-     * The visibility rules below exempt human actors, on the reasoning that a
-     * person operating a local home is its operator. That does not extend to
-     * todos: the plan is explicit that a todo is visible only to its owner
-     * except through an explicitly authorized administrative capability, and
-     * this release has no such capability. Without this clause a human actor
-     * would see every agent's private reminders in an item list.
+     * A todo is hidden from other agents, never from the human operating this home: humans are
+     * exempt from every private-record rule here (they are this store's administrators), and the
+     * hosted API grants the same to workspace owners and admins. Agents and system actors see only
+     * their own todos.
      */
-    add(
-      `(kind != 'todo' OR (owner_agent_id = ? AND ? = 'agent') OR (actor_id = ? AND actor_kind = ?))`,
-      viewer.id,
-      viewer.kind,
-      viewer.id,
-      viewer.kind,
-    );
+    if (viewer.kind !== 'human') {
+      add(
+        `(kind != 'todo' OR (owner_agent_id = ? AND ? = 'agent') OR (actor_id = ? AND actor_kind = ?))`,
+        viewer.id,
+        viewer.kind,
+        viewer.id,
+        viewer.kind,
+      );
+    }
 
     if (viewer.kind !== 'human') {
       if (viewer.kind === 'agent') {

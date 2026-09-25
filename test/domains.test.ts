@@ -585,17 +585,20 @@ describe('unanswered and overdue discovery', () => {
     await gracie.close();
   });
 
-  it('never shows another actor a private todo, even to a human', async () => {
+  it("shows the human operating the home an agent's todos, but not other agents", async () => {
     const home = tempHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
-    await gracie.todos.create({ title: 'Private to gracie' });
+    await gracie.todos.create({ title: 'Gracie reminder' });
     await gracie.close();
 
-    // A human actor is the operator of a local home, and the visibility rules
-    // exempt humans generally — but not from another actor's private todos.
+    // Todos are hidden from other agents, not from the humans responsible for the agent.
     const troy = await testClient(home, { kind: 'human', id: 'troy' });
     const listed = await troy.items.list({ kinds: ['todo'] });
-    expect(listed.items).toHaveLength(0);
+    expect(listed.items.map((item) => item.title)).toEqual(['Gracie reminder']);
     await troy.close();
+
+    const codex = await testClient(home, { kind: 'agent', id: 'codex' });
+    expect((await codex.items.list({ kinds: ['todo'] })).items).toHaveLength(0);
+    await codex.close();
   });
 });
