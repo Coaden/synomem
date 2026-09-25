@@ -3,6 +3,14 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
+## 0.9.5
+
+- MCP: tag fields no longer advertise the `\p{L}\p{N}` Unicode pattern in tool JSON Schemas.
+  A JSON Schema `pattern` carries no regex flags, so hosts that compile it outside JavaScript
+  rejected the tool — ChatGPT refused the whole tool list with "Invalid MCP tool schema for tool
+  'synomem_kudos_give'". The rule is unchanged and still enforced; it is checked in code and
+  described in text instead of advertised as a pattern.
+
 ## 0.9.4
 
 - macOS Keychain: credentials are now actually stored. `security add-generic-password -w`

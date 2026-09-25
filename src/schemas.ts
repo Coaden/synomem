@@ -288,12 +288,23 @@ export const kudosTitleSchema = z
   .max(200)
   .regex(/^[^\r\n]+$/, 'Kudos titles must be a single line');
 
+const TAG_PATTERN = /^[\p{L}\p{N}][\p{L}\p{N}._-]*$/u;
+
+/**
+ * Checked with `refine`, not `.regex`, so the rule never reaches an advertised JSON Schema:
+ * `\p{…}` needs the `u` flag, which a JSON Schema `pattern` cannot carry, and hosts that
+ * compile patterns outside JavaScript (ChatGPT) reject the whole tool over it.
+ */
 export const kudosTagSchema = z
   .string()
   .trim()
   .min(1)
   .max(64)
-  .regex(/^[\p{L}\p{N}][\p{L}\p{N}._-]*$/u);
+  .refine(
+    (tag) => TAG_PATTERN.test(tag),
+    'Tags start with a letter or digit, then letters, digits, ".", "_" or "-"',
+  )
+  .describe('A letter or digit, then letters, digits, ".", "_" or "-"');
 
 const kudosGivenSchema = baseEventSchema.extend({
   type: z.literal('kudos.given'),

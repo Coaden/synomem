@@ -138,13 +138,15 @@ describe('MCP protocol integration', () => {
       ?.inputSchema as {
       type?: string;
       required?: string[];
-      properties?: { tags?: { items?: { pattern?: string } } };
+      properties?: { tags?: { items?: { pattern?: string; description?: string } } };
     };
     expect(giveSchema.type).toBe('object');
     expect(giveSchema.required).toEqual(
       expect.arrayContaining(['recipientAgentId', 'title', 'reason']),
     );
-    expect(giveSchema.properties?.tags?.items?.pattern).toBeTruthy();
+    // The tag rule is enforced by refine, never advertised (see the portable-pattern test).
+    expect(giveSchema.properties?.tags?.items?.pattern).toBeUndefined();
+    expect(giveSchema.properties?.tags?.items?.description).toBeTruthy();
     const templates = await protocolClient.listResourceTemplates();
     expect(templates.resourceTemplates.map((resource) => resource.uriTemplate)).toContain(
       'synomem://contexts/{contextId}/agents/{agentId}/inbox',
@@ -483,6 +485,49 @@ describe('MCP protocol integration', () => {
     await protocolClient.close();
     await runtime.close();
   });
+  it('advertises only regex patterns every host can compile', async () => {
+    // ChatGPT refused the whole tool list over one `\p{L}` tag pattern: a JSON Schema
+    // `pattern` has no flags, so a Unicode property escape only means something to a JavaScript
+    // engine running with `u`. Keep advertised patterns to the portable subset.
+    const home = tempHome();
+    const { runtime, protocolClient } = await setupRuntime(home);
+    const tools = (await protocolClient.listTools()).tools;
+    const patterns: Array<{ tool: string; pattern: string }> = [];
+    const walk = (tool: string, node: unknown): void => {
+      if (Array.isArray(node)) return node.forEach((child) => walk(tool, child));
+      if (typeof node !== 'object' || node === null) return;
+      for (const [key, value] of Object.entries(node)) {
+        if (key === 'pattern' && typeof value === 'string') patterns.push({ tool, pattern: value });
+        else walk(tool, value);
+      }
+    };
+    for (const tool of tools) walk(tool.name, [tool.inputSchema, tool.outputSchema]);
+    expect(patterns.length).toBeGreaterThan(0);
+    for (const { tool, pattern } of patterns) {
+      expect(pattern, tool).not.toMatch(/\\[pPu]\{|\(\?<[=!]?|\(\?[a-z]/);
+      expect(() => new RegExp(pattern), tool).not.toThrow();
+    }
+
+    // The tag rule itself still holds; it is checked, just not advertised.
+    const refused = await protocolClient.callTool({
+      name: 'synomem_kudos_give',
+      arguments: { recipientAgentId: 'codex', title: 'Caught it', reason: 'Why', tags: ['-bad'] },
+    });
+    expect(refused.isError).toBe(true);
+    const accepted = await protocolClient.callTool({
+      name: 'synomem_kudos_give',
+      arguments: {
+        recipientAgentId: 'codex',
+        title: 'Caught it',
+        reason: 'Why',
+        tags: ['café.review'],
+      },
+    });
+    expect(accepted.isError, JSON.stringify(accepted.content)).toBeFalsy();
+    await protocolClient.close();
+    await runtime.close();
+  });
+
   it('registers every tool in exactly one of the context or discovery inventories', async () => {
     const home = tempHome();
     const { runtime, protocolClient } = await setupRuntime(home);
