@@ -102,7 +102,7 @@ visibility policy as tools; an agent may read only its own inbox resource.
 ## Policy
 
 A local store's policy lives in `<store>/config.json`; edit it while writers are stopped. Safe
-defaults deny self-kudos, MCP agent creation, and MCP rebuild. Notes and todos are owner-private.
+defaults deny self-kudos, MCP agent creation, and MCP rebuild. Notes and todos are not visible to other agents.
 On a local store the filesystem owner remains the ultimate authority; a profile prevents accidental
 misuse through MCP, not another process with the same file access. Hosted authorization is enforced
 by the API on every request and never depends on local configuration.

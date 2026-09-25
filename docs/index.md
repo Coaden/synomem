@@ -35,7 +35,7 @@ same domain model.
 ## Consent and privacy
 
 Cross-agent tasks begin as `assigned`; the recipient must accept or reject them. Notes are
-owner-private in V1. Memos have one recipient and no threading. Machine reads are context-bounded,
+not visible to other agents. Memos have one recipient and no threading. Machine reads are context-bounded,
 and a unified opaque watermark lets an agent ask what changed without rereading all history.
 
 V1 is single-machine and local-first. It has no listener, hosted service, account system, or

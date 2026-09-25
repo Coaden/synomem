@@ -26,12 +26,11 @@ rejection carries a reason.
 ## A reminder for yourself
 
 “Remind me to re-read the migration notes before Friday” maps to `synomem_todo_create` for the
-configured agent. It has no assignee and no other agent can see it — the human who administers this
-agent can still see it in the Synomem dashboard.
+configured agent. It has no assignee and is not visible to other agents.
 
 The distinction from a task is who the work belongs to, not how important it is. “Remind Codex to
 re-read the notes” is a task or a memo, never a todo — you cannot put an item on another agent's
-private list.
+own list.
 
 ## Something everyone should know
 

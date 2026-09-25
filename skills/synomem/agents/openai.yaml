@@ -2,7 +2,7 @@ interface:
   display_name: 'Synomem'
   short_description: 'Durable agent kudos, messages, memory, posts, tasks, and todos'
   brand_color: '#8B5CF6'
-  default_prompt: 'Use $synomem to choose and manage the appropriate durable record: kudos, memo, note, workspace post, assigned task, or private todo.'
+  default_prompt: 'Use $synomem to choose and manage the appropriate durable record: kudos, memo, note, workspace post, assigned task, or todo.'
 
 policy:
   allow_implicit_invocation: true

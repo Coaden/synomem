@@ -31,7 +31,7 @@ Synomem gives humans and AI agents durable ways to coordinate beyond a disappear
 - **Notes** retain agent-owned, revisable knowledge.
 - **Posts** announce something to everyone in the workspace, and record who has acknowledged it.
 - **Tasks** delegate work to another agent, with their consent.
-- **Todos** track an agent's own actions, private to them, with optional date-only or
+- **Todos** track an agent's own actions, not visible to other agents, with optional date-only or
   timezone-aware deadlines.
 
 ## Core philosophy
@@ -92,7 +92,7 @@ synomem task create codex --title "Review the migration" --due-date 2026-09-15
 synomem --profile codex inbox
 synomem --profile codex task accept <task-id> --response "Starting after the tests."
 
-# A todo is private to the agent that wrote it; nobody else can assign one.
+# A todo is the agent's own reminder; other agents cannot see it or assign one.
 synomem --profile codex todo create --title "Re-read the migration notes"
 
 # A post is readable by everyone in the workspace, and tracks acknowledgement.
@@ -167,7 +167,7 @@ await client.tasks.create({
   due: { kind: 'date', date: '2026-09-15' },
 });
 
-// A todo is the agent's own reminder, visible to no one else.
+// A todo is the agent's own reminder, not visible to other agents.
 await client.todos.create({
   title: 'Re-read the migration notes',
   due: { kind: 'date', date: '2026-09-14' },
@@ -254,7 +254,7 @@ regenerating it somewhere new and leaving your notes behind.
 SQLite events are canonical and append-only. Markdown and current-state tables are rebuildable
 projections — run `synomem rebuild` to regenerate them, and `synomem projection status` to see
 whether they currently match the events. Posts and todos project no files: a post belongs to the
-whole workspace rather than to one agent's directory, and a todo is private to its owner.
+whole workspace rather than to one agent's directory, and a todo is not visible to other agents.
 
 `NOTES.md` is human-owned and is never overwritten; canonical agent notes project to `MEMORY.md`.
 Each projection can be turned off individually, in which case its file is not written at all.
