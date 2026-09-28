@@ -1,4 +1,9 @@
-import type { ActorDirectoryInput, ActorProfile, ActorProfileInput } from './actor-directory.js';
+import type {
+  ActorDirectoryInput,
+  ActorDirectoryPage,
+  ActorProfile,
+  ActorProfileInput,
+} from './actor-directory.js';
 import type {
   NotificationInput as HpNotificationInput,
   NotificationPage as HpNotificationPage,
@@ -286,7 +291,7 @@ export class RemoteSynomemService implements SynomemService {
         `actor-directory/${input.target.kind}/${encodeURIComponent(input.target.id)}/profile${queryString({ after: input.after, limit: input.limit })}`,
       ),
     list: (input: ActorDirectoryInput = {}) =>
-      this.request<AddressableActor[]>('GET', `actor-directory${queryString(input)}`),
+      this.request<ActorDirectoryPage>('GET', `actor-directory${queryString(input)}`),
     get: (ref: ActorRef) =>
       this.request<AddressableActor>(
         'GET',

@@ -1,4 +1,9 @@
-import type { ActorDirectoryInput } from './actor-directory.js';
+import {
+  actorDirectoryBinding,
+  actorDirectoryKey,
+  parseActorDirectoryKey,
+} from './actor-directory.js';
+import type { ActorDirectoryInput, ActorDirectoryPage } from './actor-directory.js';
 import type { SQLInputValue as HpSQLInputValue } from 'node:sqlite';
 import { SqlBookmarkRepository, bookmarkTables } from './bookmarks.js';
 import { SqlNotificationRepository, notificationTables } from './notifications.js';
@@ -2137,29 +2142,56 @@ CREATE TABLE mutation_receipts(actor_kind TEXT NOT NULL,actor_id TEXT NOT NULL,k
     ) as { count: bigint };
     return { kudosReceived: Number(kudos.count), usefulReceived: Number(useful.count) };
   }
-  listActors(input: ActorDirectoryInput = {}): AddressableActor[] {
+  listActors(input: ActorDirectoryInput = {}, viewer: ActorIdentity): ActorDirectoryPage {
     const query = (input.query ?? '').toLowerCase();
-    return (
-      this.prepare(
-        `SELECT kind,id,handle,display_name,status FROM (
+    const binding = actorDirectoryBinding(this.config.workspaceId, viewer, input);
+    const position = input.cursor
+      ? this.cursorCodec!.decode(input.cursor, binding, '0')
+      : undefined;
+    const after = position?.id ? parseActorDirectoryKey(position.id) : undefined;
+    const source = `(
       SELECT 'human' AS kind,id,handle,display_name,status FROM human_actors
       UNION ALL SELECT 'agent' AS kind,id,json_extract(profile_json,'$.handle') AS handle,display_name,
       CASE WHEN json_extract(profile_json,'$.status')='archived' THEN 'inactive' ELSE 'active' END AS status FROM agents
-    ) WHERE status='active' AND (? IS NULL OR kind=?) AND (?='' OR instr(lower(id||' '||handle||' '||display_name),?)>0) ORDER BY kind,handle,id LIMIT ?`,
-      ).all(input.kind ?? null, input.kind ?? null, query, query, input.limit ?? 20) as Array<{
-        kind: 'human' | 'agent';
-        id: string;
-        handle: string;
-        display_name: string;
-        status: 'active';
-      }>
-    ).map((row) => ({
+    )`;
+    const filter = `status='active' AND (? IS NULL OR kind=?) AND (?='' OR instr(lower(id||' '||handle||' '||display_name),?)>0)`;
+    const values = [input.kind ?? null, input.kind ?? null, query, query];
+    const total = this.prepare(`SELECT COUNT(*) AS count FROM ${source} WHERE ${filter}`).get(
+      ...values,
+    ) as { count: bigint };
+    const rows = this.prepare(
+      `SELECT kind,id,handle,display_name,status FROM ${source} WHERE ${filter}${after ? ' AND (kind,handle,id)>(?,?,?)' : ''} ORDER BY kind,handle,id LIMIT ?`,
+    ).all(...values, ...(after ?? []), (input.limit ?? 20) + 1) as Array<{
+      kind: 'human' | 'agent';
+      id: string;
+      handle: string;
+      display_name: string;
+      status: 'active';
+    }>;
+    const limit = input.limit ?? 20;
+    const hasMore = rows.length > limit;
+    const items = rows.slice(0, limit).map((row) => ({
       kind: row.kind,
       id: row.id,
       handle: row.handle,
       displayName: row.display_name,
       status: row.status,
     }));
+    return {
+      items,
+      total: Number(total.count),
+      limit,
+      hasMore,
+      ...(hasMore
+        ? {
+            nextCursor: this.cursorCodec!.encode(binding, {
+              sequence: '0',
+              watermark: '0',
+              id: actorDirectoryKey(items.at(-1)!),
+            }),
+          }
+        : {}),
+    };
   }
 
   registerHuman(actor: AddressableActor): void {

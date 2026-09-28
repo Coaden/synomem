@@ -1,4 +1,14 @@
-export type { ActorDirectoryInput, ActorProfile, ActorProfileInput } from './actor-directory.js';
+export type {
+  ActorDirectoryInput,
+  ActorDirectoryPage,
+  ActorProfile,
+  ActorProfileInput,
+} from './actor-directory.js';
+export {
+  actorDirectoryBinding,
+  actorDirectoryKey,
+  parseActorDirectoryKey,
+} from './actor-directory.js';
 export { SynomemClient, SynomemCore } from './client.js';
 export type { SynomemCoreOptions } from './client.js';
 export type { ProjectionWriter } from './ports/projections.js';

@@ -968,6 +968,7 @@ export async function createSynomemMcpServer(
       inputSchema: z.object({
         query: z.string().max(50).optional(),
         kind: z.enum(['human', 'agent']).optional(),
+        cursor: z.string().max(4096).optional(),
         limit: z.number().int().min(1).max(50).optional(),
       }),
       outputSchema,
@@ -975,8 +976,8 @@ export async function createSynomemMcpServer(
     },
     async (input, { client, actor }) => {
       try {
-        const actors = await client.actors.list(input);
-        return success(actor, `Found ${actors.length} actors.`, { actors });
+        const page = await client.actors.list(input);
+        return success(actor, `Found ${page.items.length} actors.`, { page });
       } catch (error) {
         return failure(actor, error);
       }

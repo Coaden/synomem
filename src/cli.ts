@@ -472,21 +472,22 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .description('Search addressable humans and agents')
     .option('--query <text>', 'Search name, handle or ID')
     .option('--kind <kind>', 'human or agent')
+    .option('--cursor <cursor>', 'Signed continuation cursor')
     .option('--limit <number>', 'Maximum actors', Number, 20)
     .action(
       async (
-        options: { query?: string; kind?: 'human' | 'agent'; limit: number },
+        options: { query?: string; kind?: 'human' | 'agent'; cursor?: string; limit: number },
         command: Command,
       ) => {
         await withProfile(command, async (service) => {
-          const actors = await service.actors.list(options);
+          const page = await service.actors.list(options);
           output(
             io,
             globals(command).json,
-            { actors },
-            actors
+            page,
+            page.items
               .map((actor) => `${actor.kind}:${actor.handle} — ${actor.displayName}`)
-              .join('\n'),
+              .join('\n') + (page.nextCursor ? `\nNext cursor: ${page.nextCursor}` : ''),
           );
         });
       },

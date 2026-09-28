@@ -769,7 +769,7 @@ export class SynomemCore implements SynomemDomainService {
     },
     list: async (input: ActorDirectoryInput = {}) => {
       this.checkAbort();
-      return await this.repository.listActors(actorDirectoryInput(input));
+      return await this.repository.listActors(actorDirectoryInput(input), this.actor);
     },
     get: (ref: ActorRef) => this.resolveActor(ref),
     registerHuman: async (input: { id: string; handle: string; displayName: string }) => {

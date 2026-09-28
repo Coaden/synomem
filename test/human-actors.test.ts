@@ -4,17 +4,42 @@ import { tempHome, testClient } from './helpers.js';
 
 describe('human participation targets', () => {
   it('finds active typed actors beyond the first directory page with bounded queries', async () => {
-    const owner = await testClient(tempHome());
+    const home = tempHome();
+    const owner = await testClient(home);
     for (let index = 0; index < 105; index++)
       await owner.actors.registerHuman({
         id: `person-${index}`,
         handle: `person_${String(index).padStart(3, '0')}`,
         displayName: `Person ${index}`,
       });
-    expect(await owner.actors.list()).toHaveLength(20);
-    expect(await owner.actors.list({ query: 'person_104', kind: 'human', limit: 5 })).toEqual([
-      expect.objectContaining({ kind: 'human', id: 'person-104' }),
-    ]);
+    const first = await owner.actors.list();
+    expect(first.items).toHaveLength(20);
+    expect(first.nextCursor).toBeTruthy();
+    const seen = new Set(first.items.map((actor) => `${actor.kind}:${actor.id}`));
+    let cursor = first.nextCursor;
+    while (cursor) {
+      const page = await owner.actors.list({ cursor });
+      for (const actor of page.items) {
+        expect(seen.has(`${actor.kind}:${actor.id}`)).toBe(false);
+        seen.add(`${actor.kind}:${actor.id}`);
+      }
+      cursor = page.nextCursor;
+    }
+    expect(seen.size).toBeGreaterThan(100);
+    expect(
+      (await owner.actors.list({ query: 'person_104', kind: 'human', limit: 5 })).items,
+    ).toEqual([expect.objectContaining({ kind: 'human', id: 'person-104' })]);
+    await expect(
+      owner.actors.list({ cursor: first.nextCursor, kind: 'agent' }),
+    ).rejects.toMatchObject({
+      code: 'INVALID_INPUT',
+    });
+    const other = new SynomemClient({ home, actor: { kind: 'human', id: 'person-1' } });
+    await other.init();
+    await expect(other.actors.list({ cursor: first.nextCursor })).rejects.toMatchObject({
+      code: 'INVALID_INPUT',
+    });
+    await other.close();
     await expect(owner.actors.list({ query: 'x'.repeat(101) })).rejects.toMatchObject({
       code: 'INVALID_INPUT',
     });

@@ -1,4 +1,9 @@
-import type { ActorDirectoryInput, ActorProfile, ActorProfileInput } from './actor-directory.js';
+import type {
+  ActorDirectoryInput,
+  ActorDirectoryPage,
+  ActorProfile,
+  ActorProfileInput,
+} from './actor-directory.js';
 import type { BookmarkInput, BookmarkPage } from './bookmarks.js';
 import type { SearchInput, SearchPage } from './search.js';
 import type { NotificationInput, NotificationPage } from './notifications.js';
@@ -138,7 +143,7 @@ export interface SynomemDomainService {
   readonly actor: ActorIdentity;
   readonly actors: {
     profile(input: ActorProfileInput): Promise<ActorProfile>;
-    list(input?: ActorDirectoryInput): Promise<AddressableActor[]>;
+    list(input?: ActorDirectoryInput): Promise<ActorDirectoryPage>;
     get(ref: ActorRef): Promise<AddressableActor>;
     registerHuman(input: {
       id: string;

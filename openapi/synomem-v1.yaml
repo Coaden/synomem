@@ -443,11 +443,12 @@ paths:
     get:
       tags: [actors]
       operationId: searchActors
-      description: Searches currently eligible human and agent handles, names and IDs before the 100-result bound.
+      description: Searches active human and agent handles, names and IDs with actor-bound signed cursor pages (default 20, maximum 50).
       parameters:
         - { $ref: '#/components/parameters/WorkspaceId' }
         - { name: query, in: query, schema: { type: string, maxLength: 100 } }
         - { name: kind, in: query, schema: { type: string, enum: [human, agent] } }
+        - { name: cursor, in: query, schema: { type: string, maxLength: 4096 } }
         - { $ref: '#/components/parameters/ListLimit' }
       responses:
         '200': { $ref: '#/components/responses/Success' }

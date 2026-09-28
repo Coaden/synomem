@@ -117,7 +117,7 @@ export class SignedCursorCodec {
         BigInt(value.watermark) > BigInt(maximum)
       )
         throw new Error();
-      if (value.id !== undefined && (typeof value.id !== 'string' || value.id.length > 200))
+      if (value.id !== undefined && (typeof value.id !== 'string' || value.id.length > 512))
         throw new Error();
       return {
         sequence: value.sequence,

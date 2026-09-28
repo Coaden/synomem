@@ -1,4 +1,4 @@
-import type { ActorDirectoryInput } from '../actor-directory.js';
+import type { ActorDirectoryInput, ActorDirectoryPage } from '../actor-directory.js';
 import type { BookmarkRepository } from '../bookmarks.js';
 import type { SearchInput, SearchPage } from '../search.js';
 import type { NotificationRepository } from '../notifications.js';
@@ -72,7 +72,7 @@ export interface SynomemRepository {
     target: ActorRef,
     viewer: ActorIdentity,
   ): Awaitable<{ kudosReceived: number; usefulReceived: number }>;
-  listActors(input?: ActorDirectoryInput): Awaitable<AddressableActor[]>;
+  listActors(input: ActorDirectoryInput, viewer: ActorIdentity): Awaitable<ActorDirectoryPage>;
   registerHuman(actor: AddressableActor): Awaitable<void>;
 
   insertAgent(profile: AgentProfile): Awaitable<void>;
