@@ -1,3 +1,21 @@
+import type { ActorDirectoryInput, ActorProfile, ActorProfileInput } from './actor-directory.js';
+import type {
+  NotificationInput as HpNotificationInput,
+  NotificationPage as HpNotificationPage,
+} from './notifications.js';
+import type {
+  ReactionSetInput as HpReactionSetInput,
+  ReactionSummary as HpReactionSummary,
+  ReplyCreateInput as HpReplyCreateInput,
+  ReplyDeleteInput as HpReplyDeleteInput,
+  ReplyRecord as HpReplyRecord,
+  ThreadInput as HpThreadInput,
+  ThreadPage as HpThreadPage,
+} from './participation.js';
+import type { BookmarkInput, BookmarkPage } from './bookmarks.js';
+import type { SearchInput, SearchPage } from './search.js';
+import type { OverrideTaskDecisionInput } from './types.js';
+import type { ActorRef, AddressableActor } from './policy.js';
 import { actorSchema } from './schemas.js';
 import { errorCodes, SynomemError, type SynomemErrorCode } from './errors.js';
 import type { SynomemService, SynomemServiceCapabilities, SynomemServiceInfo } from './service.js';
@@ -117,7 +135,7 @@ function queryString(input: object): string {
     if (Array.isArray(value)) {
       for (const item of value) parameters.append(key, String(item));
     } else {
-      parameters.set(key, String(value));
+      parameters.set(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
     }
   }
   const encoded = parameters.toString();
@@ -195,6 +213,97 @@ export class RemoteSynomemService implements SynomemService {
   private initialized = false;
   private cachedCapabilities?: SynomemServiceCapabilities;
 
+  readonly bookmarks = {
+    list: (input: BookmarkInput = {}) =>
+      this.request<BookmarkPage>('GET', `bookmarks${queryString(input)}`),
+    has: (rootId: string) =>
+      this.request<{ saved: boolean }>('GET', `items/${encodeURIComponent(rootId)}/bookmark`),
+    set: (input: { rootId: string; present: boolean }) =>
+      this.request<{ saved: boolean }>(
+        input.present ? 'PUT' : 'DELETE',
+        `items/${encodeURIComponent(input.rootId)}/bookmark`,
+        {},
+      ),
+  };
+  readonly notifications = {
+    list: (input: HpNotificationInput = {}) =>
+      this.request<HpNotificationPage>('GET', `inbox${queryString(input)}`),
+    read: async (id: string) => {
+      await this.request('POST', `inbox/${encodeURIComponent(id)}/read`, {});
+    },
+    dismiss: async (id: string) => {
+      await this.request('POST', `inbox/${encodeURIComponent(id)}/dismiss`, {});
+    },
+    readThrough: async (through: string) => {
+      await this.request('POST', 'inbox/read', { through });
+    },
+  };
+  readonly replies = {
+    changes: (input: HpThreadInput) =>
+      this.request<HpThreadPage>('GET', `replies/changes${queryString(input)}`),
+    create: (input: HpReplyCreateInput) =>
+      this.request<HpReplyRecord>(
+        'POST',
+        `items/${encodeURIComponent(input.rootId)}/replies`,
+        input,
+      ),
+    get: (id: string) => this.request<HpReplyRecord>('GET', `replies/${encodeURIComponent(id)}`),
+    delete: (input: HpReplyDeleteInput) =>
+      this.request<HpReplyRecord>('DELETE', `replies/${encodeURIComponent(input.replyId)}`, input),
+  };
+  readonly threads = {
+    read: async (input: { rootId: string; through: string }) => {
+      await this.request('PUT', `items/${encodeURIComponent(input.rootId)}/thread/read`, {
+        through: input.through,
+      });
+    },
+    get: (input: HpThreadInput) =>
+      this.request<HpThreadPage>(
+        'GET',
+        `items/${encodeURIComponent(input.rootId)}/thread${queryString({ after: input.after, limit: input.limit })}`,
+      ),
+    subscription: (input: { rootId: string; following: boolean; muted: boolean }) =>
+      this.request<void>(
+        'PUT',
+        `items/${encodeURIComponent(input.rootId)}/thread/subscription`,
+        input,
+      ),
+  };
+  readonly reactions = {
+    set: (input: HpReactionSetInput) =>
+      this.request<HpReactionSummary>(
+        input.present ? 'PUT' : 'DELETE',
+        `reactions/${encodeURIComponent(input.targetId)}/${input.code}`,
+        input,
+      ),
+    get: (targetId: string) =>
+      this.request<HpReactionSummary>('GET', `reactions/${encodeURIComponent(targetId)}`),
+  };
+  readonly actors = {
+    profile: (input: ActorProfileInput) =>
+      this.request<ActorProfile>(
+        'GET',
+        `actor-directory/${input.target.kind}/${encodeURIComponent(input.target.id)}/profile${queryString({ after: input.after, limit: input.limit })}`,
+      ),
+    list: (input: ActorDirectoryInput = {}) =>
+      this.request<AddressableActor[]>('GET', `actor-directory${queryString(input)}`),
+    get: (ref: ActorRef) =>
+      this.request<AddressableActor>(
+        'GET',
+        `actor-directory/${ref.kind}/${encodeURIComponent(ref.id)}`,
+      ),
+    registerHuman: async (_input: {
+      id: string;
+      handle: string;
+      displayName: string;
+    }): Promise<AddressableActor> => {
+      void _input;
+      throw new SynomemError(
+        'MUTATION_FORBIDDEN',
+        'Hosted human identities are provisioned through workspace membership.',
+      );
+    },
+  };
   readonly agents = {
     create: (input: CreateAgentInput) =>
       this.request<Awaited<ReturnType<SynomemService['agents']['create']>>>(
@@ -329,24 +438,41 @@ export class RemoteSynomemService implements SynomemService {
         input,
         ['postId'],
       ),
-    archive: (input: { postId: string; reason?: string; idempotencyKey?: string }) =>
+    archive: (input: {
+      expectedVersion: number;
+      postId: string;
+      reason?: string;
+      idempotencyKey?: string;
+    }) =>
       this.mutation<Awaited<ReturnType<SynomemService['posts']['archive']>>>(
         'POST',
         `posts/${encodeURIComponent(input.postId)}/archive`,
         input,
         ['postId'],
       ),
-    acknowledge: (input: { postId: string; note?: string; idempotencyKey?: string }) =>
+    acknowledge: (input: {
+      expectedVersion: number;
+      postId: string;
+      note?: string;
+      idempotencyKey?: string;
+    }) =>
       this.mutation<Awaited<ReturnType<SynomemService['posts']['acknowledge']>>>(
         'POST',
         `posts/${encodeURIComponent(input.postId)}/acknowledgment`,
         input,
         ['postId'],
       ),
-    withdrawAcknowledgment: (input: { postId: string; reason?: string }) =>
-      this.request<Awaited<ReturnType<SynomemService['posts']['withdrawAcknowledgment']>>>(
+    withdrawAcknowledgment: (input: {
+      expectedVersion: number;
+      postId: string;
+      reason?: string;
+      idempotencyKey?: string;
+    }) =>
+      this.mutation<Awaited<ReturnType<SynomemService['posts']['withdrawAcknowledgment']>>>(
         'DELETE',
         `posts/${encodeURIComponent(input.postId)}/acknowledgment`,
+        input,
+        ['postId'],
       ),
     roster: (postId: string) =>
       this.request<Awaited<ReturnType<SynomemService['posts']['roster']>>>(
@@ -373,17 +499,30 @@ export class RemoteSynomemService implements SynomemService {
         'GET',
         `kudos/${encodeURIComponent(id)}`,
       ),
-    acknowledge: (input: { kudosId: string; note?: string }) =>
-      this.request<Awaited<ReturnType<SynomemService['kudos']['acknowledge']>>>(
+    acknowledge: (input: {
+      expectedVersion: number;
+      kudosId: string;
+      note?: string;
+      idempotencyKey?: string;
+    }) =>
+      this.mutation<Awaited<ReturnType<SynomemService['kudos']['acknowledge']>>>(
         'POST',
         `kudos/${encodeURIComponent(input.kudosId)}/acknowledgment`,
-        input.note === undefined ? {} : { note: input.note },
+        input,
+        ['kudosId'],
       ),
-    revoke: (input: { kudosId: string; reason: string; administrative?: boolean }) =>
-      this.request<Awaited<ReturnType<SynomemService['kudos']['revoke']>>>(
+    revoke: (input: {
+      expectedVersion: number;
+      kudosId: string;
+      reason: string;
+      administrative?: boolean;
+      idempotencyKey?: string;
+    }) =>
+      this.mutation<Awaited<ReturnType<SynomemService['kudos']['revoke']>>>(
         'POST',
         `kudos/${encodeURIComponent(input.kudosId)}/revocation`,
-        { reason: input.reason },
+        input,
+        ['kudosId', 'administrative'],
       ),
   };
 
@@ -400,14 +539,14 @@ export class RemoteSynomemService implements SynomemService {
         'GET',
         `memos/${encodeURIComponent(id)}`,
       ),
-    read: (input: { memoId: string; idempotencyKey?: string }) =>
+    read: (input: { expectedVersion: number; memoId: string; idempotencyKey?: string }) =>
       this.mutation<Awaited<ReturnType<SynomemService['memos']['read']>>>(
         'POST',
         `memos/${encodeURIComponent(input.memoId)}/read`,
         input,
         ['memoId'],
       ),
-    archive: (input: { memoId: string; idempotencyKey?: string }) =>
+    archive: (input: { expectedVersion: number; memoId: string; idempotencyKey?: string }) =>
       this.mutation<Awaited<ReturnType<SynomemService['memos']['archive']>>>(
         'POST',
         `memos/${encodeURIComponent(input.memoId)}/archive`,
@@ -436,7 +575,7 @@ export class RemoteSynomemService implements SynomemService {
         input,
         ['noteId'],
       ),
-    archive: (input: { noteId: string; idempotencyKey?: string }) =>
+    archive: (input: { expectedVersion: number; noteId: string; idempotencyKey?: string }) =>
       this.mutation<Awaited<ReturnType<SynomemService['notes']['archive']>>>(
         'POST',
         `notes/${encodeURIComponent(input.noteId)}/archive`,
@@ -446,6 +585,7 @@ export class RemoteSynomemService implements SynomemService {
   };
 
   readonly tasks = {
+    overrideDecision: (input: OverrideTaskDecisionInput) => this.taskTransition('override', input),
     create: (input: CreateTaskInput) =>
       this.mutation<Awaited<ReturnType<SynomemService['tasks']['create']>>>('POST', 'tasks', input),
     list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
@@ -465,16 +605,32 @@ export class RemoteSynomemService implements SynomemService {
         input,
         ['taskId'],
       ),
-    accept: (input: { taskId: string; response?: string; idempotencyKey?: string }) =>
-      this.taskTransition('accept', input),
-    reject: (input: { taskId: string; response: string; idempotencyKey?: string }) =>
-      this.taskTransition('reject', input),
-    complete: (input: { taskId: string; note?: string; idempotencyKey?: string }) =>
-      this.taskTransition('complete', input),
-    reopen: (input: { taskId: string; idempotencyKey?: string }) =>
+    accept: (input: {
+      expectedVersion: number;
+      taskId: string;
+      response?: string;
+      idempotencyKey?: string;
+    }) => this.taskTransition('accept', input),
+    reject: (input: {
+      expectedVersion: number;
+      taskId: string;
+      response: string;
+      idempotencyKey?: string;
+    }) => this.taskTransition('reject', input),
+    complete: (input: {
+      expectedVersion: number;
+      taskId: string;
+      note?: string;
+      idempotencyKey?: string;
+    }) => this.taskTransition('complete', input),
+    reopen: (input: { expectedVersion: number; taskId: string; idempotencyKey?: string }) =>
       this.taskTransition('reopen', input),
-    cancel: (input: { taskId: string; reason?: string; idempotencyKey?: string }) =>
-      this.taskTransition('cancel', input),
+    cancel: (input: {
+      expectedVersion: number;
+      taskId: string;
+      reason?: string;
+      idempotencyKey?: string;
+    }) => this.taskTransition('cancel', input),
   };
 
   /**
@@ -501,13 +657,21 @@ export class RemoteSynomemService implements SynomemService {
         input,
         ['todoId'],
       ),
-    complete: (input: { todoId: string; note?: string; idempotencyKey?: string }) =>
-      this.todoTransition('complete', input),
-    reopen: (input: { todoId: string; idempotencyKey?: string }) =>
+    complete: (input: {
+      expectedVersion: number;
+      todoId: string;
+      note?: string;
+      idempotencyKey?: string;
+    }) => this.todoTransition('complete', input),
+    reopen: (input: { expectedVersion: number; todoId: string; idempotencyKey?: string }) =>
       this.todoTransition('reopen', input),
-    cancel: (input: { todoId: string; reason?: string; idempotencyKey?: string }) =>
-      this.todoTransition('cancel', input),
-    archive: (input: { todoId: string; idempotencyKey?: string }) =>
+    cancel: (input: {
+      expectedVersion: number;
+      todoId: string;
+      reason?: string;
+      idempotencyKey?: string;
+    }) => this.todoTransition('cancel', input),
+    archive: (input: { expectedVersion: number; todoId: string; idempotencyKey?: string }) =>
       this.todoTransition('archive', input),
   };
 
@@ -540,6 +704,12 @@ export class RemoteSynomemService implements SynomemService {
     },
   };
 
+  async search(input: SearchInput): Promise<SearchPage> {
+    const capabilities = await this.capabilities();
+    if (!capabilities.participation?.search)
+      throw new SynomemError('UNSUPPORTED_BACKEND', 'This workspace does not support search.');
+    return this.request('GET', `search${queryString(input)}`);
+  }
   readonly items = {
     list: (input: ItemListInput = {}) =>
       this.request<Awaited<ReturnType<SynomemService['items']['list']>>>(
@@ -595,6 +765,11 @@ export class RemoteSynomemService implements SynomemService {
     if (this.cachedCapabilities.backend !== 'remote') {
       throw new SynomemError('REMOTE_PROTOCOL', 'The configured server is not a remote backend.');
     }
+    if (this.cachedCapabilities.participation?.version !== 2)
+      throw new SynomemError(
+        'UNSUPPORTED_SCHEMA',
+        'This client requires the human participation v2 contract.',
+      );
     const binding = this.cachedCapabilities.binding;
     if (binding.workspaceId !== this.workspaceId) {
       throw new SynomemError(
@@ -646,10 +821,8 @@ export class RemoteSynomemService implements SynomemService {
   }
 
   async capabilities(): Promise<SynomemServiceCapabilities> {
-    return (
-      this.cachedCapabilities ??
-      (await this.request<SynomemServiceCapabilities>('GET', '../../capabilities'))
-    );
+    await this.init();
+    return this.cachedCapabilities!;
   }
 
   async info(): Promise<SynomemServiceInfo> {
@@ -664,8 +837,9 @@ export class RemoteSynomemService implements SynomemService {
   }
 
   private taskTransition(
-    transition: 'accept' | 'reject' | 'complete' | 'reopen' | 'cancel',
+    transition: 'accept' | 'reject' | 'complete' | 'reopen' | 'cancel' | 'override',
     input: {
+      expectedVersion: number;
       taskId: string;
       idempotencyKey?: string;
       reason?: string;
@@ -683,7 +857,13 @@ export class RemoteSynomemService implements SynomemService {
 
   private todoTransition(
     transition: 'complete' | 'reopen' | 'cancel' | 'archive',
-    input: { todoId: string; idempotencyKey?: string; reason?: string; note?: string },
+    input: {
+      expectedVersion: number;
+      todoId: string;
+      idempotencyKey?: string;
+      reason?: string;
+      note?: string;
+    },
   ) {
     return this.mutation<Awaited<ReturnType<SynomemService['todos']['complete']>>>(
       'POST',
@@ -694,7 +874,7 @@ export class RemoteSynomemService implements SynomemService {
   }
 
   private mutation<T>(
-    method: 'POST' | 'PATCH',
+    method: 'POST' | 'PATCH' | 'DELETE',
     path: string,
     input: object,
     omittedKeys: string[] = [],
@@ -708,11 +888,16 @@ export class RemoteSynomemService implements SynomemService {
   }
 
   private async request<T>(
-    method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
+    method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE',
     path: string,
     body?: object,
     idempotencyKey?: string,
   ): Promise<T> {
+    if (method !== 'GET') {
+      await this.init();
+      if (!this.cachedCapabilities?.participation?.canWrite)
+        throw new SynomemError('READ_ONLY', 'The selected binding has no write capability.');
+    }
     const accessToken = await this.bearer(this.signal);
     if (!accessToken) {
       throw new SynomemError('AUTH_REQUIRED', 'Remote Synomem authentication is required.');

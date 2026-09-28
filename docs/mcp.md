@@ -50,6 +50,8 @@ registration: the profile routes to a credential stored in the keychain or a res
 Several identities in one harness: either register one fixed server per profile (the host
 namespaces their tools), or one explicit server for a preset (one catalog, a context per call).
 
+Participation tools include `synomem_actor_list`, `synomem_actor_profile`, reply/thread, reaction, notification and bookmark operations, plus hosted search. Targets are typed human/agent references; tool arguments never replace the authenticated actor. A personal notification's read state does not accept a memo, task, kudos or post for its recipient. Results obey current root visibility, including profile counts and search snippets. See [the participation contract](human-participation.md).
+
 ## Tools
 
 Discovery — never needs a context:

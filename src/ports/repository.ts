@@ -1,3 +1,10 @@
+import type { ActorDirectoryInput } from '../actor-directory.js';
+import type { BookmarkRepository } from '../bookmarks.js';
+import type { SearchInput, SearchPage } from '../search.js';
+import type { NotificationRepository } from '../notifications.js';
+import type { ParticipationRepository } from '../participation.js';
+import type { MutationReceipt } from '../mutation-receipts.js';
+import type { ActorRef, AddressableActor, RecordAuthority } from '../policy.js';
 import type {
   ActorIdentity,
   AgentProfile,
@@ -25,8 +32,13 @@ import type {
  * local SQLite and remote service implementations.
  */
 export interface SynomemRepository {
+  search?(input: SearchInput, actor: ActorIdentity): Promise<SearchPage>;
+  readonly bookmarks: BookmarkRepository;
   readonly config: SynomemConfig;
+  readonly notifications: NotificationRepository;
+  readonly participation: ParticipationRepository;
 
+  setAuthority(authority: RecordAuthority): void;
   init(): Awaitable<void>;
   close(): Awaitable<void>;
   assertEventCompatibility(): Awaitable<void>;
@@ -41,6 +53,27 @@ export interface SynomemRepository {
   ): Awaitable<SynomemEvent | undefined>;
   getReadableSynomemEvents(kudosId: string): Awaitable<SynomemEvent[]>;
   getReadableItemEvents(id: string): Awaitable<SynomemEvent[]>;
+
+  getMutationReceipt(
+    actorKind: string,
+    actorId: string,
+    keyHash: string,
+  ): Awaitable<MutationReceipt | undefined>;
+  insertMutationReceipt(
+    actorKind: string,
+    actorId: string,
+    keyHash: string,
+    receipt: MutationReceipt,
+  ): Awaitable<void>;
+  compactMutationReceipts(before: string): Awaitable<number>;
+  canActorReadItem(id: string, actor: ActorRef): Awaitable<boolean>;
+  getActor(ref: ActorRef): Awaitable<AddressableActor | undefined>;
+  actorCounts(
+    target: ActorRef,
+    viewer: ActorIdentity,
+  ): Awaitable<{ kudosReceived: number; usefulReceived: number }>;
+  listActors(input?: ActorDirectoryInput): Awaitable<AddressableActor[]>;
+  registerHuman(actor: AddressableActor): Awaitable<void>;
 
   insertAgent(profile: AgentProfile): Awaitable<void>;
   updateAgent(profile: AgentProfile, updatedAt: string): Awaitable<void>;

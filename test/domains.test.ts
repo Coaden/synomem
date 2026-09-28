@@ -1,9 +1,9 @@
+import { localOwnerAuthority, resolveAuthority } from '../src/policy.js';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { SynomemClient } from '../src/client.js';
 import { tempHome, testClient } from './helpers.js';
-
 async function seededHome() {
   const home = tempHome();
   const admin = await testClient(home, { kind: 'human', id: 'troy' });
@@ -13,13 +13,12 @@ async function seededHome() {
   await admin.close();
   return home;
 }
-
 describe('Synomem domains', () => {
   it('delivers self and peer memos with recipient-scoped state and idempotency', async () => {
     const home = await seededHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     const sent = await gracie.memos.send({
-      recipientAgentId: 'codex',
+      recipient: { kind: 'agent', id: 'codex' },
       subject: 'Review result',
       body: 'The continuity check is complete.',
       visibility: 'private',
@@ -28,7 +27,7 @@ describe('Synomem domains', () => {
     expect(
       (
         await gracie.memos.send({
-          recipientAgentId: 'codex',
+          recipient: { kind: 'agent', id: 'codex' },
           subject: 'Review result',
           body: 'The continuity check is complete.',
           visibility: 'private',
@@ -37,31 +36,44 @@ describe('Synomem domains', () => {
       ).deduplicated,
     ).toBe(true);
     const self = await gracie.memos.send({
-      recipientAgentId: 'gracie',
+      recipient: { kind: 'agent', id: 'gracie' },
       subject: 'Future reminder',
       body: 'Recheck the decision after implementation.',
     });
     expect(self.record.status).toBe('unread');
     await gracie.close();
-
     const mycroft = await testClient(home, { kind: 'agent', id: 'mycroft' });
     await expect(mycroft.memos.get(sent.record.event.id)).rejects.toMatchObject({
       code: 'POLICY_FORBIDDEN',
     });
-    await expect(mycroft.memos.read({ memoId: sent.record.event.id })).rejects.toMatchObject({
+    await expect(
+      mycroft.memos.read({ expectedVersion: 1, memoId: sent.record.event.id }),
+    ).rejects.toMatchObject({
       code: 'POLICY_FORBIDDEN',
     });
     await mycroft.close();
-
     const codex = await testClient(home, { kind: 'agent', id: 'codex' });
-    expect((await codex.memos.read({ memoId: sent.record.event.id })).status).toBe('read');
-    expect((await codex.memos.archive({ memoId: sent.record.event.id })).status).toBe('archived');
+    expect(
+      (
+        await codex.memos.read({
+          expectedVersion: (await codex.memos.get(sent.record.event.id)).lifecycleVersion!,
+          memoId: sent.record.event.id,
+        })
+      ).status,
+    ).toBe('read');
+    expect(
+      (
+        await codex.memos.archive({
+          expectedVersion: (await codex.memos.get(sent.record.event.id)).lifecycleVersion!,
+          memoId: sent.record.event.id,
+        })
+      ).status,
+    ).toBe('archived');
     expect(existsSync(join(home, 'codex', 'inbox', 'memos', `${sent.record.event.id}.md`))).toBe(
       false,
     );
     await codex.close();
   });
-
   it('keeps notes owner-scoped, versioned, and separate from human NOTES.md', async () => {
     const home = await seededHome();
     const scratch = join(home, 'codex', 'NOTES.md');
@@ -92,42 +104,57 @@ describe('Synomem domains', () => {
     expect(readFileSync(scratch, 'utf8')).toBe('Human scratchpad.\n');
     expect(readFileSync(join(home, 'codex', 'MEMORY.md'), 'utf8')).toContain('Release invariant');
     await codex.close();
-
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     await expect(gracie.notes.get(created.record.event.id)).rejects.toMatchObject({
       code: 'POLICY_FORBIDDEN',
     });
     await gracie.close();
   });
-
   it('assigns and transitions tasks with date-aware due values and conflict checks', async () => {
     const home = await seededHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     const created = await gracie.tasks.create({
-      assigneeAgentId: 'codex',
+      assignee: { kind: 'agent', id: 'codex' },
       title: 'Review migration',
       due: { kind: 'date', date: '2026-09-15' },
       priority: 2,
       idempotencyKey: 'task-1',
     });
     expect(created.record.status).toBe('assigned');
-    await expect(gracie.tasks.accept({ taskId: created.record.event.id })).rejects.toMatchObject({
+    await expect(
+      gracie.tasks.accept({
+        expectedVersion: (await gracie.tasks.get(created.record.event.id)).lifecycleVersion!,
+        taskId: created.record.event.id,
+      }),
+    ).rejects.toMatchObject({
       code: 'MUTATION_FORBIDDEN',
     });
-    await expect(gracie.tasks.complete({ taskId: created.record.event.id })).rejects.toMatchObject({
+    await expect(
+      gracie.tasks.complete({
+        expectedVersion: (await gracie.tasks.get(created.record.event.id)).lifecycleVersion!,
+        taskId: created.record.event.id,
+      }),
+    ).rejects.toMatchObject({
       code: 'INVALID_INPUT',
     });
     const rejectable = await gracie.tasks.create({
-      assigneeAgentId: 'codex',
+      assignee: { kind: 'agent', id: 'codex' },
       title: 'Optional review',
     });
     await gracie.close();
-
     const codex = await testClient(home, { kind: 'agent', id: 'codex' });
-    expect((await codex.tasks.accept({ taskId: created.record.event.id })).status).toBe('open');
+    expect(
+      (
+        await codex.tasks.accept({
+          expectedVersion: (await codex.tasks.get(created.record.event.id)).lifecycleVersion!,
+          taskId: created.record.event.id,
+        })
+      ).status,
+    ).toBe('open');
     expect(
       (
         await codex.tasks.reject({
+          expectedVersion: (await codex.tasks.get(rejectable.record.event.id)).lifecycleVersion!,
           taskId: rejectable.record.event.id,
           response: 'Outside current scope.',
         })
@@ -143,32 +170,49 @@ describe('Synomem domains', () => {
     await expect(
       codex.tasks.update({ taskId: created.record.event.id, expectedVersion: 2, title: 'Stale' }),
     ).rejects.toMatchObject({ code: 'REVISION_CONFLICT' });
-    expect((await codex.tasks.complete({ taskId: created.record.event.id })).status).toBe(
-      'completed',
-    );
-    expect((await codex.tasks.reopen({ taskId: created.record.event.id })).status).toBe('open');
     expect(
-      (await codex.tasks.cancel({ taskId: created.record.event.id, reason: 'Superseded.' })).status,
+      (
+        await codex.tasks.complete({
+          expectedVersion: (await codex.tasks.get(created.record.event.id)).lifecycleVersion!,
+          taskId: created.record.event.id,
+        })
+      ).status,
+    ).toBe('completed');
+    expect(
+      (
+        await codex.tasks.reopen({
+          expectedVersion: (await codex.tasks.get(created.record.event.id)).lifecycleVersion!,
+          taskId: created.record.event.id,
+        })
+      ).status,
+    ).toBe('open');
+    expect(
+      (
+        await codex.tasks.cancel({
+          expectedVersion: (await codex.tasks.get(created.record.event.id)).lifecycleVersion!,
+          taskId: created.record.event.id,
+          reason: 'Superseded.',
+        })
+      ).status,
     ).toBe('canceled');
     expect(readFileSync(join(home, 'codex', 'TASKS.md'), 'utf8')).toContain('Review migration');
     await codex.close();
   });
-
   it('provides one bounded, privacy-aware mixed item feed and change stream', async () => {
     const home = await seededHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     await gracie.kudos.give({
-      recipientAgentId: 'codex',
+      recipient: { kind: 'agent', id: 'codex' },
       title: 'Good review',
       reason: 'Caught a flaw.',
     });
     await gracie.memos.send({
-      recipientAgentId: 'codex',
+      recipient: { kind: 'agent', id: 'codex' },
       subject: 'Follow-up',
       body: 'Please retest.',
     });
-    await gracie.tasks.create({ assigneeAgentId: 'codex', title: 'Retest' });
-    const page = await gracie.items.list({ participantAgentId: 'codex' });
+    await gracie.tasks.create({ assignee: { kind: 'agent', id: 'codex' }, title: 'Retest' });
+    const page = await gracie.items.list({ participant: { kind: 'agent', id: 'codex' } });
     expect(new Set(page.items.map((item) => item.kind))).toEqual(
       new Set(['kudos', 'memo', 'task']),
     );
@@ -176,7 +220,6 @@ describe('Synomem domains', () => {
     const changes = await gracie.items.changes({ after: page.watermark });
     expect(changes.items).toHaveLength(0);
     await gracie.close();
-
     const readonly = new SynomemClient({
       home,
       actor: { kind: 'agent', id: 'codex' },
@@ -186,52 +229,58 @@ describe('Synomem domains', () => {
     expect((await readonly.items.list()).items.length).toBeGreaterThanOrEqual(3);
     await readonly.close();
   });
-
   it('filters actionable inbox states before applying the page limit', async () => {
     const home = await seededHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     const oldMemo = await gracie.memos.send({
-      recipientAgentId: 'codex',
+      recipient: { kind: 'agent', id: 'codex' },
       subject: 'Already read',
       body: 'This should not consume an inbox slot.',
     });
     await gracie.memos.send({
-      recipientAgentId: 'codex',
+      recipient: { kind: 'agent', id: 'codex' },
       subject: 'Still unread',
       body: 'This should be returned.',
     });
     const assigned = await gracie.tasks.create({
-      assigneeAgentId: 'codex',
+      assignee: { kind: 'agent', id: 'codex' },
       title: 'Needs consent',
     });
     await gracie.close();
-
     const codex = await testClient(home, { kind: 'agent', id: 'codex' });
-    await codex.memos.read({ memoId: oldMemo.record.event.id });
-    const first = await codex.items.list({ participantAgentId: 'codex', pending: true, limit: 1 });
+    await codex.memos.read({
+      expectedVersion: (await codex.memos.get(oldMemo.record.event.id)).lifecycleVersion!,
+      memoId: oldMemo.record.event.id,
+    });
+    const first = await codex.items.list({
+      participant: { kind: 'agent', id: 'codex' },
+      pending: true,
+      limit: 1,
+    });
     expect(first.items).toHaveLength(1);
     expect(first.items[0]?.status).not.toBe('read');
-    const all = await codex.items.list({ participantAgentId: 'codex', pending: true, limit: 10 });
+    const all = await codex.items.list({
+      participant: { kind: 'agent', id: 'codex' },
+      pending: true,
+      limit: 10,
+    });
     expect(all.items.map((item) => item.id)).toContain(assigned.record.event.id);
     expect(all.items.some((item) => item.status === 'read')).toBe(false);
     await codex.close();
   });
-
   it('keeps actor kinds distinct for private item reads and change feeds', async () => {
     const home = await seededHome();
     const admin = await testClient(home, { kind: 'human', id: 'troy' });
     await admin.agents.create({ handle: 'bob', displayName: 'Agent Bob' });
     await admin.close();
-
     const humanBob = await testClient(home, { kind: 'human', id: 'bob' });
     const memo = await humanBob.memos.send({
-      recipientAgentId: 'codex',
+      recipient: { kind: 'agent', id: 'codex' },
       subject: 'Human-authored private memo',
       body: 'An agent with the same textual ID is not this author.',
       visibility: 'private',
     });
     await humanBob.close();
-
     const agentBob = await testClient(home, { kind: 'agent', id: 'bob' });
     await expect(agentBob.memos.get(memo.record.event.id)).rejects.toMatchObject({
       code: 'POLICY_FORBIDDEN',
@@ -245,28 +294,28 @@ describe('Synomem domains', () => {
     await agentBob.close();
   });
 });
-
 describe('task responses', () => {
   it('requires a reason when rejecting and keeps it in the durable history', async () => {
     const home = tempHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
     const assigned = await gracie.tasks.create({
-      assigneeAgentId: 'codex',
+      assignee: { kind: 'agent', id: 'codex' },
       title: 'Send the migration notice',
     });
     await gracie.close();
-
     const codex = await testClient(home, { kind: 'agent', id: 'codex' });
-
     // A refusal with no reason tells the assigner only that the work will not
     // happen — not whether to reassign it, wait, or change the request.
     await expect(
       // @ts-expect-error a response is required by the type as well as at runtime
-      codex.tasks.reject({ taskId: assigned.record.event.id }),
+      codex.tasks.reject({
+        expectedVersion: (await codex.tasks.get(assigned.record.event.id)).lifecycleVersion!,
+        taskId: assigned.record.event.id,
+      }),
     ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
-
     const rejected = await codex.tasks.reject({
+      expectedVersion: (await codex.tasks.get(assigned.record.event.id)).lifecycleVersion!,
       taskId: assigned.record.event.id,
       response: 'This Hermes profile has no outbound messaging connection.',
     });
@@ -279,22 +328,30 @@ describe('task responses', () => {
     ]);
     await codex.close();
   });
-
   it('allows an acceptance response but does not demand one', async () => {
     const home = tempHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
-    const plain = await gracie.tasks.create({ assigneeAgentId: 'codex', title: 'Plain' });
+    const plain = await gracie.tasks.create({
+      assignee: { kind: 'agent', id: 'codex' },
+      title: 'Plain',
+    });
     const conditional = await gracie.tasks.create({
-      assigneeAgentId: 'codex',
+      assignee: { kind: 'agent', id: 'codex' },
       title: 'Conditional',
     });
     await gracie.close();
-
     const codex = await testClient(home, { kind: 'agent', id: 'codex' });
-    expect((await codex.tasks.accept({ taskId: plain.record.event.id })).status).toBe('open');
-
+    expect(
+      (
+        await codex.tasks.accept({
+          expectedVersion: (await codex.tasks.get(plain.record.event.id)).lifecycleVersion!,
+          taskId: plain.record.event.id,
+        })
+      ).status,
+    ).toBe('open');
     const accepted = await codex.tasks.accept({
+      expectedVersion: (await codex.tasks.get(conditional.record.event.id)).lifecycleVersion!,
       taskId: conditional.record.event.id,
       response: 'Accepted; I can send email but do not have iMessage access.',
     });
@@ -307,7 +364,6 @@ describe('task responses', () => {
     await codex.close();
   });
 });
-
 /*
  * The inbox contract, pinned because the Skill and the MCP tool descriptions
  * both state it and neither can check it.
@@ -325,28 +381,28 @@ describe('inbox contents', () => {
     const codex = await admin.agents.create({ handle: 'codex', displayName: 'Codex' });
     const gracie = await admin.agents.create({ handle: 'gracie', displayName: 'Gracie' });
     await admin.close();
-
     const sender = await testClient(home, { kind: 'agent', id: gracie.id });
     await sender.kudos.give({
-      recipientAgentId: codex.id,
+      recipient: { kind: 'agent', id: codex.id },
       title: 'Caught the migration gap',
       reason: 'Found the missing rollback path before the window opened.',
     });
     await sender.memos.send({
-      recipientAgentId: codex.id,
+      recipient: { kind: 'agent', id: codex.id },
       subject: 'Review follow-up',
       body: 'Please recheck after the tests pass.',
     });
-    await sender.tasks.create({ assigneeAgentId: codex.id, title: 'Review the migration' });
+    await sender.tasks.create({
+      assignee: { kind: 'agent', id: codex.id },
+      title: 'Review the migration',
+    });
     await sender.posts.create({ title: 'Migration tonight', body: 'Short read-only window.' });
     await sender.close();
-
     const client = await testClient(home, { kind: 'agent', id: codex.id });
     await client.notes.create({ title: 'Release invariant', body: 'Never publish unattended.' });
     await client.todos.create({ title: 'Re-read the migration notes' });
-
     const inbox = await client.items.list({
-      participantAgentId: codex.id,
+      participant: { kind: 'agent', id: codex.id },
       pending: true,
       limit: 50,
     });
@@ -355,7 +411,6 @@ describe('inbox contents', () => {
       'memo',
       'task',
     ]);
-
     // Each absent kind is reachable, so the advice to use `kinds` holds. An
     // empty inbox must not be read as nothing to look at.
     for (const kind of ['note', 'post', 'todo'] as const) {
@@ -368,7 +423,6 @@ describe('inbox contents', () => {
     await client.close();
   });
 });
-
 describe('private todos', () => {
   it('is reachable through the generic items.get, not just todos.get', async () => {
     // synomem_list only ever returns compact summaries; synomem_get (items.get)
@@ -377,19 +431,33 @@ describe('private todos', () => {
     // 'post' and 'todo' to getTask -- those two fell through and failed with
     // a task-store "not found", even though the record plainly exists.
     const home = tempHome();
+    const owner = await testClient(home);
+    await owner.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await owner.close();
+    const seedOwner = await testClient(home);
+    if (!(await seedOwner.agents.resolve('gracie')).match)
+      await seedOwner.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await seedOwner.close();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     const todo = await gracie.todos.create({ title: 'Draft the migration checklist' });
     const seen = (await gracie.items.get(todo.record.event.id)) as {
-      event: { type: string };
-      current: { title: string };
+      event: {
+        type: string;
+      };
+      current: {
+        title: string;
+      };
     };
     expect(seen.event.type).toBe('todo.created');
     expect(seen.current.title).toBe('Draft the migration checklist');
     await gracie.close();
   });
-
   it('is owned by its author and readable by nobody else', async () => {
     const home = tempHome();
+    const seedOwner = await testClient(home);
+    if (!(await seedOwner.agents.resolve('gracie')).match)
+      await seedOwner.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await seedOwner.close();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
     const todo = await gracie.todos.create({
@@ -399,7 +467,6 @@ describe('private todos', () => {
     });
     expect(todo.record.status).toBe('open');
     await gracie.close();
-
     // Another agent holding the id still cannot read it. Ownership is asserted
     // on the record, not left to a visibility filter.
     const codex = await testClient(home, { kind: 'agent', id: 'codex' });
@@ -407,7 +474,6 @@ describe('private todos', () => {
       code: 'MUTATION_FORBIDDEN',
     });
     await codex.close();
-
     // A non-administrative human — the hosted API's equivalent of an
     // ordinary organization member with no owner/admin role — is bound by
     // the same rule as any other actor: this is not a blanket "humans see
@@ -415,63 +481,83 @@ describe('private todos', () => {
     const member = await testClient(
       home,
       { kind: 'human', id: 'someone-else' },
-      { administrative: false },
+      { authority: resolveAuthority() },
     );
     await expect(member.todos.get(todo.record.event.id)).rejects.toMatchObject({
       code: 'MUTATION_FORBIDDEN',
     });
     await member.close();
-
     // An administrator — the hosted API's org owner/admin, who is the only
     // kind of human who could have created gracie's agent identity in the
     // first place — reads it without the ownership check ever firing.
-    const admin = await testClient(home, { kind: 'human', id: 'troy' }, { administrative: true });
+    const admin = await testClient(
+      home,
+      { kind: 'human', id: 'troy' },
+      { authority: localOwnerAuthority() },
+    );
     const seen = await admin.todos.get(todo.record.event.id);
     expect(seen.event.id).toBe(todo.record.event.id);
     await admin.close();
   });
-
   it('has no assignee and no acceptance lifecycle', async () => {
     const home = tempHome();
+    const seedOwner = await testClient(home);
+    if (!(await seedOwner.agents.resolve('gracie')).match)
+      await seedOwner.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await seedOwner.close();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
-
     // Assigning a todo is not a thing that exists. The input rejects it rather
     // than quietly creating a private reminder the "assignee" never sees.
     await expect(
       // @ts-expect-error assigneeAgentId is deliberately absent from the input
-      gracie.todos.create({ title: 'Not yours', assigneeAgentId: 'codex' }),
+      gracie.todos.create({ title: 'Not yours', assignee: { kind: 'agent', id: 'codex' } }),
     ).rejects.toMatchObject({ code: 'INVALID_INPUT' });
-
     const todo = await gracie.todos.create({ title: 'Mine' });
     expect(Object.keys(gracie.todos)).not.toContain('accept');
     expect(Object.keys(gracie.todos)).not.toContain('reject');
-
-    const completed = await gracie.todos.complete({ todoId: todo.record.event.id });
+    const completed = await gracie.todos.complete({
+      expectedVersion: (await gracie.todos.get(todo.record.event.id)).lifecycleVersion!,
+      todoId: todo.record.event.id,
+    });
     expect(completed.status).toBe('completed');
-    const reopened = await gracie.todos.reopen({ todoId: todo.record.event.id });
+    const reopened = await gracie.todos.reopen({
+      expectedVersion: (await gracie.todos.get(todo.record.event.id)).lifecycleVersion!,
+      todoId: todo.record.event.id,
+    });
     expect(reopened.status).toBe('open');
-    const archived = await gracie.todos.archive({ todoId: todo.record.event.id });
+    const archived = await gracie.todos.archive({
+      expectedVersion: (await gracie.todos.get(todo.record.event.id)).lifecycleVersion!,
+      todoId: todo.record.event.id,
+    });
     expect(archived.status).toBe('archived');
     await gracie.close();
   });
-
   it('keeps todos out of another actor’s item list', async () => {
     const home = tempHome();
+    const seedOwner = await testClient(home);
+    if (!(await seedOwner.agents.resolve('gracie')).match)
+      await seedOwner.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await seedOwner.close();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
     await gracie.todos.create({ title: 'Private reminder' });
     const own = await gracie.todos.list();
     expect(own.items).toHaveLength(1);
     await gracie.close();
-
     const codex = await testClient(home, { kind: 'agent', id: 'codex' });
     const others = await codex.todos.list();
     expect(others.items).toHaveLength(0);
     await codex.close();
   });
-
   it('versions updates optimistically like every other record', async () => {
     const home = tempHome();
+    const owner = await testClient(home);
+    await owner.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await owner.close();
+    const seedOwner = await testClient(home);
+    if (!(await seedOwner.agents.resolve('gracie')).match)
+      await seedOwner.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await seedOwner.close();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     const todo = await gracie.todos.create({ title: 'First' });
     const updated = await gracie.todos.update({
@@ -489,114 +575,134 @@ describe('private todos', () => {
     await gracie.close();
   });
 });
-
 describe('unanswered and overdue discovery', () => {
   it('finds work nobody has answered yet, without claiming why', async () => {
     const home = tempHome();
+    const seedOwner = await testClient(home);
+    if (!(await seedOwner.agents.resolve('gracie')).match)
+      await seedOwner.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await seedOwner.close();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
-
-    await gracie.tasks.create({ assigneeAgentId: 'codex', title: 'Awaiting a decision' });
-    await gracie.memos.send({ recipientAgentId: 'codex', subject: 'Unread', body: 'Please read.' });
+    await gracie.tasks.create({
+      assignee: { kind: 'agent', id: 'codex' },
+      title: 'Awaiting a decision',
+    });
+    await gracie.memos.send({
+      recipient: { kind: 'agent', id: 'codex' },
+      subject: 'Unread',
+      body: 'Please read.',
+    });
     await gracie.kudos.give({
-      recipientAgentId: 'codex',
+      recipient: { kind: 'agent', id: 'codex' },
       title: 'Nice catch',
       reason: 'Spotted the off-by-one.',
     });
-
     const answered = await gracie.tasks.create({
-      assigneeAgentId: 'codex',
+      assignee: { kind: 'agent', id: 'codex' },
       title: 'Already answered',
     });
     await gracie.close();
-
     const codex = await testClient(home, { kind: 'agent', id: 'codex' });
-    await codex.tasks.accept({ taskId: answered.record.event.id });
-
-    const unanswered = await codex.discovery.unanswered({ participantAgentId: 'codex' });
+    await codex.tasks.accept({
+      expectedVersion: (await codex.tasks.get(answered.record.event.id)).lifecycleVersion!,
+      taskId: answered.record.event.id,
+    });
+    const unanswered = await codex.discovery.unanswered({
+      participant: { kind: 'agent', id: 'codex' },
+    });
     const titles = unanswered.items.map((item) => item.title).sort();
     expect(titles).toEqual(['Awaiting a decision', 'Nice catch', 'Unread']);
-
     // An accepted task is no longer awaiting an answer.
     expect(titles).not.toContain('Already answered');
     await codex.close();
   });
-
   it('respects an age filter', async () => {
     const home = tempHome();
+    const seedOwner = await testClient(home);
+    if (!(await seedOwner.agents.resolve('gracie')).match)
+      await seedOwner.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await seedOwner.close();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
-    await gracie.tasks.create({ assigneeAgentId: 'codex', title: 'Fresh' });
-
+    await gracie.tasks.create({ assignee: { kind: 'agent', id: 'codex' }, title: 'Fresh' });
     // Nothing is older than a day yet.
     const stale = await gracie.discovery.unanswered({ olderThanHours: 24 });
     expect(stale.items).toHaveLength(0);
-
     const all = await gracie.discovery.unanswered({});
     expect(all.items.length).toBeGreaterThan(0);
     await gracie.close();
   });
-
   it('reports open work past its deadline and ignores finished work', async () => {
     const home = tempHome();
+    const seedOwner = await testClient(home);
+    if (!(await seedOwner.agents.resolve('gracie')).match)
+      await seedOwner.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await seedOwner.close();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
-
     await gracie.tasks.create({
-      assigneeAgentId: 'codex',
+      assignee: { kind: 'agent', id: 'codex' },
       title: 'Late',
       due: { kind: 'date', date: '2020-01-01' },
     });
     const done = await gracie.tasks.create({
-      assigneeAgentId: 'codex',
+      assignee: { kind: 'agent', id: 'codex' },
       title: 'Late but finished',
       due: { kind: 'date', date: '2020-01-01' },
     });
     await gracie.tasks.create({
-      assigneeAgentId: 'codex',
+      assignee: { kind: 'agent', id: 'codex' },
       title: 'Due much later',
       due: { kind: 'date', date: '2999-01-01' },
     });
     await gracie.close();
-
     const codex = await testClient(home, { kind: 'agent', id: 'codex' });
-    await codex.tasks.accept({ taskId: done.record.event.id });
-    await codex.tasks.complete({ taskId: done.record.event.id });
-
+    await codex.tasks.accept({
+      expectedVersion: (await codex.tasks.get(done.record.event.id)).lifecycleVersion!,
+      taskId: done.record.event.id,
+    });
+    await codex.tasks.complete({
+      expectedVersion: (await codex.tasks.get(done.record.event.id)).lifecycleVersion!,
+      taskId: done.record.event.id,
+    });
     const overdue = await codex.discovery.overdue({});
     expect(overdue.items.map((item) => item.title)).toEqual(['Late']);
     await codex.close();
   });
-
   it('treats a date-only deadline as the end of that day', async () => {
     const home = tempHome();
+    const seedOwner = await testClient(home);
+    if (!(await seedOwner.agents.resolve('gracie')).match)
+      await seedOwner.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await seedOwner.close();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     await gracie.agents.create({ handle: 'codex', displayName: 'Codex' });
     const today = new Date().toISOString().slice(0, 10);
     await gracie.tasks.create({
-      assigneeAgentId: 'codex',
+      assignee: { kind: 'agent', id: 'codex' },
       title: 'Due today',
       due: { kind: 'date', date: today },
     });
-
     // Due today is not yet overdue — midnight would wrongly say otherwise.
     const now = await gracie.discovery.overdue({});
     expect(now.items).toHaveLength(0);
     await gracie.close();
   });
-
   it("shows the human operating the home an agent's todos, but not other agents", async () => {
     const home = tempHome();
+    const seedOwner = await testClient(home);
+    if (!(await seedOwner.agents.resolve('gracie')).match)
+      await seedOwner.agents.create({ handle: 'gracie', displayName: 'Gracie' });
+    await seedOwner.close();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
     await gracie.todos.create({ title: 'Gracie reminder' });
     await gracie.close();
-
     // Todos are hidden from other agents, not from the humans responsible for the agent.
     const troy = await testClient(home, { kind: 'human', id: 'troy' });
     const listed = await troy.items.list({ kinds: ['todo'] });
     expect(listed.items.map((item) => item.title)).toEqual(['Gracie reminder']);
     await troy.close();
-
     const codex = await testClient(home, { kind: 'agent', id: 'codex' });
     expect((await codex.items.list({ kinds: ['todo'] })).items).toHaveLength(0);
     await codex.close();

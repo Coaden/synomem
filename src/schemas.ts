@@ -1,3 +1,4 @@
+import { reactionCodes } from './participation.js';
 import { isAbsolute, normalize } from 'node:path';
 import { z } from 'zod';
 import type { JsonValue } from './types.js';
@@ -56,6 +57,17 @@ export const agentIdSchema = z.union([agentUlidSchema, agentHandleSchema]);
  * People type `Mike` and `mike` interchangeably, so accepting either and
  * storing one keeps a single alias from being claimed twice in two casings.
  */
+export const actorRefSchema = z
+  .object({
+    kind: z.enum(['human', 'agent']),
+    id: z
+      .string()
+      .min(1)
+      .max(100)
+      .regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/),
+  })
+  .strict();
+
 export const agentAliasSchema = z
   .string()
   .trim()
@@ -269,13 +281,20 @@ export const bindRuntimeSchema = z
   .strict();
 
 const baseEventSchema = z.object({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.literal(2),
   id: z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/),
   workspaceId: z.string().trim().min(1).max(100),
   aggregateId: z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$|^[a-z0-9]+(?:-[a-z0-9]+)*$/),
   aggregateVersion: z.number().int().min(1),
   createdAt: z.string().datetime({ offset: true }),
   actor: actorSchema,
+  intervention: z
+    .object({
+      basis: z.enum(['operator', 'workspace_admin', 'organization_admin', 'local_owner']),
+      reason: z.string().trim().min(1).max(2000).optional(),
+    })
+    .strict()
+    .optional(),
   idempotencyKey: z.string().trim().min(1).max(200).optional(),
   source: sourceSchema.optional(),
   metadata: metadataSchema.optional(),
@@ -308,7 +327,7 @@ export const kudosTagSchema = z
 
 const kudosGivenSchema = baseEventSchema.extend({
   type: z.literal('kudos.given'),
-  recipientAgentId: agentIdSchema,
+  recipient: actorRefSchema,
   recipientDisplayName: z.string().trim().min(1).max(200),
   title: z.string().trim().min(1).max(200),
   reason: z.string().trim().min(1).max(5000),
@@ -321,7 +340,7 @@ const kudosGivenSchema = baseEventSchema.extend({
 const acknowledgedSchema = baseEventSchema.extend({
   type: z.literal('kudos.acknowledged'),
   kudosId: z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/),
-  recipientAgentId: agentIdSchema,
+  recipient: actorRefSchema,
   note: z.string().trim().min(1).max(2000).optional(),
 });
 
@@ -365,7 +384,7 @@ const topicUpdatedSchema = baseEventSchema.extend({
 
 const memoSentSchema = baseEventSchema.extend({
   type: z.literal('memo.sent'),
-  recipientAgentId: agentIdSchema,
+  recipient: actorRefSchema,
   recipientDisplayName: z.string().trim().min(1).max(200),
   subject: z
     .string()
@@ -382,17 +401,17 @@ const memoSentSchema = baseEventSchema.extend({
 const memoReadSchema = baseEventSchema.extend({
   type: z.literal('memo.read'),
   memoId: z.string().length(26),
-  recipientAgentId: agentIdSchema,
+  recipient: actorRefSchema,
 });
 const memoArchivedSchema = baseEventSchema.extend({
   type: z.literal('memo.archived'),
   memoId: z.string().length(26),
-  recipientAgentId: agentIdSchema,
+  recipient: actorRefSchema,
 });
 
 const noteCreatedSchema = baseEventSchema.extend({
   type: z.literal('note.created'),
-  ownerAgentId: agentIdSchema,
+  owner: actorRefSchema,
   ownerDisplayName: z.string().trim().min(1).max(200),
   title: z
     .string()
@@ -430,6 +449,7 @@ const noteArchivedSchema = baseEventSchema.extend({
  * a visibility field would create a second, weaker way to hide a record.
  */
 const postFields = {
+  mentions: z.array(actorRefSchema).max(20).optional(),
   title: z
     .string()
     .trim()
@@ -443,7 +463,6 @@ const postFields = {
 const postCreatedSchema = baseEventSchema.extend({
   type: z.literal('post.created'),
   ...postFields,
-  replyTo: z.string().length(26).optional(),
 });
 const postEditedSchema = baseEventSchema.extend({
   type: z.literal('post.edited'),
@@ -511,7 +530,7 @@ const taskFields = {
 };
 const taskCreatedSchema = baseEventSchema.extend({
   type: z.literal('task.created'),
-  assigneeAgentId: agentIdSchema,
+  assignee: actorRefSchema,
   assigneeDisplayName: z.string().trim().min(1).max(200),
   requiresAcceptance: z.boolean(),
   ...taskFields,
@@ -543,6 +562,22 @@ const taskRejectedSchema = baseEventSchema.extend({
   // will not happen, not whether to reassign it, wait, or change the request.
   response: z.string().trim().min(1).max(2000),
 });
+const taskDecisionOverriddenSchema = baseEventSchema.extend({
+  type: z.literal('task.decision_overridden'),
+  taskId: z.string().length(26),
+  previousStatus: z.enum(['open', 'rejected']),
+  nextStatus: z.enum(['open', 'rejected']),
+  reason: z.string().trim().min(1).max(2000),
+});
+export const overrideTaskDecisionSchema = z
+  .object({
+    taskId: z.string().length(26),
+    expectedVersion: z.number().int().min(1),
+    nextStatus: z.enum(['open', 'rejected']),
+    reason: z.string().trim().min(1).max(2000),
+    idempotencyKey: z.string().trim().min(1).max(200).optional(),
+  })
+  .strict();
 const taskCanceledSchema = baseEventSchema.extend({
   type: z.literal('task.canceled'),
   taskId: z.string().length(26),
@@ -564,6 +599,7 @@ const todoFields = {
 };
 const todoCreatedSchema = baseEventSchema.extend({
   type: z.literal('todo.created'),
+  owner: actorRefSchema,
   ...todoFields,
 });
 const todoUpdatedSchema = baseEventSchema.extend({
@@ -590,7 +626,67 @@ const todoArchivedSchema = baseEventSchema.extend({
   todoId: z.string().length(26),
 });
 
+const replyCreatedSchema = baseEventSchema.extend({
+  type: z.literal('reply.created'),
+  rootId: z.string().length(26),
+  parentId: z.string().length(26).nullable(),
+  body: z.string().trim().min(1).max(16000),
+  mentions: z.array(actorRefSchema).max(20),
+});
+const replyDeletedSchema = baseEventSchema.extend({
+  type: z.literal('reply.deleted'),
+  rootId: z.string().length(26),
+  replyId: z.string().length(26),
+  reason: z.string().trim().min(1).max(2000).optional(),
+});
+const reactionAddedSchema = baseEventSchema.extend({
+  type: z.literal('reaction.added'),
+  rootId: z.string().length(26),
+  targetId: z.string().length(26),
+  code: z.enum(reactionCodes),
+});
+const reactionRemovedSchema = reactionAddedSchema.extend({ type: z.literal('reaction.removed') });
+export const threadInputSchema = z
+  .object({
+    rootId: z.string().length(26),
+    after: z.string().max(4096).optional(),
+    limit: z.number().int().min(1).max(100).optional(),
+  })
+  .strict();
+export const threadSubscriptionSchema = z
+  .object({ rootId: z.string().length(26), following: z.boolean(), muted: z.boolean() })
+  .strict();
+export const replyCreateSchema = z
+  .object({
+    rootId: z.string().length(26),
+    parentId: z.string().length(26).nullable().optional(),
+    body: z.string().trim().min(1).max(16000),
+    mentions: z.array(actorRefSchema).max(20).optional(),
+    idempotencyKey: z.string().trim().min(1).max(200).optional(),
+  })
+  .strict();
+export const replyDeleteSchema = z
+  .object({
+    replyId: z.string().length(26),
+    expectedVersion: z.number().int().positive(),
+    reason: z.string().trim().min(1).max(2000).optional(),
+    idempotencyKey: z.string().trim().min(1).max(200).optional(),
+  })
+  .strict();
+export const reactionSetSchema = z
+  .object({
+    targetId: z.string().length(26),
+    code: z.enum(reactionCodes),
+    present: z.boolean(),
+    idempotencyKey: z.string().trim().min(1).max(200).optional(),
+  })
+  .strict();
+
 export const eventSchema = z.discriminatedUnion('type', [
+  replyCreatedSchema,
+  replyDeletedSchema,
+  reactionAddedSchema,
+  reactionRemovedSchema,
   postCreatedSchema,
   postEditedSchema,
   postArchivedSchema,
@@ -616,6 +712,7 @@ export const eventSchema = z.discriminatedUnion('type', [
   taskAcceptedSchema,
   taskRejectedSchema,
   taskCanceledSchema,
+  taskDecisionOverriddenSchema,
   todoCreatedSchema,
   todoUpdatedSchema,
   todoCompletedSchema,
@@ -634,6 +731,7 @@ const giveKudosInputSchema = kudosGivenSchema
     aggregateVersion: true,
     createdAt: true,
     actor: true,
+    intervention: true,
     recipientDisplayName: true,
   })
   .extend({
@@ -641,7 +739,8 @@ const giveKudosInputSchema = kudosGivenSchema
     evidence: z.array(evidenceSchema).max(10).optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
     topicIds: topicIdsFieldSchema,
-  });
+  })
+  .strict();
 
 function enforceKudosPayloadSize(value: unknown, context: z.RefinementCtx): void {
   if (Buffer.byteLength(JSON.stringify(value), 'utf8') > 32_768) {
@@ -657,7 +756,7 @@ export const giveKudosMcpSchema = giveKudosInputSchema
 
 export const listInputSchema = z
   .object({
-    recipientAgentId: agentIdSchema.optional(),
+    recipient: actorRefSchema.optional(),
     actorId: agentIdSchema.optional(),
     actorKind: z.enum(['human', 'agent', 'system']).optional(),
     tag: z.string().trim().min(1).max(64).optional(),
@@ -689,7 +788,7 @@ const mutationMetadata = {
 };
 export const sendMemoSchema = z
   .object({
-    recipientAgentId: agentIdSchema,
+    recipient: actorRefSchema,
     subject: memoSentSchema.shape.subject,
     body: memoSentSchema.shape.body,
     tags: z.array(kudosTagSchema).max(20).optional(),
@@ -701,7 +800,6 @@ export const sendMemoSchema = z
 export const createPostSchema = z
   .object({
     ...postFields,
-    replyTo: z.string().length(26).optional(),
     ...mutationMetadata,
   })
   .strict();
@@ -709,6 +807,7 @@ export const updatePostSchema = z
   .object({
     postId: z.string().length(26),
     expectedVersion: z.number().int().min(1),
+    mentions: postFields.mentions,
     title: postFields.title.optional(),
     body: postFields.body.optional(),
     tags: postFields.tags,
@@ -719,7 +818,7 @@ export const updatePostSchema = z
 
 export const createNoteSchema = z
   .object({
-    ownerAgentId: agentIdSchema.optional(),
+    owner: actorRefSchema.optional(),
     title: noteCreatedSchema.shape.title,
     body: noteCreatedSchema.shape.body,
     tags: z.array(kudosTagSchema).max(20).optional(),
@@ -740,7 +839,7 @@ export const reviseNoteSchema = z
   .strict();
 export const createTaskSchema = z
   .object({
-    assigneeAgentId: agentIdSchema.optional(),
+    assignee: actorRefSchema.optional(),
     title: taskCreatedSchema.shape.title,
     description: taskCreatedSchema.shape.description,
     priority: taskCreatedSchema.shape.priority.optional(),
@@ -773,6 +872,7 @@ export const updateTaskSchema = z
  */
 export const createTodoSchema = z
   .object({
+    owner: actorRefSchema.optional(),
     title: todoCreatedSchema.shape.title,
     details: todoCreatedSchema.shape.details,
     priority: todoCreatedSchema.shape.priority.optional(),
@@ -802,7 +902,7 @@ export const itemListInputSchema = z
       .array(z.enum(['kudos', 'memo', 'note', 'post', 'task', 'todo']))
       .max(5)
       .optional(),
-    participantAgentId: agentIdSchema.optional(),
+    participant: actorRefSchema.optional(),
     actorId: agentIdSchema.optional(),
     actorKind: z.enum(['human', 'agent', 'system']).optional(),
     awaitingResponse: z.boolean().optional(),

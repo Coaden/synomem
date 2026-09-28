@@ -1,3 +1,18 @@
+import type { ActorDirectoryInput, ActorProfile, ActorProfileInput } from './actor-directory.js';
+import type { BookmarkInput, BookmarkPage } from './bookmarks.js';
+import type { SearchInput, SearchPage } from './search.js';
+import type { NotificationInput, NotificationPage } from './notifications.js';
+import type {
+  ReplyCreateInput,
+  ReplyDeleteInput,
+  ReplyRecord,
+  ReactionSetInput,
+  ReactionSummary,
+  ThreadInput,
+  ThreadPage,
+} from './participation.js';
+import type { OverrideTaskDecisionInput } from './types.js';
+import type { ActorRef, AddressableActor } from './policy.js';
 import type {
   ActorIdentity,
   AgentDirectoryEntry,
@@ -52,6 +67,16 @@ import type {
 
 export interface SynomemServiceCapabilities {
   backend: 'local' | 'remote';
+  participation?: {
+    version: 2;
+    replies: boolean;
+    reactions: boolean;
+    personalInbox: boolean;
+    search?: boolean;
+    canWrite: boolean;
+    administrator: boolean;
+    managedAgentIds: string[];
+  };
   binding: {
     workspaceId: string;
     actor: ActorIdentity;
@@ -81,7 +106,46 @@ export interface ProjectionRebuildResult {
 }
 
 export interface SynomemDomainService {
+  readonly bookmarks: {
+    list(input?: BookmarkInput): Promise<BookmarkPage>;
+    has(rootId: string): Promise<{ saved: boolean }>;
+    set(input: { rootId: string; present: boolean }): Promise<{ saved: boolean }>;
+  };
+  search(input: SearchInput): Promise<SearchPage>;
+  readonly notifications: {
+    list(input?: NotificationInput): Promise<NotificationPage>;
+    read(id: string): Promise<void>;
+    dismiss(id: string): Promise<void>;
+    readThrough(through: string): Promise<void>;
+  };
+
+  readonly replies: {
+    changes(input: ThreadInput): Promise<ThreadPage>;
+    create(input: ReplyCreateInput): Promise<ReplyRecord>;
+    get(id: string): Promise<ReplyRecord>;
+    delete(input: ReplyDeleteInput): Promise<ReplyRecord>;
+  };
+  readonly threads: {
+    read(input: { rootId: string; through: string }): Promise<void>;
+    get(input: ThreadInput): Promise<ThreadPage>;
+    subscription(input: { rootId: string; following: boolean; muted: boolean }): Promise<void>;
+  };
+  readonly reactions: {
+    set(input: ReactionSetInput): Promise<ReactionSummary>;
+    get(targetId: string): Promise<ReactionSummary>;
+  };
+
   readonly actor: ActorIdentity;
+  readonly actors: {
+    profile(input: ActorProfileInput): Promise<ActorProfile>;
+    list(input?: ActorDirectoryInput): Promise<AddressableActor[]>;
+    get(ref: ActorRef): Promise<AddressableActor>;
+    registerHuman(input: {
+      id: string;
+      handle: string;
+      displayName: string;
+    }): Promise<AddressableActor>;
+  };
   readonly agents: {
     create(input: CreateAgentInput): Promise<AgentProfile>;
     update(id: string, changes: UpdateAgentInput): Promise<AgentProfile>;
@@ -120,16 +184,23 @@ export interface SynomemDomainService {
     get(id: string): Promise<PostRecord>;
     update(input: UpdatePostInput): Promise<PostRecord>;
     archive(input: {
+      expectedVersion: number;
       postId: string;
       reason?: string;
       idempotencyKey?: string;
     }): Promise<PostRecord>;
     acknowledge(input: {
+      expectedVersion: number;
       postId: string;
       note?: string;
       idempotencyKey?: string;
     }): Promise<PostRecord>;
-    withdrawAcknowledgment(input: { postId: string; reason?: string }): Promise<PostRecord>;
+    withdrawAcknowledgment(input: {
+      expectedVersion: number;
+      postId: string;
+      reason?: string;
+      idempotencyKey?: string;
+    }): Promise<PostRecord>;
     roster(postId: string): Promise<PostRoster>;
   };
   readonly kudos: {
@@ -137,51 +208,79 @@ export interface SynomemDomainService {
     list(input?: KudosListInput): Promise<Page<KudosSummary>>;
     changes(input?: KudosChangesInput): Promise<ChangePage>;
     get(id: string): Promise<KudosRecord>;
-    acknowledge(input: { kudosId: string; note?: string }): Promise<KudosRecord>;
+    acknowledge(input: {
+      expectedVersion: number;
+      kudosId: string;
+      note?: string;
+      idempotencyKey?: string;
+    }): Promise<KudosRecord>;
     revoke(input: {
+      expectedVersion: number;
       kudosId: string;
       reason: string;
       administrative?: boolean;
+      idempotencyKey?: string;
     }): Promise<KudosRecord>;
   };
   readonly memos: {
     send(input: SendMemoInput): Promise<SendMemoResult>;
     list(input?: Omit<ItemListInput, 'kinds'>): Promise<Page<ItemSummary>>;
     get(id: string): Promise<MemoRecord>;
-    read(input: { memoId: string; idempotencyKey?: string }): Promise<MemoRecord>;
-    archive(input: { memoId: string; idempotencyKey?: string }): Promise<MemoRecord>;
+    read(input: {
+      expectedVersion: number;
+      memoId: string;
+      idempotencyKey?: string;
+    }): Promise<MemoRecord>;
+    archive(input: {
+      expectedVersion: number;
+      memoId: string;
+      idempotencyKey?: string;
+    }): Promise<MemoRecord>;
   };
   readonly notes: {
     create(input: CreateNoteInput): Promise<CreateNoteResult>;
     list(input?: Omit<ItemListInput, 'kinds'>): Promise<Page<ItemSummary>>;
     get(id: string): Promise<NoteRecord>;
     revise(input: ReviseNoteInput): Promise<NoteRecord>;
-    archive(input: { noteId: string; idempotencyKey?: string }): Promise<NoteRecord>;
+    archive(input: {
+      expectedVersion: number;
+      noteId: string;
+      idempotencyKey?: string;
+    }): Promise<NoteRecord>;
   };
   readonly tasks: {
+    overrideDecision(input: OverrideTaskDecisionInput): Promise<TaskRecord>;
     create(input: CreateTaskInput): Promise<CreateTaskResult>;
     list(input?: Omit<ItemListInput, 'kinds'>): Promise<Page<ItemSummary>>;
     get(id: string): Promise<TaskRecord>;
     update(input: UpdateTaskInput): Promise<TaskRecord>;
     accept(input: {
+      expectedVersion: number;
       taskId: string;
       /** Optional: conditions, timing, or partial capability. */
       response?: string;
       idempotencyKey?: string;
     }): Promise<TaskRecord>;
     reject(input: {
+      expectedVersion: number;
       taskId: string;
       /** Required: a refusal the assigner cannot act on is barely an answer. */
       response: string;
       idempotencyKey?: string;
     }): Promise<TaskRecord>;
     complete(input: {
+      expectedVersion: number;
       taskId: string;
       note?: string;
       idempotencyKey?: string;
     }): Promise<TaskRecord>;
-    reopen(input: { taskId: string; idempotencyKey?: string }): Promise<TaskRecord>;
+    reopen(input: {
+      expectedVersion: number;
+      taskId: string;
+      idempotencyKey?: string;
+    }): Promise<TaskRecord>;
     cancel(input: {
+      expectedVersion: number;
       taskId: string;
       reason?: string;
       idempotencyKey?: string;
@@ -196,17 +295,27 @@ export interface SynomemDomainService {
     get(id: string): Promise<TodoRecord>;
     update(input: UpdateTodoInput): Promise<TodoRecord>;
     complete(input: {
+      expectedVersion: number;
       todoId: string;
       note?: string;
       idempotencyKey?: string;
     }): Promise<TodoRecord>;
-    reopen(input: { todoId: string; idempotencyKey?: string }): Promise<TodoRecord>;
+    reopen(input: {
+      expectedVersion: number;
+      todoId: string;
+      idempotencyKey?: string;
+    }): Promise<TodoRecord>;
     cancel(input: {
+      expectedVersion: number;
       todoId: string;
       reason?: string;
       idempotencyKey?: string;
     }): Promise<TodoRecord>;
-    archive(input: { todoId: string; idempotencyKey?: string }): Promise<TodoRecord>;
+    archive(input: {
+      expectedVersion: number;
+      todoId: string;
+      idempotencyKey?: string;
+    }): Promise<TodoRecord>;
   };
   /**
    * Unanswered and overdue discovery. Derived from durable events; never a

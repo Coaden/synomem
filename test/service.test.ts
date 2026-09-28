@@ -1,10 +1,10 @@
+import { localOwnerAuthority, resolveAuthority } from '../src/policy.js';
 import { describe, expect, it } from 'vitest';
 import { SynomemClient, SynomemCore } from '../src/client.js';
 import { ProjectionManager } from '../src/projections.js';
 import type { SynomemDomainService, SynomemService } from '../src/service.js';
 import { SynomemStorage } from '../src/storage.js';
 import { tempHome } from './helpers.js';
-
 describe('domain service boundary', () => {
   it('runs authoritative behavior with injected repository and projection ports', async () => {
     const home = tempHome();
@@ -13,20 +13,18 @@ describe('domain service boundary', () => {
       repository,
       projectionWriter: new ProjectionManager(repository),
       actor: { kind: 'human', id: 'troy', displayName: 'Troy' },
+      authority: localOwnerAuthority(),
     });
     await service.init();
-
     await service.agents.create({ handle: 'codex', displayName: 'Codex' });
     const memo = await service.memos.send({
-      recipientAgentId: 'codex',
+      recipient: { kind: 'agent', id: 'codex' },
       subject: 'Repository boundary',
       body: 'The core received its repository and projection writer as ports.',
     });
     expect(await service.items.get(memo.record.event.id)).toMatchObject({ status: 'unread' });
-
     await service.close();
   });
-
   it('allows adapters to deny the local human-administrator default explicitly', async () => {
     const home = tempHome();
     const repository = new SynomemStorage({ home, readOnly: false });
@@ -34,26 +32,32 @@ describe('domain service boundary', () => {
       repository,
       projectionWriter: new ProjectionManager(repository),
       actor: { kind: 'human', id: 'owner', displayName: 'Owner' },
+      authority: localOwnerAuthority(),
     });
     await administrator.init();
     await administrator.agents.create({ handle: 'codex', displayName: 'Codex' });
     const kudos = await administrator.kudos.give({
-      recipientAgentId: 'codex',
+      recipient: { kind: 'agent', id: 'codex' },
       title: 'Explicit authority',
       reason: 'Provides an aggregate for the adapter-level boundary.',
     });
+    await administrator.actors.registerHuman({
+      id: 'member',
+      handle: 'member',
+      displayName: 'Member',
+    });
     await administrator.close();
-
     const restrictedRepository = new SynomemStorage({ home, readOnly: false });
     const restrictedHuman = new SynomemCore({
       repository: restrictedRepository,
       projectionWriter: new ProjectionManager(restrictedRepository),
       actor: { kind: 'human', id: 'member', displayName: 'Member' },
-      administrative: false,
+      authority: resolveAuthority(),
     });
     await restrictedHuman.init();
     await expect(
       restrictedHuman.kudos.revoke({
+        expectedVersion: (await restrictedHuman.kudos.get(kudos.record.event.id)).lifecycleVersion!,
         kudosId: kudos.record.event.id,
         reason: 'A hosted human membership is not implicitly administrative.',
         administrative: true,
@@ -61,15 +65,14 @@ describe('domain service boundary', () => {
     ).rejects.toMatchObject({ code: 'REVOCATION_FORBIDDEN' });
     await restrictedHuman.close();
   });
-
   it('exposes local behavior without requiring storage or projections from adapters', async () => {
     const home = tempHome();
     const service: SynomemService = new SynomemClient({
       home,
       actor: { kind: 'human', id: 'troy', displayName: 'Troy' },
+      authority: localOwnerAuthority(),
     });
     await service.init();
-
     const info = await service.info();
     expect(info).toMatchObject({ backend: 'local', home });
     expect(await service.capabilities()).toMatchObject({
@@ -81,16 +84,14 @@ describe('domain service boundary', () => {
       },
       projections: { writeWinsMarkdown: true },
     });
-
     await service.agents.create({ handle: 'codex', displayName: 'Codex' });
     const result = await service.kudos.give({
-      recipientAgentId: 'codex',
+      recipient: { kind: 'agent', id: 'codex' },
       title: 'Preserved the domain boundary',
       reason: 'Kept transport adapters independent from concrete local storage.',
     });
     expect(await service.getCanonicalEvent(result.record.event.id)).toEqual(result.record.event);
     expect((await service.rebuild()).generated.length).toBeGreaterThan(0);
-
     await service.close();
   });
 });

@@ -250,8 +250,12 @@ describe('CLI: local setup and profiles', () => {
       '--body',
       'Please review.',
     ]);
-    const inbox = await okJson<{ items: Array<{ id: string }> }>(['--profile', 'codex', 'inbox']);
-    expect(inbox.items.map((item) => item.id)).toContain(memo.record.event.id);
+    const inbox = await okJson<{ items: Array<{ rootId: string }> }>([
+      '--profile',
+      'codex',
+      'inbox',
+    ]);
+    expect(inbox.items.map((item) => item.rootId)).toContain(memo.record.event.id);
     const read = await okJson<{ status: string }>([
       '--profile',
       'codex',

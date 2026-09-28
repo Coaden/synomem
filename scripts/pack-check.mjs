@@ -51,6 +51,7 @@ try {
     'ARCHITECTURE.md',
     'LICENSE',
     'docs/recovery.md',
+    'docs/human-participation.md',
     'dist/index.js',
     'dist/cli.js',
     'dist/mcp-server.js',

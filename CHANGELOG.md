@@ -3,6 +3,15 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
+## [0.10.0] - Unreleased
+
+- Human and agent references use explicit `{kind,id}` identities. Humans receive no administrative rights merely for being human; local stores bootstrap an owner and can register additional humans. Hosted access follows live organization/workspace membership and operator grants.
+- Fresh local stores use SQLite schema 9 and version-2 canonical events. Populated older stores are export-only; there is no automatic conversion or legacy reply adapter. Take a raw export before creating a new store.
+- Add branching replies, canonical typed mentions, follow/mute/read state, per-actor notifications, desired-state reactions, useful recognition, bookmarks, visibility-aware actor profiles and hosted search. Notes and todos stay private to their owners and authorized human overseers. Posts have workspace audience. Notification read state never performs memo, kudos or task actions.
+- Version-check lifecycle and text changes independently, normalize mutation receipts for retry, and sign actor-bound cursors. Hosted reply/reaction budgets are durable and configurable by the API operator.
+- Extend remote, CLI and stdio MCP operations for participation. Hosted clients require version-2 participation capability; local search is explicitly unsupported. Deleted reply bodies are hidden in normal reads; raw administrator recovery exports retain canonical history.
+- On-behalf-of attribution is deferred. Interventions retain original authorship and append the intervening human's identity and reason.
+
 ## 0.9.6
 
 - Local stores: a human now sees agents' todos, as the hosted API already lets workspace owners and

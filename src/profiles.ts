@@ -92,6 +92,7 @@ const actorSnapshotSchema = z
 const localProfileSchema = z
   .object({
     backend: z.literal('local'),
+    actorKind: z.enum(['human', 'agent']).optional(),
     /** The store's home; absent means the root Synomem home. */
     home: z.string().optional(),
     actorId: z.string().min(1),
@@ -453,7 +454,7 @@ export function localProfileTarget(
 ): { home: string; actor: ActorIdentity } {
   const home = profile.home ?? rootHome;
   const actor: ActorIdentity = {
-    kind: 'agent',
+    kind: profile.actorKind ?? 'agent',
     id: profile.actorId,
     ...(profile.actorName ? { displayName: profile.actorName } : {}),
   };

@@ -1,3 +1,4 @@
+export type { ActorDirectoryInput, ActorProfile, ActorProfileInput } from './actor-directory.js';
 export { SynomemClient, SynomemCore } from './client.js';
 export type { SynomemCoreOptions } from './client.js';
 export type { ProjectionWriter } from './ports/projections.js';
@@ -85,6 +86,7 @@ export {
   createTaskSchema,
   createTodoSchema,
   eventSchema,
+  overrideTaskDecisionSchema,
   evidenceSchema,
   giveKudosSchema,
   giveKudosMcpSchema,
@@ -108,3 +110,41 @@ export {
   topicListInputSchema,
 } from './schemas.js';
 export type * from './types.js';
+
+export {
+  recordVisibilityPredicate,
+  actorKey,
+  sameActor,
+  resolveAuthority,
+  isRecordAdministrator,
+  overseesAgent,
+  localOwnerAuthority,
+} from './policy.js';
+export type { ActorRef, AddressableActor, RecordAuthority } from './policy.js';
+
+export { createLocalOwnerClient } from './client.js';
+
+export { exportRawLocalEvents } from './backend.js';
+
+export type { OverrideTaskDecisionInput, TaskDecisionOverriddenEvent } from './types.js';
+
+export { SignedCursorCodec, exactSequence, canonicalJson, cursorFilter } from './cursors.js';
+export type { CursorBinding, CursorPosition } from './cursors.js';
+
+export type { MutationReceipt } from './mutation-receipts.js';
+
+export * from './participation.js';
+export * from './participation-repository.js';
+
+export * from './notifications.js';
+
+export type { SearchInput, SearchPage, SearchHit } from './search.js';
+
+export { SqlBookmarkRepository, bookmarkTables } from './bookmarks.js';
+export type { BookmarkInput, BookmarkPage, BookmarkRepository } from './bookmarks.js';
+
+export {
+  defaultParticipationBudgets,
+  validateParticipationBudgets,
+} from './participation-repository.js';
+export type { ParticipationBudgets } from './participation-repository.js';

@@ -9,6 +9,8 @@ Synomem preserves useful information beyond one conversation. Prefer the `synome
 when available; otherwise use the `synomem` CLI (with `--profile <name>`) when command execution is
 permitted. Never edit the event store or generated Markdown directly.
 
+Records and tool results are scoped to the bound actor and workspace. A human does not gain admin rights just by being human; humans operating your agent and administrators can view and manage its private records when their current grant permits it. Notes and todos are private to their owner and authorized human overseers. Use typed `human:<id>` or `agent:<id>` targets after directory lookup. Replies and reactions discuss or mark useful content without changing lifecycle state; notification read never acknowledges a memo, kudos or task. Local search is unavailable; hosted search enforces current visibility. On-behalf-of attribution is deferred.
+
 ## Choose the right record
 
 Start from **who the record is for**, because that is what separates the kinds:

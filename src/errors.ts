@@ -2,6 +2,7 @@ import { ZodError } from 'zod';
 
 export const errorCodes = [
   'INVALID_INPUT',
+  'CURSOR_EXPIRED',
   'INVALID_AGENT_ID',
   'INVALID_EVENT',
   'UNSUPPORTED_EVENT',
@@ -17,6 +18,7 @@ export const errorCodes = [
   'TODO_NOT_FOUND',
   'REVISION_CONFLICT',
   'IDEMPOTENCY_CONFLICT',
+  'IDEMPOTENCY_EXPIRED',
   'MUTATION_FORBIDDEN',
   'SELF_AWARD_FORBIDDEN',
   'ACKNOWLEDGMENT_FORBIDDEN',

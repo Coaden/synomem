@@ -1,3 +1,21 @@
+import type { ActorDirectoryInput } from './actor-directory.js';
+import type { SQLInputValue as HpSQLInputValue } from 'node:sqlite';
+import { SqlBookmarkRepository, bookmarkTables } from './bookmarks.js';
+import { SqlNotificationRepository, notificationTables } from './notifications.js';
+import {
+  SqlParticipationRepository,
+  participationStatements,
+  participationTables,
+} from './participation-repository.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { MutationReceipt } from './mutation-receipts.js';
+import { randomBytes } from 'node:crypto';
+import { SignedCursorCodec, cursorFilter, exactSequence } from './cursors.js';
+import type { CursorBinding } from './cursors.js';
+import type { StatementSync } from 'node:sqlite';
+import type { ActorRef } from './policy.js';
+import { recordVisibilityPredicate, resolveAuthority } from './policy.js';
+import type { RecordAuthority, AddressableActor } from './policy.js';
 import {
   chmodSync,
   closeSync,
@@ -7,6 +25,8 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  readFileSync,
+  readSync,
   rmdirSync,
   unlinkSync,
 } from 'node:fs';
@@ -45,18 +65,17 @@ import type {
   KudosSummary,
   Page,
 } from './types.js';
-
 interface EventRow {
   id: string;
   payload: string;
-  sequence?: number;
+  sequence?: bigint;
 }
-
 interface CurrentRow {
   kudos_id: string;
-  given_sequence: number;
+  given_sequence: bigint;
   created_at: string;
-  recipient_agent_id: string;
+  recipient_kind: 'human' | 'agent';
+  recipient_id: string;
   recipient_display_name: string;
   actor_kind: ActorIdentity['kind'];
   actor_id: string;
@@ -67,14 +86,13 @@ interface CurrentRow {
   visibility: KudosSummary['visibility'];
   status: KudosSummary['status'];
   revocation_status: KudosSummary['revocationStatus'];
-  updated_sequence: number;
+  updated_sequence: bigint;
 }
-
 interface ItemRow {
   item_id: string;
   kind: RecordKind;
-  created_sequence: number;
-  updated_sequence: number;
+  created_sequence: bigint;
+  updated_sequence: bigint;
   created_at: string;
   updated_at: string;
   actor_kind: ActorIdentity['kind'];
@@ -85,33 +103,34 @@ interface ItemRow {
   topic_ids_json: string;
   visibility: ItemSummary['visibility'];
   status: string;
-  recipient_agent_id: string | null;
+  recipient_kind: 'human' | 'agent';
+  recipient_id: string | null;
   recipient_display_name: string | null;
-  owner_agent_id: string | null;
+  owner_kind: 'human' | 'agent' | null;
+  owner_id: string | null;
   owner_display_name: string | null;
-  assignee_agent_id: string | null;
+  assignee_kind: 'human' | 'agent' | null;
+  assignee_id: string | null;
   assignee_display_name: string | null;
 }
-
 export interface EventScan {
   events: SynomemEvent[];
-  invalid: Array<{ id: string; error: SynomemError }>;
+  invalid: Array<{
+    id: string;
+    error: SynomemError;
+  }>;
 }
-
 interface ProfileRow {
   profile_json: string;
 }
-
 interface TopicRow {
   id: string;
   display_name: string;
   status: 'active' | 'archived';
   created_at: string;
 }
-
 /** The schema version this file writes and expects. */
-const SUPPORTED_SCHEMA_VERSION = 8;
-
+const SUPPORTED_SCHEMA_VERSION = 9;
 const migrationV1 = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version INTEGER PRIMARY KEY,
@@ -138,7 +157,8 @@ CREATE TABLE IF NOT EXISTS events (
   created_at TEXT NOT NULL,
   actor_kind TEXT NOT NULL,
   actor_id TEXT NOT NULL,
-  recipient_agent_id TEXT,
+  recipient_kind TEXT NOT NULL DEFAULT 'agent',
+  recipient_id TEXT,
   kudos_id TEXT,
   visibility TEXT,
   idempotency_key TEXT,
@@ -150,7 +170,7 @@ ON events(actor_kind, actor_id, idempotency_key)
 WHERE type = 'kudos.given' AND idempotency_key IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS events_type_created ON events(type, created_at, id);
-CREATE INDEX IF NOT EXISTS events_recipient ON events(recipient_agent_id, created_at, id);
+CREATE INDEX IF NOT EXISTS events_recipient ON events(recipient_id, created_at, id);
 CREATE INDEX IF NOT EXISTS events_kudos_id ON events(kudos_id, created_at, id);
 
 CREATE TABLE IF NOT EXISTS projection_manifest (
@@ -168,7 +188,6 @@ BEFORE DELETE ON events BEGIN
   SELECT RAISE(ABORT, 'events are append-only');
 END;
 `;
-
 const migrationV2 = `
 DROP TRIGGER IF EXISTS events_append_only_update;
 ALTER TABLE events ADD COLUMN sequence INTEGER;
@@ -187,7 +206,8 @@ CREATE TABLE kudos_current (
   kudos_id TEXT PRIMARY KEY,
   given_sequence INTEGER NOT NULL UNIQUE,
   created_at TEXT NOT NULL,
-  recipient_agent_id TEXT NOT NULL,
+  recipient_kind TEXT NOT NULL DEFAULT 'agent',
+  recipient_id TEXT NOT NULL,
   recipient_display_name TEXT NOT NULL,
   actor_kind TEXT NOT NULL,
   actor_id TEXT NOT NULL,
@@ -200,11 +220,10 @@ CREATE TABLE kudos_current (
   revocation_status TEXT NOT NULL,
   updated_sequence INTEGER NOT NULL
 ) STRICT;
-CREATE INDEX kudos_current_recipient ON kudos_current(recipient_agent_id, given_sequence DESC);
+CREATE INDEX kudos_current_recipient ON kudos_current(recipient_id, given_sequence DESC);
 CREATE INDEX kudos_current_actor ON kudos_current(actor_kind, actor_id, given_sequence DESC);
 CREATE INDEX kudos_current_status ON kudos_current(status, revocation_status, given_sequence DESC);
 `;
-
 /**
  * v4 records a task's or todo's deadline on the item index.
  *
@@ -218,7 +237,6 @@ const migrationV4 = `
 ALTER TABLE items_current ADD COLUMN due_at TEXT;
 CREATE INDEX items_current_due ON items_current(kind, status, due_at);
 `;
-
 /**
  * v5 makes alias lookup case-insensitive and unambiguous.
  *
@@ -252,7 +270,6 @@ CREATE UNIQUE INDEX agent_runtime_bindings_unique
   ON agent_runtime_bindings(agent_id, runtime, COALESCE(profile, ''), COALESCE(installation_id, ''));
 CREATE INDEX agent_runtime_bindings_agent ON agent_runtime_bindings(agent_id);
 `;
-
 const migrationV6 = `
 -- Acknowledgements are their own rows rather than a column on the post: many
 -- actors acknowledge one post independently, and the interesting question is
@@ -268,7 +285,6 @@ CREATE TABLE post_acknowledgments (
 ) STRICT;
 CREATE INDEX post_acknowledgments_post ON post_acknowledgments(post_id);
 `;
-
 const migrationV7 = `
 -- Opaque canonical IDs, with the handle as a separate mutable name.
 --
@@ -283,7 +299,6 @@ CREATE UNIQUE INDEX agents_handle ON agents(handle);
 -- Archived agents keep their records and stop being able to act.
 ALTER TABLE agents ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
 `;
-
 const migrationV8 = `
 -- Topics: a controlled, reusable subject a record can be filed under,
 -- distinct from a free-text tag (§ Topic in types.ts). One canonical display
@@ -302,7 +317,6 @@ CREATE TABLE topic_aliases (
 ) STRICT;
 CREATE INDEX topic_aliases_topic ON topic_aliases(topic_id);
 `;
-
 const migrationV3 = `
 DROP TRIGGER IF EXISTS events_append_only_update;
 DROP TRIGGER IF EXISTS events_append_only_delete;
@@ -353,17 +367,20 @@ CREATE TABLE items_current (
   topic_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(topic_ids_json)),
   visibility TEXT NOT NULL,
   status TEXT NOT NULL,
-  recipient_agent_id TEXT,
+  recipient_kind TEXT NOT NULL DEFAULT 'agent',
+  recipient_id TEXT,
   recipient_display_name TEXT,
-  owner_agent_id TEXT,
+  owner_kind TEXT,
+  owner_id TEXT,
   owner_display_name TEXT,
-  assignee_agent_id TEXT,
+  assignee_kind TEXT,
+  assignee_id TEXT,
   assignee_display_name TEXT
 ) STRICT;
 CREATE INDEX items_current_kind_sequence ON items_current(kind, created_sequence DESC);
-CREATE INDEX items_current_recipient ON items_current(recipient_agent_id, created_sequence DESC);
-CREATE INDEX items_current_owner ON items_current(owner_agent_id, created_sequence DESC);
-CREATE INDEX items_current_assignee ON items_current(assignee_agent_id, created_sequence DESC);
+CREATE INDEX items_current_recipient ON items_current(recipient_id, created_sequence DESC);
+CREATE INDEX items_current_owner ON items_current(owner_id, created_sequence DESC);
+CREATE INDEX items_current_assignee ON items_current(assignee_id, created_sequence DESC);
 CREATE INDEX items_current_status ON items_current(kind, status, created_sequence DESC);
 
 CREATE TRIGGER events_append_only_update
@@ -371,35 +388,7 @@ BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'events are append-only'); END
 CREATE TRIGGER events_append_only_delete
 BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
 `;
-
-const CONTEXT_BUDGET_BYTES = 24_576;
-
-function encodeCursor(kind: 'list' | 'items' | 'change', sequence: number): string {
-  return Buffer.from(JSON.stringify({ v: 1, kind, sequence }), 'utf8').toString('base64url');
-}
-
-function decodeCursor(cursor: string, kind: 'list' | 'items' | 'change'): number {
-  try {
-    const value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
-      v?: unknown;
-      kind?: unknown;
-      sequence?: unknown;
-    };
-    if (
-      value.v !== 1 ||
-      value.kind !== kind ||
-      typeof value.sequence !== 'number' ||
-      !Number.isSafeInteger(value.sequence) ||
-      value.sequence < 0
-    ) {
-      throw new Error('invalid cursor');
-    }
-    return value.sequence;
-  } catch {
-    throw new SynomemError('INVALID_INPUT', `Invalid ${kind} cursor.`);
-  }
-}
-
+const CONTEXT_BUDGET_BYTES = 24576;
 function itemSummaryFromRow(row: ItemRow): ItemSummary {
   return {
     id: row.item_id,
@@ -416,12 +405,13 @@ function itemSummaryFromRow(row: ItemRow): ItemSummary {
     topicIds: JSON.parse(row.topic_ids_json) as string[],
     visibility: row.visibility,
     status: row.status,
-    ...(row.recipient_agent_id ? { recipientAgentId: row.recipient_agent_id } : {}),
-    ...(row.owner_agent_id ? { ownerAgentId: row.owner_agent_id } : {}),
-    ...(row.assignee_agent_id ? { assigneeAgentId: row.assignee_agent_id } : {}),
+    ...(row.recipient_id ? { recipient: { kind: row.recipient_kind, id: row.recipient_id } } : {}),
+    ...(row.owner_id ? { owner: { kind: row.owner_kind ?? 'agent', id: row.owner_id } } : {}),
+    ...(row.assignee_id
+      ? { assignee: { kind: row.assignee_kind ?? 'agent', id: row.assignee_id } }
+      : {}),
   };
 }
-
 /**
  * Resolves a due value to a comparable instant.
  *
@@ -438,14 +428,13 @@ function eventKind(event: SynomemEvent): RecordKind | undefined {
   if (event.type.startsWith('todo.')) return 'todo';
   return undefined;
 }
-
 function summaryFromRow(row: CurrentRow): KudosSummary {
   return {
     id: row.kudos_id,
     kind: 'kudos',
     createdAt: row.created_at,
     updatedAt: row.created_at,
-    recipientAgentId: row.recipient_agent_id,
+    recipient: { kind: row.recipient_kind, id: row.recipient_id },
     recipientDisplayName: row.recipient_display_name,
     actor: {
       kind: row.actor_kind,
@@ -460,14 +449,79 @@ function summaryFromRow(row: CurrentRow): KudosSummary {
     revocationStatus: row.revocation_status,
   };
 }
-
 export interface StorageOptions {
+  actor?: ActorIdentity;
+  authority?: RecordAuthority;
   home: string;
   readOnly: boolean;
   config?: SynomemConfigOverrides;
 }
+const databaseWriteTails = new Map<string, Promise<void>>();
 
 export class SynomemStorage implements SynomemRepository {
+  readonly notifications = this.makeNotifications();
+  private makeNotifications(): SqlNotificationRepository {
+    const workspaceId = () => this.config.workspaceId;
+    return new SqlNotificationRepository({
+      get workspaceId() {
+        return workspaceId();
+      },
+      query: async (sql, values) => this.prepare(sql).all(...(values as HpSQLInputValue[])),
+      execute: async (sql, values) => {
+        this.prepare(sql).run(...(values as HpSQLInputValue[]));
+      },
+      codec: () => this.cursorCodec!,
+      canRead: async (id, actor) => this.canActorReadItem(id, actor),
+      visibility: (actor) =>
+        recordVisibilityPredicate(
+          actor,
+          this.boundActor && this.boundActor.kind === actor.kind && this.boundActor.id === actor.id
+            ? this.authority
+            : resolveAuthority(),
+          false,
+          'i.',
+        ),
+    });
+  }
+  readonly bookmarks = this.makeBookmarks();
+  private makeBookmarks(): SqlBookmarkRepository {
+    const workspaceId = () => this.config.workspaceId;
+    return new SqlBookmarkRepository({
+      get workspaceId() {
+        return workspaceId();
+      },
+      query: async (sql, values) => this.prepare(sql).all(...(values as HpSQLInputValue[])),
+      execute: async (sql, values) => {
+        this.prepare(sql).run(...(values as HpSQLInputValue[]));
+      },
+      codec: () => this.cursorCodec!,
+      canRead: async (id, actor) => this.canActorReadItem(id, actor),
+      visibility: (actor) =>
+        recordVisibilityPredicate(
+          actor,
+          this.boundActor && this.boundActor.kind === actor.kind && this.boundActor.id === actor.id
+            ? this.authority
+            : resolveAuthority(),
+          false,
+          'i.',
+        ),
+    });
+  }
+  readonly participation = this.makeParticipation();
+  private makeParticipation(): SqlParticipationRepository {
+    const workspaceId = () => this.config.workspaceId;
+    return new SqlParticipationRepository({
+      get workspaceId() {
+        return workspaceId();
+      },
+      query: async (sql, values) => this.prepare(sql).all(...(values as HpSQLInputValue[])),
+      execute: async (sql, values) => {
+        this.prepare(sql).run(...(values as HpSQLInputValue[]));
+      },
+      codec: () => this.cursorCodec!,
+    });
+  }
+
   readonly home: string;
   readonly storageDirectory: string;
   readonly databasePath: string;
@@ -475,11 +529,15 @@ export class SynomemStorage implements SynomemRepository {
   readonly readOnly: boolean;
   config: SynomemConfig = defaultConfig;
   private database?: DatabaseSync;
+  private cursorCodec?: SignedCursorCodec;
+  private authority: RecordAuthority;
+  private readonly boundActor?: ActorIdentity;
   private readonly configOverrides?: SynomemConfigOverrides;
-  private validatedEventSequence = 0;
-  private transactionTail: Promise<void> = Promise.resolve();
-
+  private validatedEventSequence = 0n;
+  private readonly transactionState = new AsyncLocalStorage<boolean>();
   constructor(options: StorageOptions) {
+    this.authority = resolveAuthority(options.authority);
+    this.boundActor = options.actor;
     this.home = resolve(options.home);
     // The home is the storage directory; see configLocation in backend.ts.
     this.storageDirectory = this.home;
@@ -488,7 +546,9 @@ export class SynomemStorage implements SynomemRepository {
     this.readOnly = options.readOnly;
     this.configOverrides = options.config;
   }
-
+  setAuthority(authority: RecordAuthority): void {
+    this.authority = resolveAuthority(authority);
+  }
   init(): void {
     try {
       if (this.configOverrides?.backend?.kind === 'remote') {
@@ -507,12 +567,36 @@ export class SynomemStorage implements SynomemRepository {
           'The configured Synomem home cannot be a symbolic link.',
         );
       }
-      if (!this.readOnly) ensureDirectory(this.storageDirectory);
       assertNoSymlinkEscape(this.home, this.storageDirectory);
+      if (existsSync(this.databasePath)) {
+        // The SQLite header stores PRAGMA user_version at byte 60. A read-only
+        // SQLite connection can still create/delete shared-memory sidecars in
+        // WAL mode, changing directory metadata before we refuse legacy data.
+        // Read only the header to keep the export-only guard truly inert.
+        const handle = openSync(this.databasePath, 'r');
+        const header = Buffer.alloc(100);
+        let size = 0;
+        try {
+          size = readSync(handle, header, 0, header.length, 0);
+        } finally {
+          closeSync(handle);
+        }
+        if (size < 100 || header.toString('ascii', 0, 16) !== 'SQLite format 3\0')
+          throw new SynomemError(
+            'UNSUPPORTED_SCHEMA',
+            'This database header is malformed; use raw recovery.',
+          );
+        const version = header.readUInt32BE(60);
+        if (version > 0 && version !== SUPPORTED_SCHEMA_VERSION)
+          throw new SynomemError(
+            'UNSUPPORTED_SCHEMA',
+            'This home is export-only. Preserve its raw events and create a fresh human-participation home.',
+          );
+      }
       if (!this.readOnly) {
+        ensureDirectory(this.storageDirectory);
         chmodSync(this.storageDirectory, 0o700);
       }
-
       const fileConfig = existsSync(this.configPath) ? readJsonFile(this.configPath) : undefined;
       const initialConfig = fileConfig ?? { ...defaultConfig, workspaceId: ulid() };
       this.config = mergeConfig(initialConfig, this.configOverrides);
@@ -537,17 +621,29 @@ export class SynomemStorage implements SynomemRepository {
         !this.readOnly &&
         typeof fileConfig === 'object' &&
         fileConfig !== null &&
-        (fileConfig as { schemaVersion?: unknown }).schemaVersion === 2
+        (
+          fileConfig as {
+            schemaVersion?: unknown;
+          }
+        ).schemaVersion === 2
       ) {
         const migrated = mergeConfig(fileConfig, undefined, {});
         atomicWriteFile(this.configPath, `${JSON.stringify(migrated, null, 2)}\n`);
       }
-
       this.database = new DatabaseSync(this.databasePath, {
         readOnly: this.readOnly,
         enableForeignKeyConstraints: true,
       });
       this.database.exec('PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;');
+      const keyPath = join(this.home, 'cursor-key');
+      assertNoSymlinkEscape(this.home, keyPath);
+      if (!existsSync(keyPath)) {
+        if (this.readOnly)
+          throw new SynomemError('CONFIG_INVALID', 'The home cursor key is missing.');
+        atomicWriteFile(keyPath, randomBytes(32).toString('base64url'), 0o600);
+      }
+      const key = Buffer.from(readFileSync(keyPath, 'utf8'), 'base64url');
+      this.cursorCodec = new SignedCursorCodec({ keyId: 'home', key });
       if (!this.readOnly) {
         this.database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;');
         this.migrate();
@@ -564,12 +660,51 @@ export class SynomemStorage implements SynomemRepository {
       throw asSynomemError(error);
     }
   }
-
+  private prepare(sql: string): StatementSync {
+    const statement = this.db().prepare(sql);
+    statement.setReadBigInts(true);
+    return statement;
+  }
+  private binding(purpose: string, viewer: ActorIdentity, filters: unknown): CursorBinding {
+    return {
+      purpose,
+      workspaceId: this.config.workspaceId,
+      actor: { kind: viewer.kind, id: viewer.id },
+      filter: cursorFilter(filters),
+    };
+  }
+  private encodeCursor(
+    binding: CursorBinding,
+    sequence: bigint,
+    watermark = this.maxEventSequence(),
+  ): string {
+    return this.cursorCodec!.encode(binding, {
+      sequence: exactSequence(sequence),
+      watermark: exactSequence(watermark),
+    });
+  }
+  private decodeCursor(
+    token: string,
+    binding: CursorBinding,
+  ): { sequence: bigint; watermark: bigint } {
+    const value = this.cursorCodec!.decode(token, binding, exactSequence(this.maxEventSequence()));
+    return { sequence: BigInt(value.sequence), watermark: BigInt(value.watermark) };
+  }
   private migrate(): void {
     const db = this.db();
     const version = Number(
-      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      (
+        db.prepare('PRAGMA user_version').get() as {
+          user_version: number;
+        }
+      ).user_version,
     );
+    if (version > 0 && version < 9 && db.prepare('SELECT 1 FROM events LIMIT 1').get()) {
+      throw new SynomemError(
+        'UNSUPPORTED_SCHEMA',
+        'This populated legacy home is export-only. Export its raw events and explicitly create a new human-participation home.',
+      );
+    }
     if (version > SUPPORTED_SCHEMA_VERSION) {
       throw new SynomemError(
         'UNSUPPORTED_SCHEMA',
@@ -586,7 +721,11 @@ export class SynomemStorage implements SynomemRepository {
       });
     }
     const currentVersion = Number(
-      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      (
+        db.prepare('PRAGMA user_version').get() as {
+          user_version: number;
+        }
+      ).user_version,
     );
     if (currentVersion === 1) {
       this.transactionSync(() => {
@@ -599,7 +738,11 @@ export class SynomemStorage implements SynomemRepository {
       });
     }
     const afterV2 = Number(
-      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      (
+        db.prepare('PRAGMA user_version').get() as {
+          user_version: number;
+        }
+      ).user_version,
     );
     if (afterV2 === 2) {
       this.transactionSync(() => {
@@ -614,7 +757,11 @@ export class SynomemStorage implements SynomemRepository {
       });
     }
     const afterV3 = Number(
-      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      (
+        db.prepare('PRAGMA user_version').get() as {
+          user_version: number;
+        }
+      ).user_version,
     );
     if (afterV3 === 3) {
       this.transactionSync(() => {
@@ -627,7 +774,11 @@ export class SynomemStorage implements SynomemRepository {
       });
     }
     const afterV4 = Number(
-      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      (
+        db.prepare('PRAGMA user_version').get() as {
+          user_version: number;
+        }
+      ).user_version,
     );
     if (afterV4 === 4) {
       this.transactionSync(() => {
@@ -639,7 +790,11 @@ export class SynomemStorage implements SynomemRepository {
       });
     }
     const afterV5 = Number(
-      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      (
+        db.prepare('PRAGMA user_version').get() as {
+          user_version: number;
+        }
+      ).user_version,
     );
     if (afterV5 === 5) {
       this.transactionSync(() => {
@@ -651,7 +806,11 @@ export class SynomemStorage implements SynomemRepository {
       });
     }
     const afterV6 = Number(
-      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      (
+        db.prepare('PRAGMA user_version').get() as {
+          user_version: number;
+        }
+      ).user_version,
     );
     if (afterV6 === 6) {
       this.transactionSync(() => {
@@ -663,7 +822,11 @@ export class SynomemStorage implements SynomemRepository {
       });
     }
     const afterV7 = Number(
-      (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      (
+        db.prepare('PRAGMA user_version').get() as {
+          user_version: number;
+        }
+      ).user_version,
     );
     if (afterV7 === 7) {
       this.transactionSync(() => {
@@ -674,7 +837,9 @@ export class SynomemStorage implements SynomemRepository {
         // column SQLite has no "IF NOT EXISTS" form for.
         for (const table of ['kudos_current', 'items_current']) {
           const hasColumn = (
-            db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+            db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+              name: string;
+            }>
           ).some((column) => column.name === 'topic_ids_json');
           if (!hasColumn) {
             db.exec(`ALTER TABLE ${table} ADD COLUMN topic_ids_json TEXT NOT NULL DEFAULT '[]'`);
@@ -686,11 +851,35 @@ export class SynomemStorage implements SynomemRepository {
         db.exec('PRAGMA user_version = 8');
       });
     }
+    if (
+      Number((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version) ===
+      8
+    ) {
+      this.transactionSync(() => {
+        db.exec(`ALTER TABLE items_current ADD COLUMN workspace_id TEXT;
+${notificationTables}
+${bookmarkTables}
+${participationTables}
+CREATE TABLE mutation_receipts(actor_kind TEXT NOT NULL,actor_id TEXT NOT NULL,key_hash TEXT NOT NULL,operation TEXT NOT NULL,request_hash TEXT NOT NULL,result_json TEXT,event_id TEXT,created_at TEXT NOT NULL,PRIMARY KEY(actor_kind,actor_id,key_hash)) STRICT;
+          CREATE INDEX mutation_receipts_retention ON mutation_receipts(created_at) WHERE result_json IS NOT NULL;
+          CREATE TABLE human_actors (id TEXT PRIMARY KEY, handle TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('active','inactive'))) STRICT;
+          CREATE INDEX items_current_owner_actor ON items_current(owner_kind,owner_id,created_sequence DESC);
+          CREATE INDEX items_current_recipient_actor ON items_current(recipient_kind,recipient_id,created_sequence DESC);
+          CREATE INDEX items_current_assignee_actor ON items_current(assignee_kind,assignee_id,created_sequence DESC);`);
+        db.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(9,?)').run(
+          new Date().toISOString(),
+        );
+        db.exec('PRAGMA user_version=9');
+      });
+    }
   }
-
   private assertSchemaSupported(): void {
     const version = Number(
-      (this.db().prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      (
+        this.prepare('PRAGMA user_version').get() as {
+          user_version: number;
+        }
+      ).user_version,
     );
     if (version !== SUPPORTED_SCHEMA_VERSION) {
       if (version >= 1 && version < SUPPORTED_SCHEMA_VERSION) {
@@ -705,18 +894,16 @@ export class SynomemStorage implements SynomemRepository {
       );
     }
   }
-
   db(): DatabaseSync {
     if (!this.database)
       throw new SynomemError('INTERNAL_ERROR', 'SynomemClient.init() has not completed.');
     return this.database;
   }
-
   assertWritable(): void {
     if (this.readOnly) throw new SynomemError('READ_ONLY', 'This Synomem client is read-only.');
   }
-
   transaction<T>(operation: () => T | Promise<T>): Promise<T> {
+    if (this.transactionState.getStore()) return Promise.resolve().then(operation);
     const execute = async (): Promise<T> => {
       this.assertWritable();
       const db = this.db();
@@ -724,7 +911,7 @@ export class SynomemStorage implements SynomemRepository {
       try {
         db.exec('BEGIN IMMEDIATE');
         began = true;
-        const result = await operation();
+        const result = await this.transactionState.run(true, operation);
         db.exec('COMMIT');
         began = false;
         this.restrictDatabaseFiles();
@@ -740,14 +927,19 @@ export class SynomemStorage implements SynomemRepository {
         throw asSynomemError(error);
       }
     };
-    const result = this.transactionTail.then(execute, execute);
-    this.transactionTail = result.then(
+    const prior = databaseWriteTails.get(this.databasePath) ?? Promise.resolve();
+    const result = prior.then(execute, execute);
+    const tail = result.then(
       () => undefined,
       () => undefined,
     );
+    databaseWriteTails.set(this.databasePath, tail);
+    void tail.then(() => {
+      if (databaseWriteTails.get(this.databasePath) === tail)
+        databaseWriteTails.delete(this.databasePath);
+    });
     return result;
   }
-
   transactionSync<T>(operation: () => T): T {
     this.assertWritable();
     const db = this.db();
@@ -771,8 +963,12 @@ export class SynomemStorage implements SynomemRepository {
       throw asSynomemError(error);
     }
   }
+  async insertEvent(event: SynomemEvent): Promise<void> {
+    if (!this.transactionState.getStore()) {
+      await this.transaction(() => this.insertEvent(event));
+      return;
+    }
 
-  insertEvent(event: SynomemEvent): void {
     const parsed = eventSchema.parse(event);
     const recipientAgentId =
       parsed.type === 'kudos.given' ||
@@ -780,7 +976,7 @@ export class SynomemStorage implements SynomemRepository {
       parsed.type === 'memo.sent' ||
       parsed.type === 'memo.read' ||
       parsed.type === 'memo.archived'
-        ? parsed.recipientAgentId
+        ? parsed.recipient?.id
         : null;
     const kudosId =
       parsed.type === 'kudos.acknowledged' || parsed.type === 'kudos.revoked'
@@ -789,84 +985,84 @@ export class SynomemStorage implements SynomemRepository {
     const visibility = 'visibility' in parsed ? parsed.visibility : null;
     const idempotencyKey = parsed.idempotencyKey ?? null;
     const kind = eventKind(parsed) ?? null;
-    const sequence = Number(
-      (
-        this.db().prepare('SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM events').get() as {
-          next: number;
-        }
-      ).next,
-    );
-    this.db()
-      .prepare(
-        `INSERT INTO events(
+    const sequence = (
+      this.prepare('SELECT COALESCE(MAX(sequence),0)+1 AS next FROM events').get() as {
+        next: bigint;
+      }
+    ).next;
+
+    this.prepare(
+      `INSERT INTO events(
           id, schema_version, type, created_at, actor_kind, actor_id,
-          recipient_agent_id, kudos_id, visibility, idempotency_key, payload, sequence,
+          recipient_id, kudos_id, visibility, idempotency_key, payload, sequence,
           workspace_id, aggregate_id, aggregate_version, item_kind
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        parsed.id,
-        parsed.schemaVersion,
-        parsed.type,
-        parsed.createdAt,
-        parsed.actor.kind,
-        parsed.actor.id,
-        recipientAgentId,
-        kudosId,
-        visibility,
-        idempotencyKey,
-        JSON.stringify(parsed),
-        sequence,
-        parsed.workspaceId,
-        parsed.aggregateId,
-        parsed.aggregateVersion,
-        kind,
-      );
+    ).run(
+      parsed.id,
+      parsed.schemaVersion,
+      parsed.type,
+      parsed.createdAt,
+      parsed.actor.kind,
+      parsed.actor.id,
+      recipientAgentId,
+      kudosId,
+      visibility,
+      idempotencyKey,
+      JSON.stringify(parsed),
+      sequence,
+      parsed.workspaceId,
+      parsed.aggregateId,
+      parsed.aggregateVersion,
+      kind,
+    );
     this.applyEventToCurrent(parsed, sequence);
     this.applyEventToItems(parsed, sequence);
+    this.prepare('UPDATE items_current SET workspace_id=? WHERE item_id=?').run(
+      parsed.workspaceId,
+      parsed.aggregateId,
+    );
+    for (const command of participationStatements(parsed, sequence, this.config.workspaceId))
+      this.prepare(command.sql).run(...(command.values as HpSQLInputValue[]));
+    await this.notifications.apply(parsed, sequence);
   }
-
-  private applyEventToCurrent(event: SynomemEvent, sequence: number): void {
+  private applyEventToCurrent(event: SynomemEvent, sequence: bigint): void {
     if (event.type === 'kudos.given') {
-      this.db()
-        .prepare(
-          `INSERT INTO kudos_current(
-            kudos_id, given_sequence, created_at, recipient_agent_id, recipient_display_name,
+      this.prepare(
+        `INSERT INTO kudos_current(
+            kudos_id, given_sequence, created_at, recipient_id, recipient_display_name,
             actor_kind, actor_id, actor_display_name, title, tags_json, topic_ids_json, visibility,
             status, revocation_status, updated_sequence
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unacknowledged', 'active', ?)`,
-        )
-        .run(
-          event.id,
-          sequence,
-          event.createdAt,
-          event.recipientAgentId,
-          event.recipientDisplayName,
-          event.actor.kind,
-          event.actor.id,
-          event.actor.displayName ?? null,
-          event.title,
-          JSON.stringify(event.tags ?? []),
-          JSON.stringify(event.topicIds ?? []),
-          event.visibility,
-          sequence,
-        );
+      ).run(
+        event.id,
+        sequence,
+        event.createdAt,
+        event.recipient?.id,
+        event.recipientDisplayName,
+        event.actor.kind,
+        event.actor.id,
+        event.actor.displayName ?? null,
+        event.title,
+        JSON.stringify(event.tags ?? []),
+        JSON.stringify(event.topicIds ?? []),
+        event.visibility,
+        sequence,
+      );
+      this.prepare('UPDATE kudos_current SET recipient_kind=? WHERE kudos_id=?').run(
+        event.recipient.kind,
+        event.id,
+      );
     } else if (event.type === 'kudos.acknowledged') {
-      this.db()
-        .prepare(
-          "UPDATE kudos_current SET status = 'acknowledged', updated_sequence = ? WHERE kudos_id = ?",
-        )
-        .run(sequence, event.kudosId);
+      this.prepare(
+        "UPDATE kudos_current SET status = 'acknowledged', updated_sequence = ? WHERE kudos_id = ?",
+      ).run(sequence, event.kudosId);
     } else if (event.type === 'kudos.revoked') {
-      this.db()
-        .prepare(
-          "UPDATE kudos_current SET revocation_status = 'revoked', updated_sequence = ? WHERE kudos_id = ?",
-        )
-        .run(sequence, event.kudosId);
+      this.prepare(
+        "UPDATE kudos_current SET revocation_status = 'revoked', updated_sequence = ? WHERE kudos_id = ?",
+      ).run(sequence, event.kudosId);
     }
   }
-
-  private applyEventToItems(event: SynomemEvent, sequence: number): void {
+  private applyEventToItems(event: SynomemEvent, sequence: bigint): void {
     const insert = (values: {
       kind: RecordKind;
       title: string;
@@ -874,55 +1070,50 @@ export class SynomemStorage implements SynomemRepository {
       topicIds?: string[];
       visibility: ItemSummary['visibility'];
       status: string;
-      recipientAgentId?: string;
+      recipient?: ActorRef;
       recipientDisplayName?: string;
-      ownerAgentId?: string;
+      owner?: ActorRef;
       ownerDisplayName?: string;
-      assigneeAgentId?: string;
+      assignee?: ActorRef;
       assigneeDisplayName?: string;
       dueAt?: string;
     }): void => {
-      this.db()
-        .prepare(
-          `INSERT INTO items_current(
+      this.prepare(
+        `INSERT INTO items_current(
           item_id, kind, created_sequence, updated_sequence, created_at, updated_at,
           actor_kind, actor_id, actor_display_name, title, tags_json, topic_ids_json, visibility, status,
-          recipient_agent_id, recipient_display_name, owner_agent_id, owner_display_name,
-          assignee_agent_id, assignee_display_name, due_at
+          recipient_id, recipient_display_name, owner_id, owner_display_name,
+          assignee_id, assignee_display_name, due_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          event.aggregateId,
-          values.kind,
-          sequence,
-          sequence,
-          event.createdAt,
-          event.createdAt,
-          event.actor.kind,
-          event.actor.id,
-          event.actor.displayName ?? null,
-          values.title,
-          JSON.stringify(values.tags ?? []),
-          JSON.stringify(values.topicIds ?? []),
-          values.visibility,
-          values.status,
-          values.recipientAgentId ?? null,
-          values.recipientDisplayName ?? null,
-          values.ownerAgentId ?? null,
-          values.ownerDisplayName ?? null,
-          values.assigneeAgentId ?? null,
-          values.assigneeDisplayName ?? null,
-          values.dueAt ?? null,
-        );
+      ).run(
+        event.aggregateId,
+        values.kind,
+        sequence,
+        sequence,
+        event.createdAt,
+        event.createdAt,
+        event.actor.kind,
+        event.actor.id,
+        event.actor.displayName ?? null,
+        values.title,
+        JSON.stringify(values.tags ?? []),
+        JSON.stringify(values.topicIds ?? []),
+        values.visibility,
+        values.status,
+        values.recipient?.id ?? null,
+        values.recipientDisplayName ?? null,
+        values.owner?.id ?? null,
+        values.ownerDisplayName ?? null,
+        values.assignee?.id ?? null,
+        values.assigneeDisplayName ?? null,
+        values.dueAt ?? null,
+      );
     };
     const updateStatus = (status: string): void => {
-      this.db()
-        .prepare(
-          'UPDATE items_current SET status = ?, updated_sequence = ?, updated_at = ? WHERE item_id = ?',
-        )
-        .run(status, sequence, event.createdAt, event.aggregateId);
+      this.prepare(
+        'UPDATE items_current SET status = ?, updated_sequence = ?, updated_at = ? WHERE item_id = ?',
+      ).run(status, sequence, event.createdAt, event.aggregateId);
     };
-
     if (event.type === 'kudos.given') {
       insert({
         kind: 'kudos',
@@ -931,7 +1122,7 @@ export class SynomemStorage implements SynomemRepository {
         topicIds: event.topicIds,
         visibility: event.visibility,
         status: 'unacknowledged',
-        recipientAgentId: event.recipientAgentId,
+        recipient: event.recipient,
         recipientDisplayName: event.recipientDisplayName,
       });
     } else if (event.type === 'kudos.acknowledged') updateStatus('acknowledged');
@@ -944,7 +1135,7 @@ export class SynomemStorage implements SynomemRepository {
         topicIds: event.topicIds,
         visibility: event.visibility,
         status: 'unread',
-        recipientAgentId: event.recipientAgentId,
+        recipient: event.recipient,
         recipientDisplayName: event.recipientDisplayName,
       });
     } else if (event.type === 'memo.read') updateStatus('read');
@@ -957,7 +1148,7 @@ export class SynomemStorage implements SynomemRepository {
         topicIds: event.topicIds,
         visibility: event.visibility,
         status: 'active',
-        ownerAgentId: event.ownerAgentId,
+        owner: event.owner,
         ownerDisplayName: event.ownerDisplayName,
       });
     } else if (event.type === 'post.created') {
@@ -976,62 +1167,54 @@ export class SynomemStorage implements SynomemRepository {
         status: 'active',
       });
     } else if (event.type === 'post.edited') {
-      this.db()
-        .prepare(
-          `UPDATE items_current SET title = ?, tags_json = ?, topic_ids_json = ?,
+      this.prepare(
+        `UPDATE items_current SET title = ?, tags_json = ?, topic_ids_json = ?,
          updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
-        )
-        .run(
-          event.title,
-          JSON.stringify(event.tags ?? []),
-          JSON.stringify(event.topicIds ?? []),
-          sequence,
-          event.createdAt,
-          event.postId,
-        );
+      ).run(
+        event.title,
+        JSON.stringify(event.tags ?? []),
+        JSON.stringify(event.topicIds ?? []),
+        sequence,
+        event.createdAt,
+        event.postId,
+      );
     } else if (event.type === 'post.archived') {
       updateStatus('archived');
     } else if (event.type === 'post.acknowledged') {
       // One row per actor per post: acknowledging twice is the same statement,
       // not a second one.
-      this.db()
-        .prepare(
-          `INSERT INTO post_acknowledgments
+      this.prepare(
+        `INSERT INTO post_acknowledgments
              (post_id, actor_kind, actor_id, actor_display_name, note, acknowledged_at)
            VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(post_id, actor_kind, actor_id) DO UPDATE SET
              note = excluded.note,
              acknowledged_at = excluded.acknowledged_at`,
-        )
-        .run(
-          event.postId,
-          event.actor.kind,
-          event.actor.id,
-          event.actor.displayName ?? null,
-          event.note ?? null,
-          event.createdAt,
-        );
+      ).run(
+        event.postId,
+        event.actor.kind,
+        event.actor.id,
+        event.actor.displayName ?? null,
+        event.note ?? null,
+        event.createdAt,
+      );
     } else if (event.type === 'post.acknowledgment.withdrawn') {
-      this.db()
-        .prepare(
-          'DELETE FROM post_acknowledgments WHERE post_id = ? AND actor_kind = ? AND actor_id = ?',
-        )
-        .run(event.postId, event.actor.kind, event.actor.id);
+      this.prepare(
+        'DELETE FROM post_acknowledgments WHERE post_id = ? AND actor_kind = ? AND actor_id = ?',
+      ).run(event.postId, event.actor.kind, event.actor.id);
     } else if (event.type === 'note.revised') {
-      this.db()
-        .prepare(
-          `UPDATE items_current SET title = ?, tags_json = ?, topic_ids_json = ?, visibility = ?,
+      this.prepare(
+        `UPDATE items_current SET title = ?, tags_json = ?, topic_ids_json = ?, visibility = ?,
          updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
-        )
-        .run(
-          event.title,
-          JSON.stringify(event.tags ?? []),
-          JSON.stringify(event.topicIds ?? []),
-          event.visibility,
-          sequence,
-          event.createdAt,
-          event.aggregateId,
-        );
+      ).run(
+        event.title,
+        JSON.stringify(event.tags ?? []),
+        JSON.stringify(event.topicIds ?? []),
+        event.visibility,
+        sequence,
+        event.createdAt,
+        event.aggregateId,
+      );
     } else if (event.type === 'note.archived') updateStatus('archived');
     else if (event.type === 'task.created') {
       insert({
@@ -1041,30 +1224,29 @@ export class SynomemStorage implements SynomemRepository {
         topicIds: event.topicIds,
         visibility: event.visibility,
         status: event.requiresAcceptance ? 'assigned' : 'open',
-        assigneeAgentId: event.assigneeAgentId,
+        assignee: event.assignee,
         assigneeDisplayName: event.assigneeDisplayName,
         ...((due) => (due ? { dueAt: due } : {}))(dueInstant(event.due)),
       });
     } else if (event.type === 'task.updated') {
-      this.db()
-        .prepare(
-          `UPDATE items_current SET title = ?, tags_json = ?, topic_ids_json = ?, visibility = ?, due_at = ?,
+      this.prepare(
+        `UPDATE items_current SET title = ?, tags_json = ?, topic_ids_json = ?, visibility = ?, due_at = ?,
          updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
-        )
-        .run(
-          event.title,
-          JSON.stringify(event.tags ?? []),
-          JSON.stringify(event.topicIds ?? []),
-          event.visibility,
-          dueInstant(event.due) ?? null,
-          sequence,
-          event.createdAt,
-          event.aggregateId,
-        );
+      ).run(
+        event.title,
+        JSON.stringify(event.tags ?? []),
+        JSON.stringify(event.topicIds ?? []),
+        event.visibility,
+        dueInstant(event.due) ?? null,
+        sequence,
+        event.createdAt,
+        event.aggregateId,
+      );
     } else if (event.type === 'task.accepted') updateStatus('open');
     else if (event.type === 'task.rejected') updateStatus('rejected');
     else if (event.type === 'task.completed') updateStatus('completed');
     else if (event.type === 'task.reopened') updateStatus('open');
+    else if (event.type === 'task.decision_overridden') updateStatus(event.nextStatus);
     else if (event.type === 'task.canceled') updateStatus('canceled');
     else if (event.type === 'todo.created') {
       // A Todo's owner IS its author, and it is always private. Recording the
@@ -1077,50 +1259,91 @@ export class SynomemStorage implements SynomemRepository {
         topicIds: event.topicIds,
         visibility: 'private',
         status: 'open',
-        ownerAgentId: event.actor.id,
+        owner: event.owner,
         ...(event.actor.displayName ? { ownerDisplayName: event.actor.displayName } : {}),
         ...((due) => (due ? { dueAt: due } : {}))(dueInstant(event.due)),
       });
     } else if (event.type === 'todo.updated') {
-      this.db()
-        .prepare(
-          `UPDATE items_current SET title = ?, tags_json = ?, topic_ids_json = ?, due_at = ?,
+      this.prepare(
+        `UPDATE items_current SET title = ?, tags_json = ?, topic_ids_json = ?, due_at = ?,
          updated_sequence = ?, updated_at = ? WHERE item_id = ?`,
-        )
-        .run(
-          event.title,
-          JSON.stringify(event.tags ?? []),
-          JSON.stringify(event.topicIds ?? []),
-          dueInstant(event.due) ?? null,
-          sequence,
-          event.createdAt,
-          event.aggregateId,
-        );
+      ).run(
+        event.title,
+        JSON.stringify(event.tags ?? []),
+        JSON.stringify(event.topicIds ?? []),
+        dueInstant(event.due) ?? null,
+        sequence,
+        event.createdAt,
+        event.aggregateId,
+      );
     } else if (event.type === 'todo.completed') updateStatus('completed');
     else if (event.type === 'todo.reopened') updateStatus('open');
     else if (event.type === 'todo.canceled') updateStatus('canceled');
     else if (event.type === 'todo.archived') updateStatus('archived');
+    if ('recipient' in event) {
+      this.prepare('UPDATE items_current SET recipient_kind=? WHERE item_id=?').run(
+        event.recipient.kind,
+        event.aggregateId,
+      );
+    }
+    if ('owner' in event) {
+      this.prepare('UPDATE items_current SET owner_kind=?,owner_id=? WHERE item_id=?').run(
+        event.owner.kind,
+        event.owner.id,
+        event.aggregateId,
+      );
+    }
+    if ('assignee' in event) {
+      this.prepare('UPDATE items_current SET assignee_kind=? WHERE item_id=?').run(
+        event.assignee.kind,
+        event.aggregateId,
+      );
+    }
   }
-
   rebuildItemsCurrentIndex(): void {
-    this.db().prepare('DELETE FROM items_current').run();
-    const rows = this.db()
-      .prepare('SELECT id, payload, sequence FROM events ORDER BY sequence ASC')
-      .all() as unknown as Array<EventRow & { sequence: number }>;
+    this.prepare('DELETE FROM items_current').run();
+    const rows = this.prepare(
+      'SELECT id, payload, sequence FROM events ORDER BY sequence ASC',
+    ).all() as unknown as Array<
+      EventRow & {
+        sequence: bigint;
+      }
+    >;
     for (const row of rows) {
       try {
-        this.applyEventToItems(this.parseEvent(row), row.sequence);
+        const event = this.parseEvent(row);
+        this.applyEventToItems(event, row.sequence);
+        this.prepare('UPDATE items_current SET workspace_id=? WHERE item_id=?').run(
+          event.workspaceId,
+          event.aggregateId,
+        );
       } catch (error) {
         if (!(error instanceof SynomemError)) throw error;
       }
     }
   }
-
+  rebuildParticipationCurrentIndex(): void {
+    for (const table of ['thread_entries', 'reactions_current', 'replies_current'])
+      this.prepare(`DELETE FROM ${table} WHERE workspace_id=?`).run(this.config.workspaceId);
+    for (const row of this.rawEventRows()) {
+      const event = this.parseEvent(row);
+      const sequence = (
+        this.prepare('SELECT sequence FROM events WHERE id=?').get(event.id) as { sequence: bigint }
+      ).sequence;
+      for (const command of participationStatements(event, sequence, this.config.workspaceId))
+        if (!command.sql.includes('thread_members'))
+          this.prepare(command.sql).run(...(command.values as HpSQLInputValue[]));
+    }
+  }
   rebuildKudosCurrentIndex(): void {
-    this.db().prepare('DELETE FROM kudos_current').run();
-    const rows = this.db()
-      .prepare('SELECT id, payload, sequence FROM events ORDER BY sequence ASC')
-      .all() as unknown as Array<EventRow & { sequence: number }>;
+    this.prepare('DELETE FROM kudos_current').run();
+    const rows = this.prepare(
+      'SELECT id, payload, sequence FROM events ORDER BY sequence ASC',
+    ).all() as unknown as Array<
+      EventRow & {
+        sequence: bigint;
+      }
+    >;
     for (const row of rows) {
       try {
         this.applyEventToCurrent(this.parseEvent(row), row.sequence);
@@ -1129,31 +1352,38 @@ export class SynomemStorage implements SynomemRepository {
       }
     }
   }
-
   nextAggregateVersion(aggregateId: string): number {
     return Number(
       (
-        this.db()
-          .prepare(
-            'SELECT COALESCE(MAX(aggregate_version), 0) + 1 AS next FROM events WHERE workspace_id = ? AND aggregate_id = ?',
-          )
-          .get(this.config.workspaceId, aggregateId) as { next: number }
+        this.prepare(
+          'SELECT COALESCE(MAX(aggregate_version), 0) + 1 AS next FROM events WHERE workspace_id = ? AND aggregate_id = ?',
+        ).get(this.config.workspaceId, aggregateId) as {
+          next: number;
+        }
       ).next,
     );
   }
-
   listKudosSummaries(
     input: Required<Pick<KudosListInput, 'limit' | 'offset'>> & KudosListInput,
     viewer: ActorIdentity,
   ): Page<KudosSummary> {
+    const binding = this.binding('kudos-list', viewer, {
+      ...input,
+      cursor: undefined,
+      limit: undefined,
+      offset: undefined,
+    });
+    const changesBinding = this.binding('kudos-changes', viewer, { kinds: ['kudos'] });
+    const position = input.cursor ? this.decodeCursor(input.cursor, binding) : undefined;
+    const high = position?.watermark ?? this.maxEventSequence();
     const where: string[] = [];
-    const parameters: Array<string | number> = [];
-    const add = (clause: string, ...values: Array<string | number>): void => {
+    const parameters: Array<string | number | bigint> = [];
+    const add = (clause: string, ...values: Array<string | number | bigint>): void => {
       where.push(clause);
       parameters.push(...values);
     };
-
-    if (input.recipientAgentId) add('recipient_agent_id = ?', input.recipientAgentId);
+    if (input.recipient?.id)
+      add('recipient_kind=? AND recipient_id = ?', input.recipient.kind, input.recipient.id);
     if (input.actorId) add('actor_id = ?', input.actorId);
     if (input.actorKind) add('actor_kind = ?', input.actorKind);
     if (input.tag) add('EXISTS (SELECT 1 FROM json_each(tags_json) WHERE value = ?)', input.tag);
@@ -1166,48 +1396,33 @@ export class SynomemStorage implements SynomemRepository {
     }
     if (input.from) add('created_at >= ?', input.from);
     if (input.to) add('created_at <= ?', input.to);
-    if (viewer.kind !== 'human') {
-      if (viewer.kind === 'agent') {
-        add(
-          `(visibility != 'private' OR recipient_agent_id = ? OR
-            (actor_kind = ? AND actor_id = ?))`,
-          viewer.id,
-          viewer.kind,
-          viewer.id,
-        );
-      } else {
-        add(
-          `(visibility != 'private' OR (actor_kind = ? AND actor_id = ?))`,
-          viewer.kind,
-          viewer.id,
-        );
-      }
-    }
-
+    const privacy = recordVisibilityPredicate(viewer, this.authority, true);
+    add(privacy.sql, ...privacy.values);
     const baseWhere = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const total = Number(
       (
-        this.db()
-          .prepare(`SELECT COUNT(*) AS count FROM kudos_current ${baseWhere}`)
-          .get(...parameters) as { count: number }
+        this.prepare(`SELECT COUNT(*) AS count FROM kudos_current ${baseWhere}`).get(
+          ...parameters,
+        ) as {
+          count: number;
+        }
       ).count,
     );
-    const cursorSequence = input.cursor ? decodeCursor(input.cursor, 'list') : undefined;
+    const cursorSequence = position?.sequence;
     const pageWhere = [...where];
     const pageParameters = [...parameters];
     if (cursorSequence !== undefined) {
       pageWhere.push('given_sequence < ?');
       pageParameters.push(cursorSequence);
     }
+    pageWhere.push('given_sequence<=? AND updated_sequence<=?');
+    pageParameters.push(high, high);
     const sqlWhere = pageWhere.length ? `WHERE ${pageWhere.join(' AND ')}` : '';
     const offset = cursorSequence === undefined ? input.offset : 0;
-    const rows = this.db()
-      .prepare(
-        `SELECT * FROM kudos_current ${sqlWhere}
+    const rows = this.prepare(
+      `SELECT * FROM kudos_current ${sqlWhere}
          ORDER BY given_sequence DESC LIMIT ? OFFSET ?`,
-      )
-      .all(...pageParameters, input.limit + 1, offset) as unknown as CurrentRow[];
-
+    ).all(...pageParameters, input.limit + 1, offset) as unknown as CurrentRow[];
     const items: KudosSummary[] = [];
     let bytes = 2;
     let contextLimited = false;
@@ -1224,36 +1439,34 @@ export class SynomemStorage implements SynomemRepository {
     const hasMore = contextLimited || rows.length > items.length;
     const last = items.at(-1);
     const lastRow = last ? rows[items.length - 1] : undefined;
-    const watermark = encodeCursor('change', this.maxEventSequence());
+    const watermark = this.encodeCursor(changesBinding, high, high);
     return {
       items,
       total,
       limit: input.limit,
       offset,
-      ...(hasMore && lastRow ? { nextCursor: encodeCursor('list', lastRow.given_sequence) } : {}),
+      ...(hasMore && lastRow
+        ? { nextCursor: this.encodeCursor(binding, lastRow.given_sequence, high) }
+        : {}),
       hasMore,
       watermark,
       contextLimited,
     };
   }
-
   listKudosChanges(after: string | undefined, limit: number, viewer: ActorIdentity): ChangePage {
-    const afterSequence = after ? decodeCursor(after, 'change') : 0;
+    const binding = this.binding('kudos-changes', viewer, { kinds: ['kudos'] });
+    const afterSequence = after ? this.decodeCursor(after, binding).sequence : 0n;
     const highWatermark = this.maxEventSequence();
-    const privacy =
-      viewer.kind === 'human'
-        ? ''
-        : viewer.kind === 'agent'
-          ? `AND (k.visibility != 'private' OR k.recipient_agent_id = ? OR
-            (k.actor_kind = ? AND k.actor_id = ?))`
-          : `AND (k.visibility != 'private' OR (k.actor_kind = ? AND k.actor_id = ?))`;
-    const parameters: Array<string | number> = [afterSequence, highWatermark];
-    if (viewer.kind === 'agent') parameters.push(viewer.id, viewer.kind, viewer.id);
-    else if (viewer.kind === 'system') parameters.push(viewer.kind, viewer.id);
+    const predicate = recordVisibilityPredicate(viewer, this.authority, true, 'k.');
+    const privacy = `AND ${predicate.sql}`;
+    const parameters: Array<string | number | bigint> = [
+      afterSequence,
+      highWatermark,
+      ...predicate.values,
+    ];
     parameters.push(limit + 1);
-    const rows = this.db()
-      .prepare(
-        `SELECT e.id AS event_id, e.sequence, e.type, e.created_at AS event_created_at, e.payload, k.*
+    const rows = this.prepare(
+      `SELECT e.id AS event_id, e.sequence, e.type, e.created_at AS event_created_at, e.payload, k.*
          FROM events e
          JOIN kudos_current k ON k.kudos_id = CASE
            WHEN e.type = 'kudos.given' THEN e.id ELSE e.kudos_id END
@@ -1261,8 +1474,7 @@ export class SynomemStorage implements SynomemRepository {
            AND e.type IN ('kudos.given', 'kudos.acknowledged', 'kudos.revoked')
            ${privacy}
          ORDER BY e.sequence ASC LIMIT ?`,
-      )
-      .all(...parameters) as unknown as Array<
+    ).all(...parameters) as unknown as Array<
       CurrentRow &
         EventRow & {
           event_id: string;
@@ -1270,17 +1482,18 @@ export class SynomemStorage implements SynomemRepository {
           type: KudosChange['type'];
         }
     >;
-
     const items: KudosChange[] = [];
     let bytes = 2;
     let contextLimited = false;
     let consumed = 0;
     let lastConsumedSequence = afterSequence;
     for (const row of rows.slice(0, limit)) {
-      const sequence = Number(row.sequence);
+      const sequence = row.sequence!;
       let actor: ActorIdentity;
       try {
-        const payload = JSON.parse(row.payload) as { actor: ActorIdentity };
+        const payload = JSON.parse(row.payload) as {
+          actor: ActorIdentity;
+        };
         actor = actorSchema.parse(payload.actor);
       } catch {
         consumed += 1;
@@ -1288,14 +1501,14 @@ export class SynomemStorage implements SynomemRepository {
         continue;
       }
       const item: KudosChange = {
-        cursor: encodeCursor('change', sequence),
-        sequence,
+        cursor: this.encodeCursor(binding, sequence, highWatermark),
+        sequence: exactSequence(sequence),
         eventId: row.event_id,
         type: row.type,
         createdAt: row.event_created_at,
         actor,
         kudosId: row.kudos_id,
-        recipientAgentId: row.recipient_agent_id,
+        recipient: { kind: row.recipient_kind, id: row.recipient_id },
         summary: summaryFromRow(row),
       };
       const itemBytes = Buffer.byteLength(JSON.stringify(item), 'utf8') + 1;
@@ -1309,36 +1522,51 @@ export class SynomemStorage implements SynomemRepository {
       lastConsumedSequence = sequence;
     }
     const hasMore = contextLimited || rows.length > consumed;
-    const nextCursor = encodeCursor('change', hasMore ? lastConsumedSequence : highWatermark);
+    const nextCursor = this.encodeCursor(
+      binding,
+      hasMore ? lastConsumedSequence : highWatermark,
+      highWatermark,
+    );
     return {
       items,
       limit,
       nextCursor,
       hasMore,
-      watermark: encodeCursor('change', highWatermark),
+      watermark: this.encodeCursor(binding, highWatermark, highWatermark),
       contextLimited,
     };
   }
-
   listItemSummaries(
     input: Required<Pick<ItemListInput, 'limit' | 'offset'>> & ItemListInput,
     viewer: ActorIdentity,
   ): Page<ItemSummary> {
+    const binding = this.binding('item-list', viewer, {
+      ...input,
+      cursor: undefined,
+      limit: undefined,
+      offset: undefined,
+    });
+    const changesBinding = this.binding('item-changes', viewer, { kinds: input.kinds ?? [] });
+    const position = input.cursor ? this.decodeCursor(input.cursor, binding) : undefined;
+    const high = position?.watermark ?? this.maxEventSequence();
     const where: string[] = [];
-    const parameters: Array<string | number> = [];
-    const add = (clause: string, ...values: Array<string | number>): void => {
+    const parameters: Array<string | number | bigint> = [];
+    const add = (clause: string, ...values: Array<string | number | bigint>): void => {
       where.push(clause);
       parameters.push(...values);
     };
     if (input.kinds?.length) {
       add(`kind IN (${input.kinds.map(() => '?').join(', ')})`, ...input.kinds);
     }
-    if (input.participantAgentId) {
+    if (input.participant?.id) {
       add(
-        '(recipient_agent_id = ? OR owner_agent_id = ? OR assignee_agent_id = ?)',
-        input.participantAgentId,
-        input.participantAgentId,
-        input.participantAgentId,
+        '((recipient_kind=? AND recipient_id=?) OR (owner_kind=? AND owner_id=?) OR (assignee_kind=? AND assignee_id=?))',
+        input.participant.kind,
+        input.participant.id,
+        input.participant.kind,
+        input.participant.id,
+        input.participant.kind,
+        input.participant.id,
       );
     }
     if (input.actorId) add('actor_id = ?', input.actorId);
@@ -1355,7 +1583,6 @@ export class SynomemStorage implements SynomemRepository {
     if (input.visibility) add('visibility = ?', input.visibility);
     if (input.from) add('created_at >= ?', input.from);
     if (input.to) add('created_at <= ?', input.to);
-
     // Unanswered discovery: items still waiting for somebody to respond. Kept
     // distinct from `pending`, which also counts accepted-and-in-progress work.
     if (input.awaitingResponse) {
@@ -1364,7 +1591,6 @@ export class SynomemStorage implements SynomemRepository {
         (kind = 'task' AND status = 'assigned'))`);
     }
     if (input.awaitingSince) add('created_at <= ?', input.awaitingSince);
-
     // Overdue discovery: a deadline that has passed, on work still open. A
     // completed or canceled item is not overdue, however late it was.
     if (input.overdueAsOf) {
@@ -1373,64 +1599,32 @@ export class SynomemStorage implements SynomemRepository {
         input.overdueAsOf,
       );
     }
-
-    /*
-     * A todo is hidden from other agents, never from the human operating this home: humans are
-     * exempt from every private-record rule here (they are this store's administrators), and the
-     * hosted API grants the same to workspace owners and admins. Agents and system actors see only
-     * their own todos.
-     */
-    if (viewer.kind !== 'human') {
-      add(
-        `(kind != 'todo' OR (owner_agent_id = ? AND ? = 'agent') OR (actor_id = ? AND actor_kind = ?))`,
-        viewer.id,
-        viewer.kind,
-        viewer.id,
-        viewer.kind,
-      );
-    }
-
-    if (viewer.kind !== 'human') {
-      if (viewer.kind === 'agent') {
-        add(
-          `(visibility != 'private' OR (actor_kind = ? AND actor_id = ?) OR
-          recipient_agent_id = ? OR owner_agent_id = ? OR assignee_agent_id = ?)`,
-          viewer.kind,
-          viewer.id,
-          viewer.id,
-          viewer.id,
-          viewer.id,
-        );
-      } else {
-        add(
-          `(visibility != 'private' OR (actor_kind = ? AND actor_id = ?))`,
-          viewer.kind,
-          viewer.id,
-        );
-      }
-    }
+    const privacy = recordVisibilityPredicate(viewer, this.authority);
+    add(privacy.sql, ...privacy.values);
     const baseWhere = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const total = Number(
       (
-        this.db()
-          .prepare(`SELECT COUNT(*) AS count FROM items_current ${baseWhere}`)
-          .get(...parameters) as { count: number }
+        this.prepare(`SELECT COUNT(*) AS count FROM items_current ${baseWhere}`).get(
+          ...parameters,
+        ) as {
+          count: number;
+        }
       ).count,
     );
-    const cursorSequence = input.cursor ? decodeCursor(input.cursor, 'items') : undefined;
+    const cursorSequence = position?.sequence;
     const pageWhere = [...where];
     const pageParameters = [...parameters];
     if (cursorSequence !== undefined) {
       pageWhere.push('created_sequence < ?');
       pageParameters.push(cursorSequence);
     }
+    pageWhere.push('created_sequence<=? AND updated_sequence<=?');
+    pageParameters.push(high, high);
     const sqlWhere = pageWhere.length ? `WHERE ${pageWhere.join(' AND ')}` : '';
     const offset = cursorSequence === undefined ? input.offset : 0;
-    const rows = this.db()
-      .prepare(
-        `SELECT * FROM items_current ${sqlWhere} ORDER BY created_sequence DESC LIMIT ? OFFSET ?`,
-      )
-      .all(...pageParameters, input.limit + 1, offset) as unknown as ItemRow[];
+    const rows = this.prepare(
+      `SELECT * FROM items_current ${sqlWhere} ORDER BY created_sequence DESC LIMIT ? OFFSET ?`,
+    ).all(...pageParameters, input.limit + 1, offset) as unknown as ItemRow[];
     const items: ItemSummary[] = [];
     let bytes = 2;
     let contextLimited = false;
@@ -1452,46 +1646,37 @@ export class SynomemStorage implements SynomemRepository {
       limit: input.limit,
       offset,
       ...(hasMore && lastRow
-        ? { nextCursor: encodeCursor('items', lastRow.created_sequence) }
+        ? { nextCursor: this.encodeCursor(binding, lastRow.created_sequence, high) }
         : {}),
       hasMore,
-      watermark: encodeCursor('change', this.maxEventSequence()),
+      watermark: this.encodeCursor(changesBinding, high, high),
       contextLimited,
     };
   }
-
   listItemChanges(
     after: string | undefined,
     limit: number,
     viewer: ActorIdentity,
     kinds?: RecordKind[],
   ): ChangePage {
-    const afterSequence = after ? decodeCursor(after, 'change') : 0;
+    const binding = this.binding('item-changes', viewer, { kinds: kinds ?? [] });
+    const afterSequence = after ? this.decodeCursor(after, binding).sequence : 0n;
     const highWatermark = this.maxEventSequence();
     const where = ['e.sequence > ?', 'e.sequence <= ?', 'e.item_kind IS NOT NULL'];
-    const parameters: Array<string | number> = [afterSequence, highWatermark];
+    const parameters: Array<string | number | bigint> = [afterSequence, highWatermark];
     if (kinds?.length) {
       where.push(`e.item_kind IN (${kinds.map(() => '?').join(', ')})`);
       parameters.push(...kinds);
     }
-    if (viewer.kind !== 'human') {
-      if (viewer.kind === 'agent') {
-        where.push(`(i.visibility != 'private' OR (i.actor_kind = ? AND i.actor_id = ?) OR
-          i.recipient_agent_id = ? OR i.owner_agent_id = ? OR i.assignee_agent_id = ?)`);
-        parameters.push(viewer.kind, viewer.id, viewer.id, viewer.id, viewer.id);
-      } else {
-        where.push(`(i.visibility != 'private' OR (i.actor_kind = ? AND i.actor_id = ?))`);
-        parameters.push(viewer.kind, viewer.id);
-      }
-    }
+    const privacy = recordVisibilityPredicate(viewer, this.authority, false, 'i.');
+    where.push(privacy.sql);
+    parameters.push(...privacy.values);
     parameters.push(limit + 1);
-    const rows = this.db()
-      .prepare(
-        `SELECT e.id AS event_id, e.sequence, e.type, e.created_at AS event_created_at,
+    const rows = this.prepare(
+      `SELECT e.id AS event_id, e.sequence, e.type, e.created_at AS event_created_at,
        e.payload, i.* FROM events e JOIN items_current i ON i.item_id = e.aggregate_id
        WHERE ${where.join(' AND ')} ORDER BY e.sequence ASC LIMIT ?`,
-      )
-      .all(...parameters) as unknown as Array<
+    ).all(...parameters) as unknown as Array<
       ItemRow &
         EventRow & {
           event_id: string;
@@ -1505,18 +1690,24 @@ export class SynomemStorage implements SynomemRepository {
     let consumed = 0;
     let lastConsumedSequence = afterSequence;
     for (const row of rows.slice(0, limit)) {
-      const sequence = Number(row.sequence);
+      const sequence = row.sequence!;
       let actor: ActorIdentity;
       try {
-        actor = actorSchema.parse((JSON.parse(row.payload) as { actor: unknown }).actor);
+        actor = actorSchema.parse(
+          (
+            JSON.parse(row.payload) as {
+              actor: unknown;
+            }
+          ).actor,
+        );
       } catch {
         consumed += 1;
         lastConsumedSequence = sequence;
         continue;
       }
       const item: ItemChange = {
-        cursor: encodeCursor('change', sequence),
-        sequence,
+        cursor: this.encodeCursor(binding, sequence, highWatermark),
+        sequence: exactSequence(sequence),
         eventId: row.event_id,
         type: row.type,
         createdAt: row.event_created_at,
@@ -1539,24 +1730,25 @@ export class SynomemStorage implements SynomemRepository {
     return {
       items,
       limit,
-      nextCursor: encodeCursor('change', hasMore ? lastConsumedSequence : highWatermark),
+      nextCursor: this.encodeCursor(
+        binding,
+        hasMore ? lastConsumedSequence : highWatermark,
+        highWatermark,
+      ),
       hasMore,
-      watermark: encodeCursor('change', highWatermark),
+      watermark: this.encodeCursor(binding, highWatermark, highWatermark),
       contextLimited,
     };
   }
-
   getItemSummary(id: string): ItemSummary | undefined {
-    const row = this.db()
-      .prepare('SELECT * FROM items_current WHERE item_id = ?')
-      .get(id) as unknown as ItemRow | undefined;
+    const row = this.prepare('SELECT * FROM items_current WHERE item_id = ?').get(id) as unknown as
+      ItemRow | undefined;
     return row ? itemSummaryFromRow(row) : undefined;
   }
-
   getReadableItemEvents(id: string): SynomemEvent[] {
-    const rows = this.db()
-      .prepare('SELECT id, payload FROM events WHERE aggregate_id = ? ORDER BY sequence ASC')
-      .all(id) as unknown as EventRow[];
+    const rows = this.prepare(
+      'SELECT id, payload FROM events WHERE aggregate_id = ? ORDER BY sequence ASC',
+    ).all(id) as unknown as EventRow[];
     const events: SynomemEvent[] = [];
     for (const row of rows) {
       try {
@@ -1567,24 +1759,29 @@ export class SynomemStorage implements SynomemRepository {
     }
     return events;
   }
-
-  currentIndexHealth(): { given: number; indexed: number; stateMismatches: number } {
+  currentIndexHealth(): {
+    given: number;
+    indexed: number;
+    stateMismatches: number;
+  } {
     const given = Number(
       (
-        this.db()
-          .prepare("SELECT COUNT(*) AS count FROM events WHERE type = 'kudos.given'")
-          .get() as { count: number }
+        this.prepare("SELECT COUNT(*) AS count FROM events WHERE type = 'kudos.given'").get() as {
+          count: number;
+        }
       ).count,
     );
     const indexed = Number(
-      (this.db().prepare('SELECT COUNT(*) AS count FROM kudos_current').get() as { count: number })
-        .count,
+      (
+        this.prepare('SELECT COUNT(*) AS count FROM kudos_current').get() as {
+          count: number;
+        }
+      ).count,
     );
     const stateMismatches = Number(
       (
-        this.db()
-          .prepare(
-            `SELECT COUNT(*) AS count
+        this.prepare(
+          `SELECT COUNT(*) AS count
              FROM kudos_current k
              WHERE k.status != CASE WHEN EXISTS (
                SELECT 1 FROM events e
@@ -1594,45 +1791,56 @@ export class SynomemStorage implements SynomemRepository {
                SELECT 1 FROM events e
                WHERE e.type = 'kudos.revoked' AND e.kudos_id = k.kudos_id
              ) THEN 'revoked' ELSE 'active' END`,
-          )
-          .get() as { count: number }
+        ).get() as {
+          count: number;
+        }
       ).count,
     );
     return { given, indexed, stateMismatches };
   }
-
-  itemIndexHealth(): { created: number; indexed: number } {
+  itemIndexHealth(): {
+    created: number;
+    indexed: number;
+  } {
     const created = Number(
       (
-        this.db()
-          .prepare(
-            `SELECT COUNT(*) AS count FROM events WHERE type IN
+        this.prepare(
+          `SELECT COUNT(*) AS count FROM events WHERE type IN
        ('kudos.given', 'memo.sent', 'note.created', 'post.created', 'task.created')`,
-          )
-          .get() as { count: number }
+        ).get() as {
+          count: number;
+        }
       ).count,
     );
     const indexed = Number(
-      (this.db().prepare('SELECT COUNT(*) AS count FROM items_current').get() as { count: number })
-        .count,
+      (
+        this.prepare('SELECT COUNT(*) AS count FROM items_current').get() as {
+          count: number;
+        }
+      ).count,
     );
     return { created, indexed };
   }
-
-  migrationState(): { schemaVersion: number; appliedVersions: number[] } {
+  migrationState(): {
+    schemaVersion: number;
+    appliedVersions: number[];
+  } {
     const schemaVersion = Number(
-      (this.db().prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      (
+        this.prepare('PRAGMA user_version').get() as {
+          user_version: number;
+        }
+      ).user_version,
     );
     const appliedVersions = (
-      this.db()
-        .prepare('SELECT version FROM schema_migrations ORDER BY version')
-        .all() as unknown as Array<{
+      this.prepare(
+        'SELECT version FROM schema_migrations ORDER BY version',
+      ).all() as unknown as Array<{
         version: number;
       }>
     ).map((row) => Number(row.version));
     return { schemaVersion, appliedVersions };
   }
-
   /**
    * Aliases that also name an agent directly.
    *
@@ -1641,63 +1849,55 @@ export class SynomemStorage implements SynomemRepository {
    * agent's handle — which is the collision that actually makes a lookup
    * ambiguous now.
    */
-  aliasIdentityConflicts(): Array<{ alias: string; agentId: string }> {
-    return this.db()
-      .prepare(
-        `SELECT x.alias, x.agent_id AS agentId
+  aliasIdentityConflicts(): Array<{
+    alias: string;
+    agentId: string;
+  }> {
+    return this.prepare(
+      `SELECT x.alias, x.agent_id AS agentId
          FROM aliases x
          JOIN agents a ON lower(a.id) = x.normalized_alias
                        OR lower(a.handle) = x.normalized_alias
         WHERE a.id != x.agent_id
         ORDER BY x.alias`,
-      )
-      .all() as unknown as Array<{ alias: string; agentId: string }>;
+    ).all() as unknown as Array<{
+      alias: string;
+      agentId: string;
+    }>;
   }
-
-  private maxEventSequence(): number {
-    return Number(
-      (
-        this.db().prepare('SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events').get() as {
-          sequence: number;
-        }
-      ).sequence,
-    );
+  private maxEventSequence(): bigint {
+    return (
+      this.prepare('SELECT COALESCE(MAX(sequence),0) AS sequence FROM events').get() as {
+        sequence: bigint;
+      }
+    ).sequence;
   }
-
   getEvent(id: string): SynomemEvent | undefined {
-    const row = this.db().prepare('SELECT id, payload FROM events WHERE id = ?').get(id) as
+    const row = this.prepare('SELECT id, payload FROM events WHERE id = ?').get(id) as
       EventRow | undefined;
     return row ? this.parseEvent(row) : undefined;
   }
-
   getEventByIdempotency(actorKind: string, actorId: string, key: string): SynomemEvent | undefined {
-    const row = this.db()
-      .prepare(
-        `SELECT id, payload FROM events
+    const row = this.prepare(
+      `SELECT id, payload FROM events
          WHERE actor_kind = ? AND actor_id = ? AND idempotency_key = ?`,
-      )
-      .get(actorKind, actorId, key) as EventRow | undefined;
+    ).get(actorKind, actorId, key) as EventRow | undefined;
     return row ? this.parseEvent(row) : undefined;
   }
-
   getEvents(): SynomemEvent[] {
     const scan = this.scanEvents();
     if (scan.invalid[0]) throw scan.invalid[0].error;
     return scan.events;
   }
-
   getReadableEvents(): SynomemEvent[] {
     return this.scanEvents().events;
   }
-
   getReadableSynomemEvents(kudosId: string): SynomemEvent[] {
-    const rows = this.db()
-      .prepare(
-        `SELECT id, payload FROM events
+    const rows = this.prepare(
+      `SELECT id, payload FROM events
          WHERE (type = 'kudos.given' AND id = ?) OR kudos_id = ?
          ORDER BY sequence ASC`,
-      )
-      .all(kudosId, kudosId) as unknown as EventRow[];
+    ).all(kudosId, kudosId) as unknown as EventRow[];
     const events: SynomemEvent[] = [];
     for (const row of rows) {
       try {
@@ -1708,7 +1908,6 @@ export class SynomemStorage implements SynomemRepository {
     }
     return events;
   }
-
   scanEvents(): EventScan {
     const rows = this.rawEventRows();
     const events: SynomemEvent[] = [];
@@ -1723,11 +1922,14 @@ export class SynomemStorage implements SynomemRepository {
     }
     return { events, invalid };
   }
-
   assertEventCompatibility(): void {
-    const rows = this.db()
-      .prepare('SELECT id, payload, sequence FROM events WHERE sequence > ? ORDER BY sequence ASC')
-      .all(this.validatedEventSequence) as unknown as Array<EventRow & { sequence: number }>;
+    const rows = this.prepare(
+      'SELECT id, payload, sequence FROM events WHERE sequence > ? ORDER BY sequence ASC',
+    ).all(this.validatedEventSequence) as unknown as Array<
+      EventRow & {
+        sequence: bigint;
+      }
+    >;
     const invalid: EventScan['invalid'] = [];
     for (const row of rows) {
       try {
@@ -1747,19 +1949,24 @@ export class SynomemStorage implements SynomemRepository {
       { eventIds: invalid.map((item) => item.id) },
     );
   }
-
   rawEventRows(): EventRow[] {
-    return this.db()
-      .prepare('SELECT id, payload FROM events ORDER BY sequence ASC')
-      .all() as unknown as EventRow[];
+    return this.prepare(
+      'SELECT id, payload FROM events ORDER BY sequence ASC',
+    ).all() as unknown as EventRow[];
   }
-
   private parseEvent(row: EventRow): SynomemEvent {
     try {
-      let value = JSON.parse(row.payload) as unknown;
+      const value = JSON.parse(row.payload) as unknown;
       if (typeof value === 'object' && value !== null) {
-        const candidate = value as { schemaVersion?: unknown; type?: unknown };
+        const candidate = value as {
+          schemaVersion?: unknown;
+          type?: unknown;
+        };
         const supportedTypes = new Set([
+          'reply.created',
+          'reply.deleted',
+          'reaction.added',
+          'reaction.removed',
           'agent.created',
           'agent.updated',
           'topic.created',
@@ -1785,6 +1992,7 @@ export class SynomemStorage implements SynomemRepository {
           'task.accepted',
           'task.rejected',
           'task.canceled',
+          'task.decision_overridden',
           'todo.created',
           'todo.updated',
           'todo.completed',
@@ -1793,7 +2001,7 @@ export class SynomemStorage implements SynomemRepository {
           'todo.archived',
         ]);
         if (
-          (typeof candidate.schemaVersion === 'number' && candidate.schemaVersion > 1) ||
+          (typeof candidate.schemaVersion === 'number' && candidate.schemaVersion > 2) ||
           (typeof candidate.type === 'string' && !supportedTypes.has(candidate.type))
         ) {
           throw new SynomemError(
@@ -1801,30 +2009,6 @@ export class SynomemStorage implements SynomemRepository {
             `Event ${row.id} was written by a newer or incompatible Synomem version.`,
           );
         }
-        const legacy = candidate as Record<string, unknown>;
-        if (legacy.workspaceId === undefined) legacy.workspaceId = 'legacy-local';
-        if (legacy.aggregateId === undefined) {
-          legacy.aggregateId =
-            legacy.kudosId ??
-            legacy.memoId ??
-            legacy.noteId ??
-            legacy.taskId ??
-            (typeof legacy.agentId === 'string' ? legacy.agentId : undefined) ??
-            (typeof legacy.agent === 'object' && legacy.agent !== null
-              ? (legacy.agent as { id?: unknown }).id
-              : undefined) ??
-            legacy.id;
-        }
-        if (legacy.aggregateVersion === undefined) {
-          legacy.aggregateVersion =
-            String(legacy.type).endsWith('.given') ||
-            String(legacy.type).endsWith('.sent') ||
-            String(legacy.type).endsWith('.created')
-              ? 1
-              : 2;
-        }
-        if (legacy.visibility === 'local') legacy.visibility = 'workspace';
-        value = legacy;
       }
       return eventSchema.parse(value);
     } catch (error) {
@@ -1838,50 +2022,189 @@ export class SynomemStorage implements SynomemRepository {
       );
     }
   }
+  canActorReadItem(id: string, actor: ActorRef): boolean {
+    const target = this.getActor(actor);
+    if (!target || target.status !== 'active') return false;
+    const authority =
+      this.boundActor && this.boundActor.kind === actor.kind && this.boundActor.id === actor.id
+        ? this.authority
+        : resolveAuthority();
+    const predicate = recordVisibilityPredicate(actor, authority);
+    return !!this.prepare(`SELECT 1 FROM items_current WHERE item_id=? AND (${predicate.sql})`).get(
+      id,
+      ...predicate.values,
+    );
+  }
+  getMutationReceipt(
+    actorKind: string,
+    actorId: string,
+    keyHash: string,
+  ): MutationReceipt | undefined {
+    const row = this.prepare(
+      'SELECT operation,request_hash,result_json,event_id,created_at FROM mutation_receipts WHERE actor_kind=? AND actor_id=? AND key_hash=?',
+    ).get(actorKind, actorId, keyHash) as
+      | {
+          operation: string;
+          request_hash: string;
+          result_json: string | null;
+          event_id: string | null;
+          created_at: string;
+        }
+      | undefined;
+    return row
+      ? {
+          operation: row.operation,
+          requestHash: row.request_hash,
+          resultJson: row.result_json,
+          createdAt: row.created_at,
+          ...(row.event_id ? { eventId: row.event_id } : {}),
+        }
+      : undefined;
+  }
+  insertMutationReceipt(
+    actorKind: string,
+    actorId: string,
+    keyHash: string,
+    receipt: MutationReceipt,
+  ): void {
+    this.prepare(
+      'INSERT INTO mutation_receipts(actor_kind,actor_id,key_hash,operation,request_hash,result_json,event_id,created_at) VALUES(?,?,?,?,?,?,?,?)',
+    ).run(
+      actorKind,
+      actorId,
+      keyHash,
+      receipt.operation,
+      receipt.requestHash,
+      receipt.resultJson,
+      receipt.eventId ?? null,
+      receipt.createdAt,
+    );
+  }
+  compactMutationReceipts(before: string): number {
+    this.assertWritable();
+    return Number(
+      this.prepare(
+        'UPDATE mutation_receipts SET result_json=NULL WHERE rowid IN (SELECT rowid FROM mutation_receipts WHERE created_at<? AND result_json IS NOT NULL ORDER BY created_at LIMIT 1000)',
+      ).run(before).changes,
+    );
+  }
+  getActor(ref: ActorRef): AddressableActor | undefined {
+    if (ref.kind === 'agent') {
+      const profile = this.getAgent(ref.id);
+      return profile
+        ? {
+            kind: 'agent',
+            id: profile.id,
+            handle: profile.handle,
+            displayName: profile.displayName,
+            status: profile.status === 'archived' ? 'inactive' : 'active',
+          }
+        : undefined;
+    }
+    const row = this.prepare(
+      'SELECT id,handle,display_name,status FROM human_actors WHERE id=? OR lower(handle)=lower(?)',
+    ).get(ref.id, ref.id) as
+      | { id: string; handle: string; display_name: string; status: 'active' | 'inactive' }
+      | undefined;
+    return row
+      ? {
+          kind: 'human',
+          id: row.id,
+          handle: row.handle,
+          displayName: row.display_name,
+          status: row.status,
+        }
+      : undefined;
+  }
+
+  actorCounts(
+    target: ActorRef,
+    viewer: ActorIdentity,
+  ): { kudosReceived: number; usefulReceived: number } {
+    const policy = recordVisibilityPredicate(viewer, this.authority, false, 'i.');
+    const kudos = this.prepare(
+      `SELECT COUNT(*) AS count FROM kudos_current k JOIN items_current i ON i.item_id=k.kudos_id WHERE i.workspace_id=? AND k.recipient_kind=? AND k.recipient_id=? AND k.revocation_status!='revoked' AND (${policy.sql})`,
+    ).get(this.config.workspaceId, target.kind, target.id, ...policy.values) as { count: bigint };
+    const useful = this.prepare(
+      `SELECT COUNT(*) AS count FROM reactions_current c JOIN items_current i ON i.workspace_id=c.workspace_id AND i.item_id=c.root_id LEFT JOIN replies_current r ON r.workspace_id=c.workspace_id AND r.reply_id=c.target_id WHERE c.workspace_id=? AND c.code='useful' AND (${policy.sql}) AND ((c.target_id=i.item_id AND i.actor_kind=? AND i.actor_id=?) OR (r.deleted_at IS NULL AND json_extract(r.author_json,'$.kind')=? AND json_extract(r.author_json,'$.id')=?))`,
+    ).get(
+      this.config.workspaceId,
+      ...policy.values,
+      target.kind,
+      target.id,
+      target.kind,
+      target.id,
+    ) as { count: bigint };
+    return { kudosReceived: Number(kudos.count), usefulReceived: Number(useful.count) };
+  }
+  listActors(input: ActorDirectoryInput = {}): AddressableActor[] {
+    const query = (input.query ?? '').toLowerCase();
+    return (
+      this.prepare(
+        `SELECT kind,id,handle,display_name,status FROM (
+      SELECT 'human' AS kind,id,handle,display_name,status FROM human_actors
+      UNION ALL SELECT 'agent' AS kind,id,json_extract(profile_json,'$.handle') AS handle,display_name,
+      CASE WHEN json_extract(profile_json,'$.status')='archived' THEN 'inactive' ELSE 'active' END AS status FROM agents
+    ) WHERE status='active' AND (? IS NULL OR kind=?) AND (?='' OR instr(lower(id||' '||handle||' '||display_name),?)>0) ORDER BY kind,handle,id LIMIT ?`,
+      ).all(input.kind ?? null, input.kind ?? null, query, query, input.limit ?? 20) as Array<{
+        kind: 'human' | 'agent';
+        id: string;
+        handle: string;
+        display_name: string;
+        status: 'active';
+      }>
+    ).map((row) => ({
+      kind: row.kind,
+      id: row.id,
+      handle: row.handle,
+      displayName: row.display_name,
+      status: row.status,
+    }));
+  }
+
+  registerHuman(actor: AddressableActor): void {
+    this.assertWritable();
+    this.prepare(
+      'INSERT INTO human_actors(id,handle,display_name,status) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET handle=excluded.handle,display_name=excluded.display_name,status=excluded.status',
+    ).run(actor.id, actor.handle, actor.displayName, actor.status);
+  }
 
   insertAgent(profile: AgentProfile): void {
     const parsed = profileSchema.parse(profile);
-    this.db()
-      .prepare(
-        `INSERT INTO agents(id, handle, status, display_name, profile_json, created_at, updated_at)
+    this.prepare(
+      `INSERT INTO agents(id, handle, status, display_name, profile_json, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        parsed.id,
-        parsed.handle,
-        parsed.status,
-        parsed.displayName,
-        JSON.stringify(parsed),
-        parsed.createdAt,
-        parsed.createdAt,
-      );
+    ).run(
+      parsed.id,
+      parsed.handle,
+      parsed.status,
+      parsed.displayName,
+      JSON.stringify(parsed),
+      parsed.createdAt,
+      parsed.createdAt,
+    );
     this.insertAliases(parsed.id, parsed.aliases ?? []);
   }
-
   updateAgent(profile: AgentProfile, updatedAt: string): void {
     const parsed = profileSchema.parse(profile);
-    this.db()
-      .prepare(
-        `UPDATE agents SET handle = ?, status = ?, display_name = ?, profile_json = ?,
+    this.prepare(
+      `UPDATE agents SET handle = ?, status = ?, display_name = ?, profile_json = ?,
            updated_at = ? WHERE id = ?`,
-      )
-      .run(
-        parsed.handle,
-        parsed.status,
-        parsed.displayName,
-        JSON.stringify(parsed),
-        updatedAt,
-        parsed.id,
-      );
-    this.db().prepare('DELETE FROM aliases WHERE agent_id = ?').run(parsed.id);
+    ).run(
+      parsed.handle,
+      parsed.status,
+      parsed.displayName,
+      JSON.stringify(parsed),
+      updatedAt,
+      parsed.id,
+    );
+    this.prepare('DELETE FROM aliases WHERE agent_id = ?').run(parsed.id);
     this.insertAliases(parsed.id, parsed.aliases ?? []);
   }
-
   getAgent(idOrAlias: string): AgentProfile | undefined {
     const resolved = this.resolveAgent(idOrAlias);
     return resolved.match;
   }
-
   /**
    * Resolves a name to a canonical agent, reporting ambiguity rather than
    * guessing.
@@ -1892,78 +2215,74 @@ export class SynomemStorage implements SynomemRepository {
    * case — silently preferring the ID would attribute work to the wrong agent,
    * and the person who typed the name would never know.
    */
-  resolveAgent(query: string): { match?: AgentProfile; candidates: AgentProfile[] } {
+  resolveAgent(query: string): {
+    match?: AgentProfile;
+    candidates: AgentProfile[];
+  } {
     const normalized = query.trim().toLowerCase();
-    const rows = this.db()
-      .prepare(
-        `SELECT DISTINCT a.profile_json
+    const rows = this.prepare(
+      `SELECT DISTINCT a.profile_json
            FROM agents a
            LEFT JOIN aliases x ON x.agent_id = a.id
           WHERE lower(a.id) = ? OR lower(a.handle) = ? OR x.normalized_alias = ?
           ORDER BY a.id ASC`,
-      )
-      .all(normalized, normalized, normalized) as unknown as ProfileRow[];
+    ).all(normalized, normalized, normalized) as unknown as ProfileRow[];
     const candidates = rows.map((row) => profileSchema.parse(JSON.parse(row.profile_json)));
     return candidates.length === 1 ? { match: candidates[0]!, candidates } : { candidates };
   }
-
   /* -------------------------------------------------------------------- topics */
-
   insertTopic(topic: Topic): void {
     const parsed = topicProfileSchema.parse(topic);
-    this.db()
-      .prepare(
-        `INSERT INTO topics(id, display_name, status, created_at, updated_at)
+    this.prepare(
+      `INSERT INTO topics(id, display_name, status, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run(parsed.id, parsed.displayName, parsed.status, parsed.createdAt, parsed.createdAt);
+    ).run(parsed.id, parsed.displayName, parsed.status, parsed.createdAt, parsed.createdAt);
     this.insertTopicAliases(parsed.id, parsed.aliases ?? []);
   }
-
   updateTopic(topic: Topic, updatedAt: string): void {
     const parsed = topicProfileSchema.parse(topic);
-    this.db()
-      .prepare('UPDATE topics SET display_name = ?, status = ?, updated_at = ? WHERE id = ?')
-      .run(parsed.displayName, parsed.status, updatedAt, parsed.id);
-    this.db().prepare('DELETE FROM topic_aliases WHERE topic_id = ?').run(parsed.id);
+    this.prepare('UPDATE topics SET display_name = ?, status = ?, updated_at = ? WHERE id = ?').run(
+      parsed.displayName,
+      parsed.status,
+      updatedAt,
+      parsed.id,
+    );
+    this.prepare('DELETE FROM topic_aliases WHERE topic_id = ?').run(parsed.id);
     this.insertTopicAliases(parsed.id, parsed.aliases ?? []);
   }
-
   getTopic(idOrAlias: string): Topic | undefined {
     return this.resolveTopic(idOrAlias).match;
   }
-
   listTopics(status?: 'active' | 'archived'): Topic[] {
     const rows = (status
-      ? this.db()
-          .prepare('SELECT * FROM topics WHERE status = ? ORDER BY display_name ASC')
-          .all(status)
-      : this.db()
-          .prepare('SELECT * FROM topics ORDER BY display_name ASC')
-          .all()) as unknown as TopicRow[];
+      ? this.prepare('SELECT * FROM topics WHERE status = ? ORDER BY display_name ASC').all(status)
+      : this.prepare(
+          'SELECT * FROM topics ORDER BY display_name ASC',
+        ).all()) as unknown as TopicRow[];
     return rows.map((row) => this.topicFromRow(row));
   }
-
   /** Resolves a name case-insensitively, reporting ambiguity instead of guessing. */
-  resolveTopic(query: string): { match?: Topic; candidates: Topic[] } {
+  resolveTopic(query: string): {
+    match?: Topic;
+    candidates: Topic[];
+  } {
     const normalized = query.trim().toLowerCase();
-    const rows = this.db()
-      .prepare(
-        `SELECT DISTINCT t.*
+    const rows = this.prepare(
+      `SELECT DISTINCT t.*
            FROM topics t
            LEFT JOIN topic_aliases x ON x.topic_id = t.id
           WHERE lower(t.id) = ? OR lower(t.display_name) = ? OR x.alias = ?
           ORDER BY t.id ASC`,
-      )
-      .all(normalized, normalized, normalized) as unknown as TopicRow[];
+    ).all(normalized, normalized, normalized) as unknown as TopicRow[];
     const candidates = rows.map((row) => this.topicFromRow(row));
     return candidates.length === 1 ? { match: candidates[0]!, candidates } : { candidates };
   }
-
   private topicFromRow(row: TopicRow): Topic {
-    const aliasRows = this.db()
-      .prepare('SELECT alias FROM topic_aliases WHERE topic_id = ? ORDER BY alias ASC')
-      .all(row.id) as unknown as Array<{ alias: string }>;
+    const aliasRows = this.prepare(
+      'SELECT alias FROM topic_aliases WHERE topic_id = ? ORDER BY alias ASC',
+    ).all(row.id) as unknown as Array<{
+      alias: string;
+    }>;
     const aliases = aliasRows.map((aliasRow) => aliasRow.alias);
     return {
       id: row.id,
@@ -1973,24 +2292,20 @@ export class SynomemStorage implements SynomemRepository {
       createdAt: row.created_at,
     };
   }
-
   private insertTopicAliases(topicId: string, aliases: string[]): void {
     for (const alias of aliases) {
-      this.db()
-        .prepare('INSERT INTO topic_aliases(alias, topic_id) VALUES (?, ?)')
-        .run(alias.trim().toLowerCase(), topicId);
+      this.prepare('INSERT INTO topic_aliases(alias, topic_id) VALUES (?, ?)').run(
+        alias.trim().toLowerCase(),
+        topicId,
+      );
     }
   }
-
   /* -------------------------------------------------------- post acknowledgment */
-
   listPostAcknowledgments(postId: string): PostAcknowledgment[] {
-    const rows = this.db()
-      .prepare(
-        `SELECT actor_kind, actor_id, actor_display_name, note, acknowledged_at
+    const rows = this.prepare(
+      `SELECT actor_kind, actor_id, actor_display_name, note, acknowledged_at
            FROM post_acknowledgments WHERE post_id = ? ORDER BY acknowledged_at ASC`,
-      )
-      .all(postId) as unknown as Array<{
+    ).all(postId) as unknown as Array<{
       actor_kind: string;
       actor_id: string;
       actor_display_name: string | null;
@@ -2007,7 +2322,6 @@ export class SynomemStorage implements SynomemRepository {
       ...(row.note ? { note: row.note } : {}),
     }));
   }
-
   /**
    * Who has acknowledged a post and who has not.
    *
@@ -2017,36 +2331,36 @@ export class SynomemStorage implements SynomemRepository {
    * newcomer of ignoring something written before it arrived.
    */
   postRoster(postId: string): PostRoster | undefined {
-    const post = this.db()
-      .prepare("SELECT created_at FROM items_current WHERE item_id = ? AND kind = 'post'")
-      .get(postId) as { created_at: string } | undefined;
+    const post = this.prepare(
+      "SELECT created_at FROM items_current WHERE item_id = ? AND kind = 'post'",
+    ).get(postId) as
+      | {
+          created_at: string;
+        }
+      | undefined;
     if (!post) return undefined;
-
     const acknowledged = this.listPostAcknowledgments(postId);
     const acknowledgedIds = new Set(acknowledged.map((entry) => entry.actor.id));
-
-    const eligible = this.db()
-      .prepare('SELECT id, display_name, created_at FROM agents ORDER BY id ASC')
-      .all() as unknown as Array<{ id: string; display_name: string; created_at: string }>;
-
+    const eligible = this.prepare(
+      'SELECT id, display_name, created_at FROM agents ORDER BY id ASC',
+    ).all() as unknown as Array<{
+      id: string;
+      display_name: string;
+      created_at: string;
+    }>;
     const outstanding = eligible
       .filter((agent) => agent.created_at <= post.created_at && !acknowledgedIds.has(agent.id))
       .map((agent) => ({ id: agent.id, displayName: agent.display_name }));
     const joinedSince = eligible.filter((agent) => agent.created_at > post.created_at).length;
-
     return { postId, acknowledged, outstanding, joinedSince };
   }
-
   /* ------------------------------------------------------- runtime bindings */
-
   listRuntimeBindings(agentId: string): AgentRuntimeBinding[] {
-    const rows = this.db()
-      .prepare(
-        `SELECT id, agent_id, installation_id, runtime, profile, capabilities_json,
+    const rows = this.prepare(
+      `SELECT id, agent_id, installation_id, runtime, profile, capabilities_json,
                 bound_at, last_seen_at
            FROM agent_runtime_bindings WHERE agent_id = ? ORDER BY bound_at ASC`,
-      )
-      .all(agentId) as unknown as Array<{
+    ).all(agentId) as unknown as Array<{
       id: string;
       agent_id: string;
       installation_id: string | null;
@@ -2067,7 +2381,6 @@ export class SynomemStorage implements SynomemRepository {
       ...(row.last_seen_at ? { lastSeenAt: row.last_seen_at } : {}),
     }));
   }
-
   bindRuntime(binding: {
     id: string;
     agentId: string;
@@ -2077,44 +2390,35 @@ export class SynomemStorage implements SynomemRepository {
     capabilities?: Record<string, JsonValue>;
     boundAt: string;
   }): void {
-    this.db()
-      .prepare(
-        `INSERT INTO agent_runtime_bindings(
+    this.prepare(
+      `INSERT INTO agent_runtime_bindings(
            id, agent_id, installation_id, runtime, profile, capabilities_json, bound_at
          ) VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(agent_id, runtime, COALESCE(profile, ''), COALESCE(installation_id, ''))
          DO UPDATE SET capabilities_json = excluded.capabilities_json`,
-      )
-      .run(
-        binding.id,
-        binding.agentId,
-        binding.installationId ?? null,
-        binding.runtime,
-        binding.profile ?? null,
-        JSON.stringify(binding.capabilities ?? {}),
-        binding.boundAt,
-      );
+    ).run(
+      binding.id,
+      binding.agentId,
+      binding.installationId ?? null,
+      binding.runtime,
+      binding.profile ?? null,
+      JSON.stringify(binding.capabilities ?? {}),
+      binding.boundAt,
+    );
   }
-
   unbindRuntime(bindingId: string): boolean {
-    const result = this.db()
-      .prepare('DELETE FROM agent_runtime_bindings WHERE id = ?')
-      .run(bindingId);
+    const result = this.prepare('DELETE FROM agent_runtime_bindings WHERE id = ?').run(bindingId);
     return Number(result.changes) > 0;
   }
-
   /**
    * Advisory only. Records that Synomem observed this binding act — never that
    * the runtime is reachable now, and never that a delivery succeeded.
    */
   touchRuntimeBinding(agentId: string, runtime: string, at: string): void {
-    this.db()
-      .prepare(
-        'UPDATE agent_runtime_bindings SET last_seen_at = ? WHERE agent_id = ? AND runtime = ?',
-      )
-      .run(at, agentId, runtime);
+    this.prepare(
+      'UPDATE agent_runtime_bindings SET last_seen_at = ? WHERE agent_id = ? AND runtime = ?',
+    ).run(at, agentId, runtime);
   }
-
   /**
    * Writes an agent's aliases, refusing any that would make a name ambiguous.
    *
@@ -2127,47 +2431,54 @@ export class SynomemStorage implements SynomemRepository {
   private insertAliases(agentId: string, aliases: string[]): void {
     for (const alias of aliases) {
       const normalized = alias.trim().toLowerCase();
-      const conflictingAgent = this.db()
-        .prepare('SELECT id FROM agents WHERE lower(id) = ? AND id != ?')
-        .get(normalized, agentId) as { id: string } | undefined;
+      const conflictingAgent = this.prepare(
+        'SELECT id FROM agents WHERE lower(id) = ? AND id != ?',
+      ).get(normalized, agentId) as
+        | {
+            id: string;
+          }
+        | undefined;
       if (conflictingAgent) {
         throw new SynomemError(
           'ALIAS_CONFLICT',
           `Alias "${alias}" is already the canonical ID of agent ${conflictingAgent.id}. Aliases must resolve to exactly one agent.`,
         );
       }
-      const conflictingAlias = this.db()
-        .prepare('SELECT agent_id FROM aliases WHERE normalized_alias = ? AND agent_id != ?')
-        .get(normalized, agentId) as { agent_id: string } | undefined;
+      const conflictingAlias = this.prepare(
+        'SELECT agent_id FROM aliases WHERE normalized_alias = ? AND agent_id != ?',
+      ).get(normalized, agentId) as
+        | {
+            agent_id: string;
+          }
+        | undefined;
       if (conflictingAlias) {
         throw new SynomemError(
           'ALIAS_CONFLICT',
           `Alias "${alias}" already belongs to agent ${conflictingAlias.agent_id}. Aliases must resolve to exactly one agent.`,
         );
       }
-      this.db()
-        .prepare('INSERT INTO aliases(alias, agent_id, normalized_alias) VALUES (?, ?, ?)')
-        .run(alias, agentId, normalized);
+      this.prepare('INSERT INTO aliases(alias, agent_id, normalized_alias) VALUES (?, ?, ?)').run(
+        alias,
+        agentId,
+        normalized,
+      );
     }
   }
-
   listAgents(): AgentProfile[] {
-    const rows = this.db()
-      .prepare('SELECT profile_json FROM agents ORDER BY id ASC')
-      .all() as unknown as ProfileRow[];
+    const rows = this.prepare(
+      'SELECT profile_json FROM agents ORDER BY id ASC',
+    ).all() as unknown as ProfileRow[];
     return rows.map((row) => profileSchema.parse(JSON.parse(row.profile_json)));
   }
-
   replaceProjectionManifest(paths: string[], generatedAt: string): void {
     this.transactionSync(() => {
-      this.db().prepare('DELETE FROM projection_manifest').run();
-      const insert = this.db().prepare(
+      this.prepare('DELETE FROM projection_manifest').run();
+      const insert = this.prepare(
         'INSERT INTO projection_manifest(path, generated_at) VALUES (?, ?)',
       );
       for (const path of paths) insert.run(path, generatedAt);
     });
   }
-
   /**
    * @param directory the agent's projection directory name, which is its
    * handle rather than its canonical ID: these rows are keyed by the path on
@@ -2175,24 +2486,23 @@ export class SynomemStorage implements SynomemRepository {
    */
   replaceAgentProjectionManifest(directory: string, paths: string[], generatedAt: string): void {
     this.transactionSync(() => {
-      this.db()
-        .prepare('DELETE FROM projection_manifest WHERE path LIKE ? OR path LIKE ?')
-        .run(`${directory}/%`, `${directory}\\%`);
-      const insert = this.db().prepare(
+      this.prepare('DELETE FROM projection_manifest WHERE path LIKE ? OR path LIKE ?').run(
+        `${directory}/%`,
+        `${directory}\\%`,
+      );
+      const insert = this.prepare(
         'INSERT INTO projection_manifest(path, generated_at) VALUES (?, ?)',
       );
       for (const path of paths) insert.run(path, generatedAt);
     });
   }
-
   projectionManifest(): string[] {
     return (
-      this.db().prepare('SELECT path FROM projection_manifest ORDER BY path').all() as unknown as {
+      this.prepare('SELECT path FROM projection_manifest ORDER BY path').all() as unknown as {
         path: string;
       }[]
     ).map((row) => row.path);
   }
-
   /**
    * Re-point manifest paths from one agent directory to another.
    *
@@ -2211,8 +2521,8 @@ export class SynomemStorage implements SynomemRepository {
       prefixes.some((prefix) => entry.path.startsWith(prefix)),
     );
     if (!rows.length) return;
-    const remove = this.db().prepare('DELETE FROM projection_manifest WHERE path = ?');
-    const insert = this.db().prepare(
+    const remove = this.prepare('DELETE FROM projection_manifest WHERE path = ?');
+    const insert = this.prepare(
       'INSERT OR REPLACE INTO projection_manifest(path, generated_at) VALUES (?, ?)',
     );
     for (const row of rows) {
@@ -2220,29 +2530,31 @@ export class SynomemStorage implements SynomemRepository {
       insert.run(`${nextHandle}${row.path.slice(previousHandle.length)}`, row.generatedAt);
     }
   }
-
   /** The manifest with the time each path was written, newest first. */
-  projectionManifestEntries(): { path: string; generatedAt: string }[] {
+  projectionManifestEntries(): {
+    path: string;
+    generatedAt: string;
+  }[] {
     return (
-      this.db()
-        .prepare('SELECT path, generated_at FROM projection_manifest ORDER BY generated_at DESC')
-        .all() as unknown as { path: string; generated_at: string }[]
+      this.prepare(
+        'SELECT path, generated_at FROM projection_manifest ORDER BY generated_at DESC',
+      ).all() as unknown as {
+        path: string;
+        generated_at: string;
+      }[]
     ).map((row) => ({ path: row.path, generatedAt: row.generated_at }));
   }
-
   integrityCheck(): string[] {
-    const rows = this.db().prepare('PRAGMA integrity_check').all() as unknown as Record<
+    const rows = this.prepare('PRAGMA integrity_check').all() as unknown as Record<
       string,
       string
     >[];
     return rows.map((row) => Object.values(row)[0] ?? 'unknown');
   }
-
   journalMode(): string {
-    const row = this.db().prepare('PRAGMA journal_mode').get() as Record<string, string>;
+    const row = this.prepare('PRAGMA journal_mode').get() as Record<string, string>;
     return Object.values(row)[0] ?? 'unknown';
   }
-
   async backup(destination: string): Promise<string> {
     this.assertWritable();
     const output = resolve(destination);
@@ -2268,7 +2580,6 @@ export class SynomemStorage implements SynomemRepository {
       rmdirSync(temporaryDirectory);
     }
   }
-
   private restrictDatabaseFiles(): void {
     if (this.readOnly) return;
     for (const path of [
@@ -2279,7 +2590,6 @@ export class SynomemStorage implements SynomemRepository {
       if (existsSync(path)) chmodSync(path, 0o600);
     }
   }
-
   close(): void {
     this.database?.close();
     this.database = undefined;

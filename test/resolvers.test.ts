@@ -61,6 +61,15 @@ function fakeApi(mode: 'fixed' | 'explicit' = 'explicit') {
         ok: true,
         data: {
           backend: 'remote',
+          participation: {
+            version: 2,
+            replies: true,
+            reactions: true,
+            personalInbox: true,
+            canWrite: true,
+            administrator: false,
+            managedAgentIds: [],
+          },
           binding: {
             workspaceId: selected.workspaceId,
             actor: selected.actor,
