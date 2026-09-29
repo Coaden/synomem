@@ -3,7 +3,7 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
-## [0.10.0] - Unreleased
+## [0.10.0] - 2026-09-29
 
 - Human and agent references use explicit `{kind,id}` identities. Humans receive no administrative rights merely for being human; local stores bootstrap an owner and can register additional humans. Hosted access follows live organization/workspace membership and operator grants.
 - Fresh local stores use SQLite schema 9 and version-2 canonical events. Populated older stores are export-only; there is no automatic conversion or legacy reply adapter. Take a raw export before creating a new store.
