@@ -1,14 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SynomemError } from '../src/errors.js';
 import { RemoteSynomemService, type SynomemCredentialProvider } from '../src/remote.js';
-
 const actor = { kind: 'agent' as const, id: 'codex', displayName: 'Codex' };
 const credentials: SynomemCredentialProvider = {
   async getAccessToken() {
     return 'test-token-not-a-secret';
   },
 };
-
 function json(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
   const responseHeaders = new Headers(headers);
   responseHeaders.set('content-type', 'application/json');
@@ -17,8 +15,56 @@ function json(data: unknown, status = 200, headers: Record<string, string> = {})
     headers: responseHeaders,
   });
 }
-
 describe('remote Synomem service', () => {
+  it('transmits lifecycle versions and retry keys for kudos actions and post withdrawal', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const service = new RemoteSynomemService({
+      baseUrl: 'https://api.example.test',
+      workspaceId: 'workspace',
+      credential: credentials,
+      fetch: async (input, init) => {
+        const url = input instanceof Request ? input.url : input.toString();
+        if (url.endsWith('/v1/capabilities'))
+          return json({
+            ok: true,
+            data: {
+              backend: 'remote',
+              participation: { version: 2, canWrite: true },
+              binding: { workspaceId: 'workspace', actor },
+            },
+          });
+        requests.push({ url, init });
+        return json({ ok: true, data: {} });
+      },
+    });
+    await service.kudos.acknowledge({
+      kudosId: 'kudos-id',
+      expectedVersion: 3,
+      note: 'Seen',
+      idempotencyKey: 'ack-retry',
+    });
+    await service.kudos.revoke({
+      kudosId: 'kudos-id',
+      expectedVersion: 4,
+      reason: 'Correction',
+      idempotencyKey: 'revoke-retry',
+    });
+    await service.posts.withdrawAcknowledgment({
+      postId: 'post-id',
+      expectedVersion: 7,
+      reason: 'Reconsidered',
+      idempotencyKey: 'withdraw-retry',
+    });
+    expect(requests.map((request) => JSON.parse(request.init?.body as string) as unknown)).toEqual([
+      { expectedVersion: 3, note: 'Seen' },
+      { expectedVersion: 4, reason: 'Correction' },
+      { expectedVersion: 7, reason: 'Reconsidered' },
+    ]);
+    expect(
+      requests.map((request) => new Headers(request.init?.headers).get('idempotency-key')),
+    ).toEqual(['ack-retry', 'revoke-retry', 'withdraw-retry']);
+    expect(requests[2]!.init?.method).toBe('DELETE');
+  });
   it('requires HTTPS except for loopback development', () => {
     expect(
       () =>
@@ -37,9 +83,11 @@ describe('remote Synomem service', () => {
         }),
     ).not.toThrow();
   });
-
   it('binds authorization outside bodies and moves idempotency into its header', async () => {
-    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const requests: Array<{
+      url: string;
+      init?: RequestInit;
+    }> = [];
     const fetchImplementation = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = input instanceof Request ? input.url : input.toString();
       requests.push({ url, init });
@@ -48,6 +96,15 @@ describe('remote Synomem service', () => {
           ok: true,
           data: {
             backend: 'remote',
+            participation: {
+              version: 2,
+              replies: true,
+              reactions: true,
+              personalInbox: true,
+              canWrite: true,
+              administrator: false,
+              managedAgentIds: [],
+            },
             binding: { workspaceId: 'workspace-a', actor },
             administration: {
               agentCreationViaMcp: false,
@@ -79,15 +136,13 @@ describe('remote Synomem service', () => {
       credential: { bearer: async () => 'test-token-not-a-secret' },
       fetch: fetchImplementation,
     });
-
     await service.init();
     await service.kudos.give({
-      recipientAgentId: 'gracie',
+      recipient: { kind: 'agent', id: 'gracie' },
       title: 'Remote boundary',
       reason: 'The server remains authoritative.',
       idempotencyKey: 'retry-1',
     });
-
     expect(requests.map(({ url }) => url)).toEqual([
       'https://api.example.test/v1/capabilities',
       'https://api.example.test/v1/workspaces/workspace-a/kudos',
@@ -113,7 +168,6 @@ describe('remote Synomem service', () => {
     expect(body).not.toHaveProperty('actorId');
     expect(body).not.toHaveProperty('actorKind');
   });
-
   it('fails before a network request when no credential is available', async () => {
     const fetchImplementation = vi.fn();
     const service = new RemoteSynomemService({
@@ -122,13 +176,15 @@ describe('remote Synomem service', () => {
       credential: async () => undefined,
       fetch: fetchImplementation,
     });
-
     await expect(service.init()).rejects.toMatchObject({ code: 'AUTH_REQUIRED' });
     expect(fetchImplementation).not.toHaveBeenCalled();
   });
-
   it('fails closed when the server binds a different workspace or context', async () => {
-    let binding: { workspaceId: string; actor: typeof actor; contextId?: string } = {
+    let binding: {
+      workspaceId: string;
+      actor: typeof actor;
+      contextId?: string;
+    } = {
       workspaceId: 'other-workspace',
       actor,
     };
@@ -142,6 +198,15 @@ describe('remote Synomem service', () => {
           ok: true,
           data: {
             backend: 'remote',
+            participation: {
+              version: 2,
+              replies: true,
+              reactions: true,
+              personalInbox: true,
+              canWrite: true,
+              administrator: false,
+              managedAgentIds: [],
+            },
             binding,
             administration: {
               agentCreationViaMcp: false,
@@ -158,10 +223,8 @@ describe('remote Synomem service', () => {
         }),
     });
     await expect(service.init()).rejects.toMatchObject({ code: 'CONTEXT_FORBIDDEN' });
-
     binding = { workspaceId: 'workspace', actor, contextId: 'ctx_someone_else' };
     await expect(service.init()).rejects.toMatchObject({ code: 'CONTEXT_FORBIDDEN' });
-
     binding = {
       workspaceId: 'workspace',
       actor: { ...actor, id: 'mycroft' },
@@ -170,7 +233,6 @@ describe('remote Synomem service', () => {
     await service.init();
     expect(service.actor.id).toBe('mycroft');
   });
-
   it('keeps context error codes instead of collapsing them into AUTH_* by status', async () => {
     const service = new RemoteSynomemService({
       baseUrl: 'https://api.example.test',
@@ -181,7 +243,6 @@ describe('remote Synomem service', () => {
     });
     await expect(service.init()).rejects.toMatchObject({ code: 'CONTEXT_FORBIDDEN' });
   });
-
   it('rejects a malformed context id before any request', () => {
     expect(
       () =>
@@ -193,7 +254,6 @@ describe('remote Synomem service', () => {
         }),
     ).toThrowError(/contextId/);
   });
-
   it('does not follow redirects and bounds response bytes', async () => {
     let response = new Response('', { status: 307, headers: { location: 'https://evil.test/' } });
     const service = new RemoteSynomemService({
@@ -204,13 +264,11 @@ describe('remote Synomem service', () => {
       fetch: async () => response,
     });
     await expect(service.init()).rejects.toMatchObject({ code: 'REMOTE_PROTOCOL' });
-
     response = json({ ok: true, data: { content: 'x'.repeat(2048) } }, 200, {
       'content-length': '4096',
     });
     await expect(service.init()).rejects.toMatchObject({ code: 'REMOTE_PROTOCOL' });
   });
-
   it('maps authenticated API errors without accepting unknown error codes', async () => {
     let response = json(
       { ok: false, error: { code: 'ANYTHING', message: 'Sign in again.', requestId: 'req-1' } },
@@ -226,11 +284,9 @@ describe('remote Synomem service', () => {
       code: 'AUTH_REQUIRED',
       details: { requestId: 'req-1' },
     });
-
     response = json({ ok: false, error: { code: 'UNKNOWN_SERVER_CODE', message: 'Nope.' } }, 400);
     await expect(service.init()).rejects.toMatchObject({ code: 'REMOTE_PROTOCOL' });
   });
-
   it('reports network failures without echoing sensitive request values', async () => {
     const service = new RemoteSynomemService({
       baseUrl: 'https://api.example.test',
@@ -240,7 +296,6 @@ describe('remote Synomem service', () => {
         throw new Error('request with test-token-not-a-secret failed');
       },
     });
-
     const error = await service.init().catch((value: unknown) => value);
     expect(error).toBeInstanceOf(SynomemError);
     expect(error).toMatchObject({ code: 'REMOTE_UNAVAILABLE', details: { cause: 'Error' } });

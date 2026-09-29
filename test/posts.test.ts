@@ -60,18 +60,28 @@ describe('posts', () => {
     const post = await mycroft.posts.create({ title: 'Read me', body: 'Please acknowledge.' });
     const id = post.record.event.id;
 
-    await atlas.posts.acknowledge({ postId: id, note: 'Already handled in the other workspace.' });
+    await atlas.posts.acknowledge({
+      expectedVersion: (await atlas.posts.get(id)).lifecycleVersion!,
+      postId: id,
+      note: 'Already handled in the other workspace.',
+    });
     const seen = await mycroft.posts.get(id);
     expect(seen.acknowledgments).toHaveLength(1);
     expect(seen.acknowledgments[0]?.actor.id).toBe(atlasId);
     expect(seen.acknowledgments[0]?.note).toContain('Already handled');
 
     // Acknowledging twice is the same statement, not a second one.
-    await atlas.posts.acknowledge({ postId: id });
+    await atlas.posts.acknowledge({
+      expectedVersion: (await atlas.posts.get(id)).lifecycleVersion!,
+      postId: id,
+    });
     expect((await mycroft.posts.get(id)).acknowledgments).toHaveLength(1);
 
     // And it can be taken back.
-    await atlas.posts.withdrawAcknowledgment({ postId: id });
+    await atlas.posts.withdrawAcknowledgment({
+      expectedVersion: (await atlas.posts.get(id)).lifecycleVersion!,
+      postId: id,
+    });
     expect((await mycroft.posts.get(id)).acknowledgments).toHaveLength(0);
 
     await Promise.all([operator.close(), mycroft.close(), atlas.close()]);
@@ -94,7 +104,10 @@ describe('posts', () => {
   it('does not count agents that did not exist when the post was written', async () => {
     const { home, operator, mycroft, atlas, mycroftId, atlasId } = await workspace();
     const post = await mycroft.posts.create({ title: 'Before', body: 'Written first.' });
-    await atlas.posts.acknowledge({ postId: post.record.event.id });
+    await atlas.posts.acknowledge({
+      expectedVersion: (await atlas.posts.get(post.record.event.id)).lifecycleVersion!,
+      postId: post.record.event.id,
+    });
 
     // A newcomer is neither acknowledged nor outstanding: it was not there, and
     // saying otherwise accuses it of ignoring something it never saw.
@@ -164,7 +177,10 @@ describe('post acknowledgement concurrency', () => {
     const id = post.record.event.id;
     expect(post.record.version).toBe(1);
 
-    await atlas.posts.acknowledge({ postId: id });
+    await atlas.posts.acknowledge({
+      expectedVersion: (await atlas.posts.get(id)).lifecycleVersion!,
+      postId: id,
+    });
     // Still version 1: the text has not changed.
     expect((await mycroft.posts.get(id)).version).toBe(1);
 
@@ -187,7 +203,10 @@ describe('post acknowledgement concurrency', () => {
 
     for (const id of ['two', 'three']) {
       const client = await testClient(home, { kind: 'agent', id });
-      await client.posts.acknowledge({ postId: post.record.event.id });
+      await client.posts.acknowledge({
+        expectedVersion: (await client.posts.get(post.record.event.id)).lifecycleVersion!,
+        postId: post.record.event.id,
+      });
       await client.close();
     }
 

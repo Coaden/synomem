@@ -8,12 +8,10 @@ import {
   escapeMarkdown,
   giveKudosSchema,
 } from '../src/index.js';
-
 describe('validation and escaping', () => {
   it.each(['codex', 'gracie-p-tienamme', 'agent-42'])('accepts agent ID %s', (id) => {
     expect(agentIdSchema.parse(id)).toBe(id);
   });
-
   it.each([
     '',
     '..',
@@ -29,7 +27,6 @@ describe('validation and escaping', () => {
   ])('rejects unsafe or reserved agent ID %s', (id) => {
     expect(() => agentIdSchema.parse(id)).toThrow();
   });
-
   it('validates URL and repository-relative file evidence', () => {
     expect(
       evidenceSchema.parse({ kind: 'url', value: 'https://example.com/task/17' }),
@@ -39,17 +36,15 @@ describe('validation and escaping', () => {
     expect(() => evidenceSchema.parse({ kind: 'file', value: '../../secret.env' })).toThrow();
     expect(() => evidenceSchema.parse({ kind: 'file', value: '/etc/passwd' })).toThrow();
   });
-
   it('escapes untrusted Markdown and HTML', () => {
     expect(escapeMarkdown('# <script>*boom*</script>')).toBe(
       '\\# &lt;script&gt;\\*boom\\*&lt;/script&gt;',
     );
     expect(escapeMarkdown('Clear prose. Follow-up work.')).toBe('Clear prose. Follow-up work.');
   });
-
   it('requires single-line titles and applies the published tag grammar', () => {
     const base = {
-      recipientAgentId: 'codex',
+      recipient: { kind: 'agent', id: 'codex' },
       reason: 'Concrete contribution.',
       visibility: 'workspace' as const,
     };
@@ -61,7 +56,6 @@ describe('validation and escaping', () => {
       giveKudosSchema.parse({ ...base, title: 'Valid title', tags: ['review.excellent'] }).tags,
     ).toEqual(['review.excellent']);
   });
-
   it('rejects attempts to share a note', () => {
     expect(() =>
       createNoteSchema.parse({
@@ -72,7 +66,6 @@ describe('validation and escaping', () => {
     ).toThrow();
   });
 });
-
 /*
  * A record written before handles existed.
  *
@@ -99,31 +92,27 @@ describe('records written before handles existed', () => {
     createdAt: '2026-09-06T18:51:12.734Z',
     aggregateId: 'mycroft',
     workspaceId: 'ws-m6w57xvemgk68gxxm7tnbzrwrs',
-    schemaVersion: 1,
+    schemaVersion: 2,
     aggregateVersion: 1,
   };
-
   it('reads a pre-handle agent.created event, taking the ID as the handle', () => {
     const event = eventSchema.parse(storedEvent);
     // Back then the ID was the name people typed, so it is the correct handle
     // rather than a placeholder.
     expect(event).toMatchObject({ type: 'agent.created', agent: { handle: 'mycroft' } });
   });
-
   it('defaults the status of a record written before archiving existed', () => {
     expect(profileSchema.parse(storedEvent.agent)).toMatchObject({
       handle: 'mycroft',
       status: 'active',
     });
   });
-
   it('still refuses a profile with neither an id nor a handle', () => {
     // The fallback must not become a way to write a nameless agent.
     expect(() =>
       profileSchema.parse({ displayName: 'Nameless', createdAt: '2026-09-06T18:51:12.734Z' }),
     ).toThrow();
   });
-
   it('leaves a handle alone when the record has one', () => {
     expect(
       profileSchema.parse({

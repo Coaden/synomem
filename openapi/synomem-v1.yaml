@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Synomem Domain API
-  version: 1.0.0
+  version: 2.0.0
   description: >-
     Authenticated domain operations for Synomem. The server derives workspace access and actor
     authority from the bearer credential; mutation bodies never select an actor.
@@ -18,6 +18,9 @@ tags:
   - name: tasks
   - name: items
   - name: administration
+  - name: actors
+  - name: participation
+  - name: search
 paths:
   /v1/capabilities:
     get:
@@ -436,6 +439,152 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/Success' }
         default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/actor-directory:
+    get:
+      tags: [actors]
+      operationId: searchActors
+      description: Searches active human and agent handles, names and IDs with actor-bound signed cursor pages (default 20, maximum 50).
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { name: query, in: query, schema: { type: string, maxLength: 100 } }
+        - { name: kind, in: query, schema: { type: string, enum: [human, agent] } }
+        - { name: cursor, in: query, schema: { type: string, maxLength: 4096 } }
+        - { $ref: '#/components/parameters/ListLimit' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/actor-directory/{kind}/{id}:
+    get:
+      tags: [actors]
+      operationId: getActor
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { name: kind, in: path, required: true, schema: { type: string, enum: [human, agent] } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/actor-directory/{kind}/{id}/profile:
+    get:
+      tags: [actors]
+      operationId: getActorProfile
+      description: Returns current-visibility authored items and separate kudos/useful counts.
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { name: kind, in: path, required: true, schema: { type: string, enum: [human, agent] } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/After' }
+        - { $ref: '#/components/parameters/ListLimit' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/items/{itemId}/replies:
+    post:
+      tags: [participation]
+      operationId: createReply
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { $ref: '#/components/parameters/ItemId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CreateReply' } } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '429': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/items/{itemId}/thread:
+    get:
+      tags: [participation]
+      operationId: getThread
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { $ref: '#/components/parameters/ItemId' }
+        - { $ref: '#/components/parameters/After' }
+        - { $ref: '#/components/parameters/ListLimit' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/replies/{itemId}:
+    get:
+      tags: [participation]
+      operationId: getReply
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [participation]
+      operationId: deleteReply
+      parameters: [{ $ref: '#/components/parameters/IdempotencyKey' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/DeleteReply' } } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/reactions/{itemId}/{code}:
+    put:
+      tags: [participation]
+      operationId: setReaction
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '429': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [participation]
+      operationId: removeReaction
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '429': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/inbox:
+    get:
+      tags: [participation]
+      operationId: listOwnNotifications
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { $ref: '#/components/parameters/After' }
+        - { $ref: '#/components/parameters/ListLimit' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/search:
+    get:
+      tags: [search]
+      operationId: searchAuthorizedRecords
+      description: Hosted current-text search. The local adapter explicitly returns UNSUPPORTED_BACKEND.
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - {
+            name: q,
+            in: query,
+            required: true,
+            schema: { type: string, minLength: 2, maxLength: 200 },
+          }
+        - { $ref: '#/components/parameters/After' }
+        - { $ref: '#/components/parameters/ListLimit' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/bookmarks:
+    get:
+      tags: [participation]
+      operationId: listOwnBookmarks
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/workspaces/{workspaceId}/administration/raw-export:
+    get:
+      tags: [administration]
+      operationId: rawCanonicalRecoveryExport
+      description: Requires live human administrator plus export and workspace-administration scopes; includes deleted reply bodies and is audited.
+      parameters:
+        - { $ref: '#/components/parameters/WorkspaceId' }
+        - { name: format, in: query, schema: { type: string, enum: [json, jsonl] } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '403': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
 components:
   securitySchemes:
     bearerAuth:
@@ -541,7 +690,7 @@ components:
             message: { type: string }
             details: { type: object }
             requestId: { type: string }
-    Visibility: { type: string, enum: [private, workspace, public] }
+    Visibility: { type: string, enum: [private, workspace] }
     Tags:
       type: array
       maxItems: 50
@@ -564,12 +713,38 @@ components:
         aliases: { type: array, items: { type: string } }
         description: { type: string }
         metadata: { type: object }
+    ActorRef:
+      type: object
+      additionalProperties: false
+      required: [kind, id]
+      properties:
+        kind: { type: string, enum: [human, agent] }
+        id: { type: string, minLength: 1, maxLength: 100 }
+    MentionRefs:
+      type: array
+      maxItems: 20
+      items: { $ref: '#/components/schemas/ActorRef' }
+    CreateReply:
+      type: object
+      additionalProperties: false
+      required: [body]
+      properties:
+        parentId: { type: [string, 'null'] }
+        body: { type: string, minLength: 1, maxLength: 16000 }
+        mentions: { $ref: '#/components/schemas/MentionRefs' }
+    DeleteReply:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion]
+      properties:
+        expectedVersion: { type: integer, minimum: 1 }
+        reason: { type: string, maxLength: 2000 }
     GiveKudos:
       type: object
       additionalProperties: false
-      required: [recipientAgentId, title, reason]
+      required: [recipient, title, reason]
       properties:
-        recipientAgentId: { type: string }
+        recipient: { $ref: '#/components/schemas/ActorRef' }
         title: { type: string }
         reason: { type: string }
         evidence: { type: array, items: { type: object } }
@@ -584,16 +759,16 @@ components:
     RevokeKudos:
       type: object
       additionalProperties: false
-      required: [reason]
+      required: [reason, expectedVersion]
       properties:
         reason: { type: string }
-        administrative: { type: boolean }
+        expectedVersion: { type: integer, minimum: 1 }
     SendMemo:
       type: object
       additionalProperties: false
-      required: [recipientAgentId, subject, body]
+      required: [recipient, subject, body]
       properties:
-        recipientAgentId: { type: string }
+        recipient: { $ref: '#/components/schemas/ActorRef' }
         subject: { type: string }
         body: { type: string }
         tags: { $ref: '#/components/schemas/Tags' }
@@ -605,7 +780,7 @@ components:
       additionalProperties: false
       required: [title, body]
       properties:
-        ownerAgentId: { type: string }
+        owner: { $ref: '#/components/schemas/ActorRef' }
         title: { type: string }
         body: { type: string }
         tags: { $ref: '#/components/schemas/Tags' }
@@ -642,7 +817,7 @@ components:
       additionalProperties: false
       required: [title]
       properties:
-        assigneeAgentId: { type: string }
+        assignee: { $ref: '#/components/schemas/ActorRef' }
         title: { type: string }
         description: { type: string }
         priority: { type: integer, minimum: 1, maximum: 4 }
@@ -669,6 +844,8 @@ components:
     TaskTransition:
       type: object
       additionalProperties: false
+      required: [expectedVersion]
       properties:
+        expectedVersion: { type: integer, minimum: 1 }
         reason: { type: string }
         note: { type: string }

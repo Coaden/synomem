@@ -1,3 +1,33 @@
+import { actorDirectoryInput } from './actor-directory.js';
+import type { ActorDirectoryInput, ActorProfileInput } from './actor-directory.js';
+import type { BookmarkInput } from './bookmarks.js';
+import type { SearchInput, SearchPage } from './search.js';
+import { z } from 'zod';
+import type { NotificationInput } from './notifications.js';
+import type {
+  ReplyCreateInput,
+  ReplyDeleteInput,
+  ReplyRecord,
+  ReactionSetInput,
+  ThreadInput,
+} from './participation.js';
+import {
+  threadInputSchema,
+  threadSubscriptionSchema,
+  replyCreateSchema,
+  replyDeleteSchema,
+  reactionSetSchema,
+} from './schemas.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { cursorFilter } from './cursors.js';
+import {
+  isRecordAdministrator,
+  localOwnerAuthority,
+  overseesAgent,
+  resolveAuthority,
+  sameActor,
+} from './policy.js';
+import type { ActorRef, AddressableActor, RecordAuthority } from './policy.js';
 import { accessSync, constants as fsConstants, existsSync, lstatSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { ulid } from 'ulid';
@@ -16,6 +46,8 @@ import {
 } from './projections.js';
 import {
   actorSchema,
+  eventSchema,
+  overrideTaskDecisionSchema,
   agentLookupSchema,
   bindRuntimeSchema,
   createAgentSchema,
@@ -79,6 +111,7 @@ import type {
   UpdateTaskInput,
   UpdateTodoInput,
   TaskRecord,
+  OverrideTaskDecisionInput,
   TodoRecord,
   ItemListInput,
   ItemRecord,
@@ -103,7 +136,6 @@ import type {
   Page,
   UpdateAgentInput,
 } from './types.js';
-
 export interface SynomemCoreOptions {
   repository: SynomemRepository;
   projectionWriter: ProjectionWriter;
@@ -111,10 +143,10 @@ export interface SynomemCoreOptions {
   clock?: () => Date;
   idGenerator?: () => string;
   signal?: AbortSignal;
-  /** Explicit administrator authority. Defaults to true only for local-style human actors. */
-  administrative?: boolean;
+  /** Authority from the trusted adapter; defaults to no administration. */
+  authority?: RecordAuthority;
+  canWrite?: boolean;
 }
-
 export class SynomemCore implements SynomemDomainService {
   /**
    * Mutable because an agent actor is resolved to its canonical identity on
@@ -126,9 +158,319 @@ export class SynomemCore implements SynomemDomainService {
   private readonly clock: () => Date;
   private readonly idGenerator: () => string;
   private readonly signal?: AbortSignal;
-  private readonly administrative: boolean;
+  protected administrative: boolean;
+  private writeAllowed: boolean;
+  private readonly mutationContext = new AsyncLocalStorage<{
+    key?: string;
+    projections: Set<string>;
+  }>();
+  protected authority: RecordAuthority;
   private initialized = false;
-
+  readonly bookmarks = {
+    list: (input: BookmarkInput = {}) => {
+      const parsed = this.validate(() =>
+        z
+          .object({
+            after: z.string().max(4096).optional(),
+            limit: z.number().int().min(1).max(100).optional(),
+          })
+          .strict()
+          .parse(input),
+      );
+      return this.repository.bookmarks.list(parsed, this.actor);
+    },
+    has: async (rootId: string) => {
+      await this.getItem(rootId);
+      return { saved: await this.repository.bookmarks.has(rootId, this.boundRef()) };
+    },
+    set: async (input: { rootId: string; present: boolean }) => {
+      const parsed = this.validate(() =>
+        z
+          .object({ rootId: z.string().length(26), present: z.boolean() })
+          .strict()
+          .parse(input),
+      );
+      if (!this.writeAllowed)
+        throw new SynomemError('READ_ONLY', 'This binding cannot change saved records.');
+      await this.repository.transaction(async () => {
+        await this.resolveActor(this.boundRef(), true);
+        await this.getItem(parsed.rootId);
+        await this.repository.bookmarks.set(parsed.rootId, this.boundRef(), parsed.present);
+      });
+      return { saved: parsed.present };
+    },
+  };
+  readonly notifications = {
+    list: async (input: NotificationInput = {}) => {
+      const parsed = this.validate(() =>
+        z
+          .object({
+            after: z.string().max(4096).optional(),
+            limit: z.number().int().min(1).max(100).optional(),
+            view: z.enum(['all', 'unread', 'action_required', 'default']).optional(),
+          })
+          .strict()
+          .parse(input),
+      );
+      if (this.writeAllowed)
+        await this.repository.transaction(() => this.repository.notifications.drain());
+      const page = await this.repository.notifications.list(parsed, this.actor);
+      return page;
+    },
+    read: (id: string) =>
+      this.personalWrite(() => this.repository.notifications.read(id, this.boundRef())),
+    dismiss: (id: string) =>
+      this.personalWrite(() => this.repository.notifications.dismiss(id, this.boundRef())),
+    readThrough: (through: string) =>
+      this.personalWrite(() => this.repository.notifications.readThrough(through, this.boundRef())),
+  };
+  readonly replies = {
+    changes: async (input: ThreadInput) => {
+      const parsed = this.validate(() => threadInputSchema.parse(input));
+      await this.getItem(parsed.rootId);
+      return this.repository.participation.changes(parsed, this.actor);
+    },
+    create: (input: ReplyCreateInput) =>
+      this.mutate('replies.create', input, () => this.createReply(input)),
+    get: (id: string) => this.getReply(id),
+    delete: (input: ReplyDeleteInput) =>
+      this.mutate('replies.delete', input, () => this.deleteReply(input)),
+  };
+  readonly threads = {
+    read: async (input: { rootId: string; through: string }) => {
+      const parsed = this.validate(() =>
+        z
+          .object({ rootId: z.string().length(26), through: z.string().max(4096) })
+          .strict()
+          .parse(input),
+      );
+      await this.personalWrite(async () => {
+        await this.getItem(parsed.rootId);
+        await this.repository.participation.read(parsed.rootId, parsed.through, this.boundRef());
+      });
+    },
+    get: async (input: ThreadInput) => {
+      const parsed = this.validate(() => threadInputSchema.parse(input));
+      await this.getItem(parsed.rootId);
+      return this.repository.participation.thread(parsed, this.actor);
+    },
+    subscription: async (input: { rootId: string; following: boolean; muted: boolean }) => {
+      const parsed = this.validate(() => threadSubscriptionSchema.parse(input));
+      await this.personalWrite(async () => {
+        await this.getItem(parsed.rootId);
+        await this.repository.participation.subscription(
+          parsed.rootId,
+          this.boundRef(),
+          parsed.following,
+          parsed.muted,
+        );
+      });
+    },
+  };
+  readonly reactions = {
+    set: (input: ReactionSetInput) =>
+      this.mutate('reactions.set', input, () => this.setReaction(input)),
+    get: async (targetId: string) => {
+      await this.reactionRoot(targetId);
+      return this.repository.participation.reactions(targetId, this.boundRef());
+    },
+  };
+  private allowedActions(record: ItemRecord): Record<string, boolean> {
+    const event = record.event;
+    const active =
+      record.status !== 'archived' &&
+      (!('revocationStatus' in record) || record.revocationStatus !== 'revoked');
+    const owner = 'owner' in event ? event.owner : event.actor;
+    const participant =
+      'assignee' in event &&
+      (this.canManage(event.assignee) || this.canManage(event.actor as ActorRef));
+    const managed =
+      event.type === 'memo.sent'
+        ? this.canManage(event.recipient)
+        : event.type === 'task.created'
+          ? participant
+          : this.canManage(owner as ActorRef);
+    const flags: Record<string, boolean> = {
+      reply: active,
+      edit:
+        active &&
+        managed &&
+        ['post.created', 'note.created', 'task.created', 'todo.created'].includes(event.type),
+      archive: active && managed && !['task.created', 'kudos.given'].includes(event.type),
+      moderateReplies: this.canModerateRoot(record),
+      acknowledge:
+        event.type === 'kudos.given'
+          ? active && sameActor(this.actor, event.recipient) && record.status === 'unacknowledged'
+          : event.type === 'post.created'
+            ? active &&
+              'acknowledgments' in record &&
+              !record.acknowledgments.some((entry) => sameActor(this.actor, entry.actor))
+            : false,
+      withdrawAcknowledgment:
+        event.type === 'post.created' &&
+        active &&
+        'acknowledgments' in record &&
+        record.acknowledgments.some((entry) => sameActor(this.actor, entry.actor)),
+      readMemo:
+        event.type === 'memo.sent' &&
+        active &&
+        sameActor(this.actor, event.recipient) &&
+        record.status === 'unread',
+      revoke: event.type === 'kudos.given' && active && this.canManage(event.actor as ActorRef),
+    };
+    if (event.type === 'task.created')
+      Object.assign(flags, {
+        accept: record.status === 'assigned' && this.canManage(event.assignee),
+        reject: record.status === 'assigned' && this.canManage(event.assignee),
+        complete: record.status === 'open' && participant,
+        reopen: ['completed', 'canceled'].includes(record.status) && participant,
+        cancel: ['assigned', 'open'].includes(record.status) && participant,
+        overrideDecision:
+          ['open', 'rejected'].includes(record.status) &&
+          this.actor.kind === 'human' &&
+          (this.administrative ||
+            (event.assignee.kind === 'agent' &&
+              overseesAgent(this.actor, this.authority, event.assignee.id)) ||
+            (event.actor.kind === 'agent' &&
+              overseesAgent(this.actor, this.authority, event.actor.id))),
+      });
+    if (event.type === 'todo.created')
+      Object.assign(flags, {
+        complete: record.status === 'open' && managed,
+        reopen: ['completed', 'canceled'].includes(record.status) && managed,
+        cancel: record.status === 'open' && managed,
+      });
+    return Object.fromEntries(
+      Object.entries(flags).map(([name, allowed]) => [name, this.writeAllowed && allowed]),
+    );
+  }
+  private async decorateRecord<T extends ItemRecord>(record: T): Promise<T> {
+    return {
+      ...record,
+      lifecycleVersion: (await this.repository.nextAggregateVersion(record.event.id)) - 1,
+      allowedActions: this.allowedActions(record),
+    };
+  }
+  private async getReply(id: string): Promise<ReplyRecord> {
+    const reply = await this.repository.participation.getReply(id);
+    if (!reply) throw new SynomemError('ITEM_NOT_FOUND', 'Unknown reply.');
+    await this.getItem(reply.rootId);
+    return reply;
+  }
+  private async createReply(input: ReplyCreateInput): Promise<ReplyRecord> {
+    await this.repository.assertEventCompatibility();
+    const parsed = this.validate(() => replyCreateSchema.parse(input));
+    const root = await this.getItem(parsed.rootId);
+    if (
+      root.status === 'archived' ||
+      ('revocationStatus' in root && root.revocationStatus === 'revoked')
+    )
+      throw new SynomemError('MUTATION_FORBIDDEN', 'This root no longer accepts replies.');
+    if (parsed.parentId) {
+      const parent = await this.getReply(parsed.parentId);
+      if (parent.rootId !== parsed.rootId)
+        throw new SynomemError('INVALID_INPUT', 'The parent must belong to this thread.');
+    }
+    const mentions: ActorRef[] = [];
+    for (const supplied of parsed.mentions ?? []) {
+      const target = await this.resolveActor(supplied, true);
+      const ref = { kind: target.kind, id: target.id };
+      if (!(await this.repository.canActorReadItem(parsed.rootId, ref)))
+        throw new SynomemError('INVALID_INPUT', 'Mention targets must already have access.');
+      if (!mentions.some((actor) => sameActor(actor, ref))) mentions.push(ref);
+    }
+    await this.repository.participation.reserveBudget('reply', this.boundRef(), this.now());
+    const id = this.nextId();
+    await this.repository.insertEvent({
+      ...this.eventBase(id, 1, id),
+      type: 'reply.created',
+      rootId: parsed.rootId,
+      parentId: parsed.parentId ?? null,
+      body: parsed.body,
+      mentions,
+    });
+    return this.getReply(id);
+  }
+  private canModerateRoot(root: ItemRecord): boolean {
+    if (this.actor.kind !== 'human') return false;
+    const event = root.event;
+    if (this.administrative || sameActor(event.actor, this.actor)) return true;
+    const targets = [
+      event.actor,
+      ...('recipient' in event ? [event.recipient] : []),
+      ...('owner' in event ? [event.owner] : []),
+      ...('assignee' in event ? [event.assignee] : []),
+    ];
+    return targets.some(
+      (ref) => ref.kind === 'agent' && overseesAgent(this.actor, this.authority, ref.id),
+    );
+  }
+  private async deleteReply(input: ReplyDeleteInput): Promise<ReplyRecord> {
+    await this.repository.assertEventCompatibility();
+    const parsed = this.validate(() => replyDeleteSchema.parse(input));
+    const reply = await this.getReply(parsed.replyId);
+    const root = await this.getItem(reply.rootId);
+    const own = sameActor(reply.author, this.actor);
+    if (!own && !this.canModerateRoot(root))
+      throw new SynomemError(
+        'MUTATION_FORBIDDEN',
+        'Only the reply author or an authorized human moderator may delete it.',
+      );
+    if (!own && !parsed.reason)
+      throw new SynomemError('INVALID_INPUT', 'Moderation requires a reason.');
+    if (reply.version !== parsed.expectedVersion)
+      throw new SynomemError('REVISION_CONFLICT', 'The reply changed. Refresh before deleting.');
+    if (reply.deleted) return reply;
+    await this.repository.insertEvent({
+      ...this.eventBase(reply.id, reply.version + 1),
+      ...(!own ? this.intervention(reply.author as ActorRef, parsed.reason) : {}),
+      type: 'reply.deleted',
+      replyId: reply.id,
+      rootId: reply.rootId,
+      ...(parsed.reason ? { reason: parsed.reason } : {}),
+    });
+    return this.getReply(reply.id);
+  }
+  private async reactionRoot(targetId: string): Promise<string> {
+    const reply = await this.repository.participation.getReply(targetId);
+    if (reply) {
+      await this.getItem(reply.rootId);
+      if (reply.deleted)
+        throw new SynomemError('MUTATION_FORBIDDEN', 'Deleted replies cannot receive reactions.');
+      return reply.rootId;
+    }
+    await this.getItem(targetId);
+    return targetId;
+  }
+  private async setReaction(input: ReactionSetInput) {
+    await this.repository.assertEventCompatibility();
+    const parsed = this.validate(() => reactionSetSchema.parse(input));
+    const rootId = await this.reactionRoot(parsed.targetId);
+    const actor = this.boundRef();
+    const present = await this.repository.participation.hasReaction(
+      parsed.targetId,
+      actor,
+      parsed.code,
+    );
+    if (present !== parsed.present) {
+      await this.repository.participation.reserveBudget('reaction', actor, this.now());
+      const id = this.nextId();
+      await this.repository.insertEvent({
+        ...this.eventBase(id, 1, id),
+        type: parsed.present ? 'reaction.added' : 'reaction.removed',
+        rootId,
+        targetId: parsed.targetId,
+        code: parsed.code,
+      });
+    }
+    return this.repository.participation.reactions(parsed.targetId, actor);
+  }
+  async search(input: SearchInput): Promise<SearchPage> {
+    this.checkAbort();
+    if (!this.repository.search)
+      throw new SynomemError('UNSUPPORTED_BACKEND', 'Search is available on hosted workspaces.');
+    return this.repository.search(input, this.actor);
+  }
   readonly agents = {
     create: (input: CreateAgentInput) => this.createAgent(input),
     update: (id: string, changes: UpdateAgentInput) => this.updateAgent(id, changes),
@@ -145,7 +487,6 @@ export class SynomemCore implements SynomemDomainService {
     bindRuntime: (input: BindRuntimeInput) => this.bindRuntime(input),
     unbindRuntime: (bindingId: string) => this.unbindRuntime(bindingId),
   };
-
   readonly topics = {
     create: (input: CreateTopicInput) => this.createTopic(input),
     update: (idOrAlias: string, changes: UpdateTopicInput) =>
@@ -156,91 +497,147 @@ export class SynomemCore implements SynomemDomainService {
     archive: (idOrAlias: string) => this.setTopicStatus(idOrAlias, 'archived'),
     restore: (idOrAlias: string) => this.setTopicStatus(idOrAlias, 'active'),
   };
-
   readonly kudos = {
-    give: (input: GiveKudosInput) => this.giveKudos(input),
+    give: (input: GiveKudosInput) => this.mutate('kudos.give', input, () => this.giveKudos(input)),
     list: (input: KudosListInput = {}) => this.listKudos(input),
     changes: (input: KudosChangesInput = {}) => this.listKudosChanges(input),
     get: (id: string) => this.getKudos(id),
-    acknowledge: (input: { kudosId: string; note?: string }) => this.acknowledgeKudos(input),
-    revoke: (input: { kudosId: string; reason: string; administrative?: boolean }) =>
-      this.revokeKudos(input),
+    acknowledge: (input: {
+      expectedVersion: number;
+      kudosId: string;
+      note?: string;
+      idempotencyKey?: string;
+    }) => this.mutate('kudos.acknowledge', input, () => this.acknowledgeKudos(input)),
+    revoke: (input: {
+      expectedVersion: number;
+      kudosId: string;
+      reason: string;
+      administrative?: boolean;
+      idempotencyKey?: string;
+    }) => this.mutate('kudos.revoke', input, () => this.revokeKudos(input)),
   };
-
   readonly memos = {
-    send: (input: SendMemoInput) => this.sendMemo(input),
+    send: (input: SendMemoInput) => this.mutate('memos.send', input, () => this.sendMemo(input)),
     list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
       this.listItems({ ...input, kinds: ['memo'] }),
     get: (id: string) => this.getMemo(id),
-    read: (input: { memoId: string; idempotencyKey?: string }) => this.readMemo(input),
-    archive: (input: { memoId: string; idempotencyKey?: string }) => this.archiveMemo(input),
+    read: (input: { expectedVersion: number; memoId: string; idempotencyKey?: string }) =>
+      this.mutate('memos.read', input, () => this.readMemo(input)),
+    archive: (input: { expectedVersion: number; memoId: string; idempotencyKey?: string }) =>
+      this.mutate('memos.archive', input, () => this.archiveMemo(input)),
   };
-
   readonly posts = {
-    create: (input: CreatePostInput) => this.createPost(input),
+    create: (input: CreatePostInput) =>
+      this.mutate('posts.create', input, () => this.createPost(input)),
     list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
       this.listItems({ ...input, kinds: ['post'] }),
     get: (id: string) => this.getPost(id),
-    update: (input: UpdatePostInput) => this.updatePost(input),
-    archive: (input: { postId: string; reason?: string; idempotencyKey?: string }) =>
-      this.archivePost(input),
+    update: (input: UpdatePostInput) =>
+      this.mutate('posts.update', input, () => this.updatePost(input)),
+    archive: (input: {
+      expectedVersion: number;
+      postId: string;
+      reason?: string;
+      idempotencyKey?: string;
+    }) => this.mutate('posts.archive', input, () => this.archivePost(input)),
     /*
      * Acknowledging is an explicit call and always speaks for the caller alone.
      * There is no bulk form and no acknowledge-on-behalf-of: an acknowledgement
      * is one actor saying "I have seen this", and reading a post must never
      * append one, or the roster stops meaning anything.
      */
-    acknowledge: (input: { postId: string; note?: string; idempotencyKey?: string }) =>
-      this.acknowledgePost(input),
-    withdrawAcknowledgment: (input: { postId: string; reason?: string }) =>
-      this.withdrawPostAcknowledgment(input),
+    acknowledge: (input: {
+      expectedVersion: number;
+      postId: string;
+      note?: string;
+      idempotencyKey?: string;
+    }) => this.mutate('posts.acknowledge', input, () => this.acknowledgePost(input)),
+    withdrawAcknowledgment: (input: {
+      expectedVersion: number;
+      postId: string;
+      reason?: string;
+      idempotencyKey?: string;
+    }) =>
+      this.mutate('posts.withdrawAcknowledgment', input, () =>
+        this.withdrawPostAcknowledgment(input),
+      ),
     roster: (postId: string) => this.postRoster(postId),
   };
-
   readonly notes = {
-    create: (input: CreateNoteInput) => this.createNote(input),
+    create: (input: CreateNoteInput) =>
+      this.mutate('notes.create', input, () => this.createNote(input)),
     list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
       this.listItems({ ...input, kinds: ['note'] }),
     get: (id: string) => this.getNote(id),
-    revise: (input: ReviseNoteInput) => this.reviseNote(input),
-    archive: (input: { noteId: string; idempotencyKey?: string }) => this.archiveNote(input),
+    revise: (input: ReviseNoteInput) =>
+      this.mutate('notes.revise', input, () => this.reviseNote(input)),
+    archive: (input: { expectedVersion: number; noteId: string; idempotencyKey?: string }) =>
+      this.mutate('notes.archive', input, () => this.archiveNote(input)),
   };
-
   readonly tasks = {
-    create: (input: CreateTaskInput) => this.createTask(input),
+    overrideDecision: (input: OverrideTaskDecisionInput) =>
+      this.mutate('tasks.overrideDecision', input, () => this.overrideTaskDecision(input)),
+    create: (input: CreateTaskInput) =>
+      this.mutate('tasks.create', input, () => this.createTask(input)),
     list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
       this.listItems({ ...input, kinds: ['task'] }),
     get: (id: string) => this.getTask(id),
-    update: (input: UpdateTaskInput) => this.updateTask(input),
+    update: (input: UpdateTaskInput) =>
+      this.mutate('tasks.update', input, () => this.updateTask(input)),
     // A response is optional when accepting and required when rejecting: a
     // refusal without a reason leaves the assigner unable to act on it.
-    accept: (input: { taskId: string; response?: string; idempotencyKey?: string }) =>
-      this.acceptTask(input),
-    reject: (input: { taskId: string; response: string; idempotencyKey?: string }) =>
-      this.rejectTask(input),
-    complete: (input: { taskId: string; note?: string; idempotencyKey?: string }) =>
-      this.completeTask(input),
-    reopen: (input: { taskId: string; idempotencyKey?: string }) => this.reopenTask(input),
-    cancel: (input: { taskId: string; reason?: string; idempotencyKey?: string }) =>
-      this.cancelTask(input),
+    accept: (input: {
+      expectedVersion: number;
+      taskId: string;
+      response?: string;
+      idempotencyKey?: string;
+    }) => this.mutate('tasks.accept', input, () => this.acceptTask(input)),
+    reject: (input: {
+      expectedVersion: number;
+      taskId: string;
+      response: string;
+      idempotencyKey?: string;
+    }) => this.mutate('tasks.reject', input, () => this.rejectTask(input)),
+    complete: (input: {
+      expectedVersion: number;
+      taskId: string;
+      note?: string;
+      idempotencyKey?: string;
+    }) => this.mutate('tasks.complete', input, () => this.completeTask(input)),
+    reopen: (input: { expectedVersion: number; taskId: string; idempotencyKey?: string }) =>
+      this.mutate('tasks.reopen', input, () => this.reopenTask(input)),
+    cancel: (input: {
+      expectedVersion: number;
+      taskId: string;
+      reason?: string;
+      idempotencyKey?: string;
+    }) => this.mutate('tasks.cancel', input, () => this.cancelTask(input)),
   };
-
   readonly todos = {
-    create: (input: CreateTodoInput) => this.createTodo(input),
+    create: (input: CreateTodoInput) =>
+      this.mutate('todos.create', input, () => this.createTodo(input)),
     list: (input: Omit<ItemListInput, 'kinds'> = {}) =>
       this.listItems({ ...input, kinds: ['todo'] }),
     get: (id: string) => this.getTodo(id),
-    update: (input: UpdateTodoInput) => this.updateTodo(input),
-    complete: (input: { todoId: string; note?: string; idempotencyKey?: string }) =>
-      this.todoTransition(input, 'todo.completed'),
-    reopen: (input: { todoId: string; idempotencyKey?: string }) =>
-      this.todoTransition(input, 'todo.reopened'),
-    cancel: (input: { todoId: string; reason?: string; idempotencyKey?: string }) =>
-      this.todoTransition(input, 'todo.canceled'),
-    archive: (input: { todoId: string; idempotencyKey?: string }) =>
-      this.todoTransition(input, 'todo.archived'),
+    update: (input: UpdateTodoInput) =>
+      this.mutate('todos.update', input, () => this.updateTodo(input)),
+    complete: (input: {
+      expectedVersion: number;
+      todoId: string;
+      note?: string;
+      idempotencyKey?: string;
+    }) => this.mutate('todos.complete', input, () => this.todoTransition(input, 'todo.completed')),
+    reopen: (input: { expectedVersion: number; todoId: string; idempotencyKey?: string }) =>
+      this.mutate('todos.reopen', input, () => this.todoTransition(input, 'todo.reopened')),
+    cancel: (input: {
+      expectedVersion: number;
+      todoId: string;
+      reason?: string;
+      idempotencyKey?: string;
+    }) => this.mutate('todos.cancel', input, () => this.todoTransition(input, 'todo.canceled')),
+    archive: (input: { expectedVersion: number; todoId: string; idempotencyKey?: string }) =>
+      this.mutate('todos.archive', input, () => this.todoTransition(input, 'todo.archived')),
   };
-
   /**
    * Unanswered and overdue discovery.
    *
@@ -255,13 +652,15 @@ export class SynomemCore implements SynomemDomainService {
      * optionally only those older than a given age or instant.
      */
     unanswered: (
-      input: Omit<ItemListInput, 'awaitingResponse' | 'pending'> & { olderThanHours?: number } = {},
+      input: Omit<ItemListInput, 'awaitingResponse' | 'pending'> & {
+        olderThanHours?: number;
+      } = {},
     ) => {
       const { olderThanHours, awaitingSince, ...rest } = input;
       const since =
         awaitingSince ??
         (olderThanHours !== undefined
-          ? new Date(Date.now() - olderThanHours * 3_600_000).toISOString()
+          ? new Date(Date.now() - olderThanHours * 3600000).toISOString()
           : undefined);
       return this.listItems({
         ...rest,
@@ -270,18 +669,20 @@ export class SynomemCore implements SynomemDomainService {
       });
     },
     /** Open work whose deadline has passed. Defaults to "now". */
-    overdue: (input: Omit<ItemListInput, 'overdueAsOf'> & { asOf?: string } = {}) => {
+    overdue: (
+      input: Omit<ItemListInput, 'overdueAsOf'> & {
+        asOf?: string;
+      } = {},
+    ) => {
       const { asOf, ...rest } = input;
       return this.listItems({ ...rest, overdueAsOf: asOf ?? new Date().toISOString() });
     },
   };
-
   readonly items = {
     list: (input: ItemListInput = {}) => this.listItems(input),
     get: (id: string) => this.getItem(id),
     changes: (input: ChangesInput = {}) => this.listItemChanges(input),
   };
-
   constructor(options: SynomemCoreOptions) {
     try {
       this.actor = actorSchema.parse(options.actor ?? { kind: 'system', id: 'workspace' });
@@ -291,17 +692,39 @@ export class SynomemCore implements SynomemDomainService {
     this.clock = options.clock ?? (() => new Date());
     this.idGenerator = options.idGenerator ?? (() => ulid(this.clock().getTime()));
     this.signal = options.signal;
-    this.administrative = options.administrative ?? this.actor.kind === 'human';
+    this.authority = resolveAuthority(options.authority);
+    this.writeAllowed = options.canWrite ?? true;
+    this.administrative = isRecordAdministrator(this.actor, this.authority);
     this.repository = options.repository;
     this.projectionWriter = options.projectionWriter;
   }
-
+  /** Trusted adapters refresh live authority after acquiring the workspace write boundary. Never exposed as a tool/input. */
+  setAuthority(authority: RecordAuthority, canWrite = this.writeAllowed): void {
+    this.writeAllowed = canWrite;
+    this.authority = resolveAuthority(authority);
+    this.administrative = isRecordAdministrator(this.actor, this.authority);
+    this.repository.setAuthority(this.authority);
+  }
   async init(): Promise<void> {
     this.checkAbort();
     if (this.initialized) return;
     await this.repository.init();
     this.initialized = true;
-
+    if (
+      this.actor.kind === 'human' &&
+      this.authority.mode === 'local-owner' &&
+      !(await this.repository.getActor({ kind: 'human', id: this.actor.id }))
+    ) {
+      await this.repository.transaction(() =>
+        this.repository.registerHuman({
+          kind: 'human',
+          id: this.actor.id,
+          handle: this.actor.id,
+          displayName: this.actor.displayName ?? this.actor.id,
+          status: 'active',
+        }),
+      );
+    }
     /*
      * An agent actor is resolved to its canonical identity here.
      *
@@ -326,23 +749,393 @@ export class SynomemCore implements SynomemDomainService {
       }
     }
   }
-
   async close(): Promise<void> {
     await this.repository.close();
     this.initialized = false;
   }
-
+  readonly actors = {
+    profile: async (input: ActorProfileInput) => {
+      const actor = await this.resolveActor(input.target);
+      return {
+        actor,
+        counts: await this.repository.actorCounts(actor, this.actor),
+        authored: await this.listItems({
+          actorKind: actor.kind,
+          actorId: actor.id,
+          cursor: input.after,
+          limit: input.limit,
+        }),
+      };
+    },
+    list: async (input: ActorDirectoryInput = {}) => {
+      this.checkAbort();
+      return await this.repository.listActors(actorDirectoryInput(input), this.actor);
+    },
+    get: (ref: ActorRef) => this.resolveActor(ref),
+    registerHuman: async (input: { id: string; handle: string; displayName: string }) => {
+      if (this.actor.kind !== 'human' || this.authority.mode !== 'local-owner')
+        throw new SynomemError('MUTATION_FORBIDDEN', 'Only the local owner may register a human.');
+      const ref = actorSchema.parse({
+        kind: 'human',
+        id: input.id,
+        displayName: input.displayName,
+      });
+      const handle = agentLookupSchema.parse(input.handle);
+      await this.repository.registerHuman({
+        kind: 'human',
+        id: ref.id,
+        handle,
+        displayName: input.displayName,
+        status: 'active',
+      });
+      return this.resolveActor({ kind: 'human', id: ref.id });
+    },
+  };
+  private async resolveActor(ref?: ActorRef, requireActive = false): Promise<AddressableActor> {
+    if (!ref || (ref.kind !== 'human' && ref.kind !== 'agent'))
+      throw new SynomemError('INVALID_INPUT', 'An actor reference is required.');
+    const actor = await this.repository.getActor(ref);
+    if (!actor) throw new SynomemError('AGENT_NOT_FOUND', `Unknown ${ref.kind}: ${ref.id}`);
+    if (requireActive && actor.status !== 'active')
+      throw new SynomemError('MUTATION_FORBIDDEN', 'Inactive actors cannot receive new work.');
+    return actor;
+  }
+  private boundRef(): ActorRef {
+    if (this.actor.kind === 'system')
+      throw new SynomemError('MUTATION_FORBIDDEN', 'A human or agent identity is required.');
+    return { kind: this.actor.kind, id: this.actor.id };
+  }
+  private canManage(ref: ActorRef): boolean {
+    return (
+      sameActor(ref, this.actor) ||
+      this.administrative ||
+      (ref.kind === 'agent' && overseesAgent(this.actor, this.authority, ref.id))
+    );
+  }
+  private intervention(ref: ActorRef, reason?: string): Pick<SynomemEvent, 'intervention'> {
+    if (this.actor.kind !== 'human' || sameActor(this.actor, ref) || !this.canManage(ref))
+      return {};
+    const basis =
+      this.authority.mode === 'local-owner'
+        ? 'local_owner'
+        : this.authority.organizationAdministrator
+          ? 'organization_admin'
+          : this.authority.workspaceAdministrator
+            ? 'workspace_admin'
+            : 'operator';
+    return { intervention: { basis, ...(reason ? { reason } : {}) } };
+  }
+  private async syncActor(ref: ActorRef): Promise<void> {
+    if (ref.kind === 'agent') {
+      const context = this.mutationContext.getStore();
+      if (context) context.projections.add(ref.id);
+      else await this.projectionWriter.syncAgent(ref.id);
+    }
+  }
+  private async normalizeMutation(
+    operation: string,
+    input: object,
+  ): Promise<Record<string, unknown>> {
+    const schemas: Record<string, { parse: (value: unknown) => unknown }> = {
+      'kudos.give': giveKudosSchema,
+      'replies.create': replyCreateSchema,
+      'replies.delete': replyDeleteSchema,
+      'reactions.set': reactionSetSchema,
+      'memos.send': sendMemoSchema,
+      'notes.create': createNoteSchema,
+      'notes.revise': reviseNoteSchema,
+      'posts.create': createPostSchema,
+      'posts.update': updatePostSchema,
+      'tasks.create': createTaskSchema,
+      'tasks.update': updateTaskSchema,
+      'tasks.overrideDecision': overrideTaskDecisionSchema,
+      'todos.create': createTodoSchema,
+      'todos.update': updateTodoSchema,
+    };
+    const value = this.validate(
+      () =>
+        schemas[operation]?.parse(
+          operation === 'kudos.give'
+            ? {
+                ...input,
+                visibility:
+                  (input as GiveKudosInput).visibility ?? this.repository.config.defaultVisibility,
+              }
+            : input,
+        ) ?? input,
+    ) as Record<string, unknown>;
+    const normalized = { ...value };
+    delete normalized.idempotencyKey;
+    for (const field of ['recipient', 'owner', 'assignee']) {
+      const supplied = normalized[field] as ActorRef | undefined;
+      if (supplied) {
+        const actor = await this.resolveActor(supplied);
+        normalized[field] = { kind: actor.kind, id: actor.id };
+      }
+    }
+    for (const field of [
+      'title',
+      'body',
+      'subject',
+      'reason',
+      'response',
+      'note',
+      'details',
+      'description',
+    ])
+      if (typeof normalized[field] === 'string') normalized[field] = normalized[field].trim();
+    for (const field of ['tags', 'topicIds'])
+      if (
+        field in normalized ||
+        operation.endsWith('.create') ||
+        ['kudos.give', 'memos.send'].includes(operation)
+      )
+        normalized[field] = [...new Set((normalized[field] ?? []) as string[])].sort();
+    if (['kudos.give', 'memos.send', 'tasks.create'].includes(operation))
+      normalized.visibility ??= this.repository.config.defaultVisibility;
+    if (['notes.create', 'todos.create'].includes(operation)) normalized.owner ??= this.boundRef();
+    if (operation === 'tasks.create') normalized.assignee ??= this.boundRef();
+    if (['tasks.create', 'todos.create'].includes(operation)) normalized.priority ??= 3;
+    if (['replies.create', 'posts.create', 'posts.update'].includes(operation)) {
+      if (operation === 'replies.create') normalized.parentId ??= null;
+      if (operation === 'posts.update' && normalized.mentions === undefined) return normalized;
+      const mentions: ActorRef[] = [];
+      for (const supplied of (normalized.mentions ?? []) as ActorRef[]) {
+        let actor: AddressableActor;
+        try {
+          actor = await this.resolveActor(supplied, true);
+        } catch (error) {
+          if (
+            error instanceof SynomemError &&
+            ['AGENT_NOT_FOUND', 'INVALID_INPUT'].includes(error.code)
+          )
+            throw new SynomemError(
+              'INVALID_INPUT',
+              'Mention targets must be active and accessible.',
+            );
+          throw error;
+        }
+        if (!mentions.some((ref) => sameActor(ref, actor)))
+          mentions.push({ kind: actor.kind, id: actor.id });
+      }
+      normalized.mentions = mentions.sort((a, b) =>
+        `${a.kind}:${a.id}`.localeCompare(`${b.kind}:${b.id}`),
+      );
+    }
+    return normalized;
+  }
+  private async authorizeReceipt(operation: string, result: unknown): Promise<void> {
+    if (operation.startsWith('replies.')) {
+      const reply = await this.getReply((result as ReplyRecord).id);
+      if (
+        operation === 'replies.delete' &&
+        !sameActor(reply.author, this.actor) &&
+        !this.canModerateRoot(await this.getItem(reply.rootId))
+      )
+        throw new SynomemError('MUTATION_FORBIDDEN', 'Moderation authority was removed.');
+      return;
+    }
+    if (operation === 'reactions.set') {
+      await this.reactionRoot((result as { targetId: string }).targetId);
+      return;
+    }
+    const candidate = result as { record?: { event?: { id?: string } }; event?: { id?: string } };
+    const id = candidate.record?.event?.id ?? candidate.event?.id;
+    if (!id)
+      throw new SynomemError(
+        'IDEMPOTENCY_EXPIRED',
+        'The cached mutation result cannot be reconstructed.',
+      );
+    const record = await this.getItem(id);
+    const event = record.event;
+    if (operation.startsWith('notes.')) this.assertNoteOwner(record as NoteRecord);
+    else if (operation.startsWith('todos.')) this.assertTodoOwner(record as TodoRecord);
+    else if (operation.startsWith('tasks.') && operation !== 'tasks.create') {
+      if (['tasks.accept', 'tasks.reject'].includes(operation))
+        this.assertTaskAssignee(record as TaskRecord);
+      else this.assertTaskParticipant(record as TaskRecord);
+      if (
+        operation === 'tasks.overrideDecision' &&
+        (this.actor.kind !== 'human' ||
+          !(
+            this.administrative ||
+            ((record as TaskRecord).event.assignee.kind === 'agent' &&
+              overseesAgent(
+                this.actor,
+                this.authority,
+                (record as TaskRecord).event.assignee.id,
+              )) ||
+            (event.actor.kind === 'agent' &&
+              overseesAgent(this.actor, this.authority, event.actor.id))
+          ))
+      )
+        throw new SynomemError('MUTATION_FORBIDDEN', 'Only a human overseer may override a task.');
+    } else if (
+      operation.startsWith('posts.') &&
+      ['posts.update', 'posts.archive'].includes(operation)
+    )
+      this.assertPostAuthor(record as PostRecord);
+    else if (operation === 'memos.read')
+      this.assertRecipient((record as MemoRecord).event.recipient, 'mark this memo read');
+    else if (operation === 'memos.archive')
+      this.assertRecipient((record as MemoRecord).event.recipient, 'archive this memo', true);
+    else if (
+      operation === 'kudos.acknowledge' &&
+      !sameActor(this.actor, (record as KudosRecord).event.recipient)
+    )
+      throw new SynomemError(
+        'ACKNOWLEDGMENT_FORBIDDEN',
+        'Only the recipient may acknowledge kudos.',
+      );
+    else if (operation === 'kudos.revoke' && !this.canManage(event.actor as ActorRef))
+      throw new SynomemError(
+        'REVOCATION_FORBIDDEN',
+        'Only the author or an authorized overseer may revoke kudos.',
+      );
+    for (const field of ['recipient', 'owner', 'assignee'] as const)
+      if (field in event) {
+        const ref = (event as unknown as Record<string, ActorRef>)[field]!;
+        await this.syncActor(ref);
+      }
+  }
+  private personalWrite<T>(operation: () => Promise<T>): Promise<T> {
+    this.checkAbort();
+    if (!this.writeAllowed)
+      throw new SynomemError('READ_ONLY', 'This binding cannot change personal state.');
+    return this.repository.transaction(async () => {
+      await this.resolveActor(this.boundRef(), true);
+      return operation();
+    });
+  }
+  private async mutate<T>(operation: string, input: object, action: () => Promise<T>): Promise<T> {
+    this.checkAbort();
+    if (!this.writeAllowed)
+      throw new SynomemError('READ_ONLY', 'This binding cannot write records.');
+    const rawKey = (input as { idempotencyKey?: unknown }).idempotencyKey;
+    if (
+      rawKey !== undefined &&
+      (typeof rawKey !== 'string' || !rawKey.trim() || rawKey.trim().length > 200)
+    )
+      throw new SynomemError('INVALID_INPUT', 'Idempotency keys must contain 1–200 characters.');
+    const key = typeof rawKey === 'string' ? rawKey.trim() : undefined;
+    const state = { ...(key ? { key } : {}), projections: new Set<string>() };
+    const result = await this.mutationContext.run(state, () =>
+      this.repository.transaction(async () => {
+        if (this.actor.kind !== 'system') await this.resolveActor(this.boundRef(), true);
+        const normalized = await this.normalizeMutation(operation, input);
+        const requestHash = cursorFilter({ operation, request: normalized });
+        const keyHash = key ? cursorFilter(key) : undefined;
+        const prior = keyHash
+          ? await this.repository.getMutationReceipt(this.actor.kind, this.actor.id, keyHash)
+          : undefined;
+        if (prior) {
+          if (prior.operation !== operation || prior.requestHash !== requestHash)
+            throw new SynomemError(
+              'IDEMPOTENCY_CONFLICT',
+              'This key was already used for a different request.',
+            );
+          if (!prior.resultJson)
+            throw new SynomemError(
+              'IDEMPOTENCY_EXPIRED',
+              'The original response expired. This request will not execute again.',
+            );
+          const response = JSON.parse(prior.resultJson) as T;
+          await this.authorizeReceipt(operation, response);
+          if (operation === 'replies.create' || operation === 'replies.delete') {
+            const current = await this.getReply((response as ReplyRecord).id);
+            if (current.deleted)
+              return { ...response, body: undefined, mentions: undefined, deleted: true };
+          }
+          if (response && typeof response === 'object' && 'created' in response)
+            return { ...response, created: false, deduplicated: true };
+          return response;
+        }
+        if (
+          key &&
+          (await this.repository.getEventByIdempotency(this.actor.kind, this.actor.id, key))
+        )
+          throw new SynomemError(
+            'IDEMPOTENCY_EXPIRED',
+            'The original request receipt is unavailable. This key will not execute again.',
+          );
+        const lifecycleOperations = new Set([
+          'kudos.acknowledge',
+          'kudos.revoke',
+          'memos.read',
+          'memos.archive',
+          'posts.archive',
+          'posts.acknowledge',
+          'posts.withdrawAcknowledgment',
+          'notes.archive',
+          'tasks.accept',
+          'tasks.reject',
+          'tasks.complete',
+          'tasks.reopen',
+          'tasks.cancel',
+          'todos.complete',
+          'todos.reopen',
+          'todos.cancel',
+          'todos.archive',
+        ]);
+        if (lifecycleOperations.has(operation)) {
+          const supplied = (input as { expectedVersion?: unknown }).expectedVersion;
+          if (!Number.isSafeInteger(supplied) || (supplied as number) < 1)
+            throw new SynomemError(
+              'INVALID_INPUT',
+              'expectedVersion must be the current positive lifecycleVersion.',
+            );
+          const rootId = normalized[
+            (operation.startsWith('kudos.')
+              ? 'kudos'
+              : operation.split('.')[0]!.replace(/s$/, '')) + 'Id'
+          ] as string;
+          const current = await this.getItem(rootId);
+          await this.authorizeReceipt(operation, current);
+          if (current.lifecycleVersion !== supplied)
+            throw new SynomemError(
+              'REVISION_CONFLICT',
+              'The record changed. Refresh before applying this action.',
+            );
+        }
+        const response = await action();
+        if (keyHash) {
+          const resultJson = JSON.stringify(response);
+          if (Buffer.byteLength(resultJson) > 262144)
+            throw new SynomemError(
+              'INVALID_INPUT',
+              'The mutation response exceeds the receipt budget.',
+            );
+          const eventId = (
+            key
+              ? await this.repository.getEventByIdempotency(this.actor.kind, this.actor.id, key)
+              : undefined
+          )?.id;
+          await this.repository.insertMutationReceipt(this.actor.kind, this.actor.id, keyHash, {
+            operation,
+            requestHash,
+            resultJson,
+            ...(eventId ? { eventId } : {}),
+            createdAt: this.now(),
+          });
+        }
+        return response;
+      }),
+    );
+    for (const id of state.projections) await this.projectionWriter.syncAgent(id);
+    return result;
+  }
   private now(): string {
     return this.clock().toISOString();
   }
-
   private nextId(): string {
     return this.idGenerator();
   }
-
   private eventBase(aggregateId: string, aggregateVersion: number, id = this.nextId()) {
     return {
-      schemaVersion: 1 as const,
+      schemaVersion: 2 as const,
+      ...(this.mutationContext.getStore()?.key
+        ? { idempotencyKey: this.mutationContext.getStore()!.key }
+        : {}),
       id,
       workspaceId: this.repository.config.workspaceId,
       aggregateId,
@@ -351,11 +1144,9 @@ export class SynomemCore implements SynomemDomainService {
       actor: this.actor,
     };
   }
-
   protected checkAbort(): void {
     this.signal?.throwIfAborted();
   }
-
   private validate<T>(operation: () => T): T {
     try {
       return operation();
@@ -363,7 +1154,6 @@ export class SynomemCore implements SynomemDomainService {
       throw asSynomemError(error);
     }
   }
-
   private async createAgent(input: CreateAgentInput): Promise<AgentProfile> {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
@@ -409,7 +1199,6 @@ export class SynomemCore implements SynomemDomainService {
     await this.projectionWriter.syncAgent(profile.id);
     return profile;
   }
-
   private async updateAgent(idOrAlias: string, changes: UpdateAgentInput): Promise<AgentProfile> {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
@@ -467,7 +1256,6 @@ export class SynomemCore implements SynomemDomainService {
     await this.projectionWriter.syncAgent(updated.id);
     return updated;
   }
-
   /**
    * Archiving stops an agent acting without erasing it.
    *
@@ -499,21 +1287,18 @@ export class SynomemCore implements SynomemDomainService {
     await this.projectionWriter.syncAgent(updated.id);
     return updated;
   }
-
   /** Adds aliases without disturbing the ones already there. */
   private async addAgentAliases(idOrAlias: string, add: string[]): Promise<AgentProfile> {
     const existing = await this.getAgent(idOrAlias);
     const merged = [...new Set([...(existing.aliases ?? []), ...add])].sort();
     return await this.updateAgent(existing.id, { aliases: merged });
   }
-
   private async removeAgentAliases(idOrAlias: string, remove: string[]): Promise<AgentProfile> {
     const existing = await this.getAgent(idOrAlias);
     const drop = new Set(remove.map((alias) => alias.trim().toLowerCase()));
     const kept = (existing.aliases ?? []).filter((alias) => !drop.has(alias));
     return await this.updateAgent(existing.id, { aliases: kept });
   }
-
   private async getAgent(idOrAlias: string): Promise<AgentProfile> {
     this.checkAbort();
     this.validate(() => agentLookupSchema.parse(idOrAlias));
@@ -521,12 +1306,10 @@ export class SynomemCore implements SynomemDomainService {
     if (!profile) throw new SynomemError('AGENT_NOT_FOUND', `Unknown agent: ${idOrAlias}`);
     return profile;
   }
-
   private async listAgents(): Promise<AgentProfile[]> {
     this.checkAbort();
     return await this.repository.listAgents();
   }
-
   /**
    * Resolves a name without ever choosing between equally valid answers.
    *
@@ -545,7 +1328,6 @@ export class SynomemCore implements SynomemDomainService {
       candidates: resolved.candidates,
     };
   }
-
   private async agentDirectory(): Promise<AgentDirectoryEntry[]> {
     this.checkAbort();
     const profiles = await this.repository.listAgents();
@@ -558,12 +1340,10 @@ export class SynomemCore implements SynomemDomainService {
     }
     return entries;
   }
-
   private async listRuntimeBindings(idOrAlias: string): Promise<AgentRuntimeBinding[]> {
     const profile = await this.getAgent(idOrAlias);
     return await this.repository.listRuntimeBindings(profile.id);
   }
-
   /**
    * Records where an agent runs. Re-binding the same runtime and profile
    * updates the claim in place rather than accumulating duplicates, because a
@@ -592,12 +1372,10 @@ export class SynomemCore implements SynomemDomainService {
     if (!binding) throw new SynomemError('INTERNAL_ERROR', 'Runtime binding was not persisted.');
     return binding;
   }
-
   private async unbindRuntime(bindingId: string): Promise<boolean> {
     this.checkAbort();
     return await this.repository.unbindRuntime(bindingId);
   }
-
   /* ---------------------------------------------------------------- topics *
    * A topic is a controlled, reusable subject a record can be filed under —
    * one canonical display name and a set of aliases, so a stable "Synomem"
@@ -606,7 +1384,6 @@ export class SynomemCore implements SynomemDomainService {
    * an administrator renames or archives it, matching how an agent's own
    * identity is managed.
    */
-
   private async createTopic(input: CreateTopicInput): Promise<Topic> {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
@@ -641,7 +1418,6 @@ export class SynomemCore implements SynomemDomainService {
     });
     return topic;
   }
-
   private async updateTopicRecord(idOrAlias: string, changes: UpdateTopicInput): Promise<Topic> {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
@@ -683,7 +1459,6 @@ export class SynomemCore implements SynomemDomainService {
     });
     return updated;
   }
-
   private async setTopicStatus(idOrAlias: string, status: 'active' | 'archived'): Promise<Topic> {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
@@ -704,7 +1479,6 @@ export class SynomemCore implements SynomemDomainService {
     });
     return updated;
   }
-
   private async getTopicRecord(idOrAlias: string): Promise<Topic> {
     this.checkAbort();
     this.validate(() => topicLookupSchema.parse(idOrAlias));
@@ -712,20 +1486,17 @@ export class SynomemCore implements SynomemDomainService {
     if (!topic) throw new SynomemError('TOPIC_NOT_FOUND', `Unknown topic: ${idOrAlias}`);
     return topic;
   }
-
   private async listTopicsRecord(input: TopicListInput): Promise<Topic[]> {
     this.checkAbort();
     const parsed = this.validate(() => topicListInputSchema.parse(input));
     return await this.repository.listTopics(parsed.status);
   }
-
   private async resolveTopicRecord(query: string): Promise<TopicResolution> {
     this.checkAbort();
     const trimmed = this.validate(() => topicLookupSchema.parse(query));
     const resolved = await this.repository.resolveTopic(trimmed);
     return { query: trimmed, ...resolved };
   }
-
   /**
    * Every topic in `topicIds` must already exist and be active — a record
    * cannot be filed under a subject that does not exist, or one somebody
@@ -739,7 +1510,6 @@ export class SynomemCore implements SynomemDomainService {
       }
     }
   }
-
   private async giveKudos(input: GiveKudosInput): Promise<GiveKudosResult> {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
@@ -750,21 +1520,20 @@ export class SynomemCore implements SynomemDomainService {
       }),
     );
     await this.assertTopicsExist(parsed.topicIds);
-    const recipient = await this.repository.getAgent(parsed.recipientAgentId);
+    const recipient = await this.resolveActor(parsed.recipient, true);
     if (!recipient) {
-      throw new SynomemError('AGENT_NOT_FOUND', `Unknown recipient: ${parsed.recipientAgentId}`);
+      throw new SynomemError('AGENT_NOT_FOUND', `Unknown recipient: ${parsed.recipient?.id}`);
     }
     if (
       !this.repository.config.allowSelfAwards &&
       this.actor.kind !== 'human' &&
-      this.actor.id === recipient.id
+      sameActor(this.actor, recipient)
     ) {
       throw new SynomemError(
         'SELF_AWARD_FORBIDDEN',
         'Non-human actors cannot award kudos to a matching agent identity.',
       );
     }
-
     const outcome = await this.repository.transaction(async () => {
       const prior = await this.priorMutation(parsed.idempotencyKey, 'kudos.given');
       if (prior?.type === 'kudos.given') return { event: prior, created: false };
@@ -772,7 +1541,7 @@ export class SynomemCore implements SynomemDomainService {
       const event: KudosGivenEvent = {
         ...this.eventBase(id, 1, id),
         type: 'kudos.given',
-        recipientAgentId: recipient.id,
+        recipient: { kind: recipient.kind, id: recipient.id },
         recipientDisplayName: recipient.displayName,
         title: parsed.title,
         reason: parsed.reason,
@@ -787,48 +1556,47 @@ export class SynomemCore implements SynomemDomainService {
       await this.repository.insertEvent(event);
       return { event, created: true };
     });
-    if (outcome.created) await this.projectionWriter.syncAgent(recipient.id);
+    if (outcome.created) await this.syncActor(recipient);
     const record = await this.getKudosRecord(outcome.event.id);
     return { record, created: outcome.created, deduplicated: !outcome.created };
   }
-
   private async getKudosRecord(id: string): Promise<KudosRecord> {
     await this.requireVisibleItem(id, 'kudos');
     const record = recordsFromEvents(await this.repository.getReadableSynomemEvents(id))[0];
     if (!record) throw new SynomemError('KUDOS_NOT_FOUND', `Unknown kudos: ${id}`);
-    return record;
+    return this.decorateRecord(record);
   }
-
   private async getKudos(id: string): Promise<KudosRecord> {
     this.checkAbort();
     return await this.getKudosRecord(id);
   }
-
   private async listKudos(input: KudosListInput): Promise<Page<KudosSummary>> {
     this.checkAbort();
     const filters = this.validate(() => listInputSchema.parse(input));
-    const recipient = filters.recipientAgentId
-      ? await this.repository.getAgent(filters.recipientAgentId)
+    const recipient = filters.recipient?.id
+      ? await this.resolveActor(filters.recipient)
       : undefined;
-    if (filters.recipientAgentId && !recipient) {
-      throw new SynomemError('AGENT_NOT_FOUND', `Unknown agent: ${filters.recipientAgentId}`);
+    if (filters.recipient?.id && !recipient) {
+      throw new SynomemError('AGENT_NOT_FOUND', `Unknown agent: ${filters.recipient?.id}`);
     }
     return await this.repository.listKudosSummaries(
       {
         ...filters,
-        ...(recipient ? { recipientAgentId: recipient.id } : {}),
+        ...(recipient ? { recipient: { kind: recipient.kind, id: recipient.id } } : {}),
       },
       this.actor,
     );
   }
-
   private async listKudosChanges(input: KudosChangesInput): Promise<ChangePage> {
     this.checkAbort();
     const parsed = this.validate(() => changesInputSchema.parse(input));
     return await this.repository.listKudosChanges(parsed.after, parsed.limit, this.actor);
   }
-
-  private async acknowledgeKudos(input: { kudosId: string; note?: string }): Promise<KudosRecord> {
+  private async acknowledgeKudos(input: {
+    expectedVersion: number;
+    kudosId: string;
+    note?: string;
+  }): Promise<KudosRecord> {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
     if (input.note !== undefined && (input.note.trim().length < 1 || input.note.length > 2000)) {
@@ -838,27 +1606,26 @@ export class SynomemCore implements SynomemDomainService {
     if (record.acknowledgment) return record;
     if (record.revocation)
       throw new SynomemError('INVALID_INPUT', 'Revoked kudos cannot be acknowledged.');
-    const isRecipient =
-      this.actor.kind === 'agent' && this.actor.id === record.event.recipientAgentId;
-    if (!this.administrative && !isRecipient) {
+    const isRecipient = sameActor(this.actor, record.event.recipient);
+    if (!isRecipient) {
       throw new SynomemError(
         'ACKNOWLEDGMENT_FORBIDDEN',
-        'Only the recipient agent or a human administrator may acknowledge kudos.',
+        'Only the recipient may acknowledge kudos.',
       );
     }
     const event: KudosAcknowledgedEvent = {
       ...this.eventBase(record.event.id, 2),
       type: 'kudos.acknowledged',
       kudosId: record.event.id,
-      recipientAgentId: record.event.recipientAgentId,
+      recipient: record.event.recipient,
       ...(input.note ? { note: input.note.trim() } : {}),
     };
     await this.repository.transaction(() => this.repository.insertEvent(event));
-    await this.projectionWriter.syncAgent(record.event.recipientAgentId);
+    await this.syncActor(record.event.recipient);
     return await this.getKudosRecord(input.kudosId);
   }
-
   private async revokeKudos(input: {
+    expectedVersion: number;
     kudosId: string;
     reason: string;
     administrative?: boolean;
@@ -880,24 +1647,24 @@ export class SynomemCore implements SynomemDomainService {
       );
     }
     const administrative = this.administrative && !isOriginalActor;
-    if (!isOriginalActor && !this.administrative) {
+    if (!this.canManage(record.event.actor as ActorRef)) {
       throw new SynomemError(
         'REVOCATION_FORBIDDEN',
-        'Only the original actor or an administrator may revoke kudos.',
+        'Only the author or an authorized overseer may revoke kudos.',
       );
     }
     const event: KudosRevokedEvent = {
       ...this.eventBase(record.event.id, record.acknowledgment ? 3 : 2),
+      ...this.intervention(record.event.actor as ActorRef, reason),
       type: 'kudos.revoked',
       kudosId: record.event.id,
       reason,
       mode: administrative && !isOriginalActor ? 'administrative' : 'actor-requested',
     };
     await this.repository.transaction(() => this.repository.insertEvent(event));
-    await this.projectionWriter.syncAgent(record.event.recipientAgentId);
+    await this.syncActor(record.event.recipient);
     return await this.getKudosRecord(input.kudosId);
   }
-
   private async priorMutation(
     idempotencyKey: string | undefined,
     expectedType: SynomemEvent['type'],
@@ -916,19 +1683,20 @@ export class SynomemCore implements SynomemDomainService {
     }
     return prior;
   }
-
   private canViewItem(summary: ItemSummary): boolean {
+    if (summary.kind === 'note' || summary.kind === 'todo')
+      return !!summary.owner && this.canManage(summary.owner);
     return (
       this.administrative ||
       summary.visibility !== 'private' ||
-      (summary.actor.kind === this.actor.kind && summary.actor.id === this.actor.id) ||
-      (this.actor.kind === 'agent' &&
-        (summary.recipientAgentId === this.actor.id ||
-          summary.ownerAgentId === this.actor.id ||
-          summary.assigneeAgentId === this.actor.id))
+      [summary.actor, summary.recipient, summary.assignee].some(
+        (ref) =>
+          !!ref &&
+          (sameActor(ref, this.actor) ||
+            (ref.kind === 'agent' && overseesAgent(this.actor, this.authority, ref.id))),
+      )
     );
   }
-
   private async requireVisibleItem(id: string, kind: ItemSummary['kind']): Promise<ItemSummary> {
     const summary = await this.repository.getItemSummary(id);
     if (!summary || summary.kind !== kind) {
@@ -950,27 +1718,24 @@ export class SynomemCore implements SynomemDomainService {
     }
     return summary;
   }
-
   private async getMemoRecord(id: string): Promise<MemoRecord> {
     await this.requireVisibleItem(id, 'memo');
     const record = memoRecordsFromEvents(await this.repository.getReadableItemEvents(id))[0];
     if (!record) throw new SynomemError('MEMO_NOT_FOUND', `Unknown memo: ${id}`);
-    return record;
+    return this.decorateRecord(record);
   }
-
   private async getMemo(id: string): Promise<MemoRecord> {
     this.checkAbort();
     return await this.getMemoRecord(id);
   }
-
   private async sendMemo(input: SendMemoInput): Promise<SendMemoResult> {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
     const parsed = this.validate(() => sendMemoSchema.parse(input));
     await this.assertTopicsExist(parsed.topicIds);
-    const recipient = await this.repository.getAgent(parsed.recipientAgentId);
+    const recipient = await this.resolveActor(parsed.recipient, true);
     if (!recipient)
-      throw new SynomemError('AGENT_NOT_FOUND', `Unknown recipient: ${parsed.recipientAgentId}`);
+      throw new SynomemError('AGENT_NOT_FOUND', `Unknown recipient: ${parsed.recipient?.id}`);
     const outcome = await this.repository.transaction(async () => {
       const prior = await this.priorMutation(parsed.idempotencyKey, 'memo.sent');
       if (prior?.type === 'memo.sent') return { id: prior.id, created: false };
@@ -978,7 +1743,7 @@ export class SynomemCore implements SynomemDomainService {
       const event: SynomemEvent = {
         ...this.eventBase(id, 1, id),
         type: 'memo.sent',
-        recipientAgentId: recipient.id,
+        recipient: { kind: recipient.kind, id: recipient.id },
         recipientDisplayName: recipient.displayName,
         subject: parsed.subject,
         body: parsed.body,
@@ -992,29 +1757,24 @@ export class SynomemCore implements SynomemDomainService {
       await this.repository.insertEvent(event);
       return { id, created: true };
     });
-    if (outcome.created) await this.projectionWriter.syncAgent(recipient.id);
+    if (outcome.created) await this.syncActor(recipient);
     return {
       record: await this.getMemoRecord(outcome.id),
       created: outcome.created,
       deduplicated: !outcome.created,
     };
   }
-
-  private assertRecipient(recipientAgentId: string, operation: string): void {
-    if (
-      !this.administrative &&
-      !(this.actor.kind === 'agent' && this.actor.id === recipientAgentId)
-    ) {
-      throw new SynomemError(
-        'MUTATION_FORBIDDEN',
-        `Only the recipient agent or a human administrator may ${operation}.`,
-      );
-    }
+  private assertRecipient(recipient: ActorRef, operation: string, oversight = false): void {
+    if (!(oversight ? this.canManage(recipient) : sameActor(this.actor, recipient)))
+      throw new SynomemError('MUTATION_FORBIDDEN', `Only the recipient may ${operation}.`);
   }
-
-  private async readMemo(input: { memoId: string; idempotencyKey?: string }): Promise<MemoRecord> {
+  private async readMemo(input: {
+    expectedVersion: number;
+    memoId: string;
+    idempotencyKey?: string;
+  }): Promise<MemoRecord> {
     const record = await this.getMemoRecord(input.memoId);
-    this.assertRecipient(record.event.recipientAgentId, 'mark this memo read');
+    this.assertRecipient(record.event.recipient, 'mark this memo read');
     if (record.read) return record;
     await this.repository.transaction(async () => {
       const prior = await this.priorMutation(input.idempotencyKey, 'memo.read');
@@ -1026,53 +1786,62 @@ export class SynomemCore implements SynomemDomainService {
         ),
         type: 'memo.read',
         memoId: record.event.id,
-        recipientAgentId: record.event.recipientAgentId,
+        recipient: record.event.recipient,
         ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
       };
       await this.repository.insertEvent(event);
     });
-    await this.projectionWriter.syncAgent(record.event.recipientAgentId);
+    await this.syncActor(record.event.recipient);
     return await this.getMemoRecord(input.memoId);
   }
-
   private async archiveMemo(input: {
+    expectedVersion: number;
     memoId: string;
     idempotencyKey?: string;
   }): Promise<MemoRecord> {
     const record = await this.getMemoRecord(input.memoId);
-    this.assertRecipient(record.event.recipientAgentId, 'archive this memo');
+    this.assertRecipient(record.event.recipient, 'archive this memo', true);
     if (record.archived) return record;
     await this.repository.transaction(async () => {
       const prior = await this.priorMutation(input.idempotencyKey, 'memo.archived');
       if (prior) return;
       const event: SynomemEvent = {
+        ...this.intervention(record.event.recipient),
         ...this.eventBase(
           record.event.id,
           await this.repository.nextAggregateVersion(record.event.id),
         ),
         type: 'memo.archived',
         memoId: record.event.id,
-        recipientAgentId: record.event.recipientAgentId,
+        recipient: record.event.recipient,
         ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
       };
       await this.repository.insertEvent(event);
     });
-    await this.projectionWriter.syncAgent(record.event.recipientAgentId);
+    await this.syncActor(record.event.recipient);
     return await this.getMemoRecord(input.memoId);
   }
-
   private async getPostRecord(id: string): Promise<PostRecord> {
     await this.requireVisibleItem(id, 'post');
     const record = postRecordsFromEvents(await this.repository.getReadableItemEvents(id))[0];
     if (!record) throw new SynomemError('ITEM_NOT_FOUND', `Unknown post: ${id}`);
-    return record;
+    return this.decorateRecord(record);
   }
-
   private async getPost(id: string): Promise<PostRecord> {
     this.checkAbort();
     return await this.getPostRecord(id);
   }
-
+  private async canonicalPostMentions(input: ActorRef[]): Promise<ActorRef[]> {
+    const mentions: ActorRef[] = [];
+    for (const reference of input) {
+      const actor = await this.resolveActor(reference, true);
+      const ref = { kind: actor.kind, id: actor.id };
+      if (!mentions.some((mention) => sameActor(mention, ref))) mentions.push(ref);
+    }
+    return mentions.sort((left, right) =>
+      `${left.kind}:${left.id}`.localeCompare(`${right.kind}:${right.id}`),
+    );
+  }
   private async createPost(input: CreatePostInput): Promise<{
     record: PostRecord;
     created: boolean;
@@ -1082,11 +1851,9 @@ export class SynomemCore implements SynomemDomainService {
     await this.repository.assertEventCompatibility();
     const parsed = this.validate(() => createPostSchema.parse(input));
     await this.assertTopicsExist(parsed.topicIds);
-
-    // A reply inherits its parent's workspace by construction, and cannot name
-    // a different target — there is no target to name.
-    if (parsed.replyTo) await this.requireVisibleItem(parsed.replyTo, 'post');
-
+    const mentions = parsed.mentions
+      ? await this.canonicalPostMentions(parsed.mentions)
+      : undefined;
     const outcome = await this.repository.transaction(async () => {
       const prior = await this.priorMutation(parsed.idempotencyKey, 'post.created');
       if (prior?.type === 'post.created') return { id: prior.id, created: false };
@@ -1096,9 +1863,9 @@ export class SynomemCore implements SynomemDomainService {
         type: 'post.created',
         title: parsed.title,
         body: parsed.body,
+        mentions: mentions ?? [],
         tags: [...new Set(parsed.tags ?? [])].sort(),
         topicIds: [...new Set(parsed.topicIds ?? [])].sort(),
-        ...(parsed.replyTo ? { replyTo: parsed.replyTo } : {}),
         ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
         ...(parsed.source ? { source: parsed.source } : {}),
         ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
@@ -1112,19 +1879,25 @@ export class SynomemCore implements SynomemDomainService {
       deduplicated: !outcome.created,
     };
   }
-
   /** Only the author edits a post. Everyone else responds to it. */
   private assertPostAuthor(record: PostRecord): void {
-    if (this.administrative) return;
+    if (
+      this.administrative ||
+      (record.event.actor.kind === 'agent' &&
+        overseesAgent(this.actor, this.authority, record.event.actor.id))
+    )
+      return;
     if (record.event.actor.id !== this.actor.id || record.event.actor.kind !== this.actor.kind) {
       throw new SynomemError('MUTATION_FORBIDDEN', 'Only the author can change a post.');
     }
   }
-
   private async updatePost(input: UpdatePostInput): Promise<PostRecord> {
     this.checkAbort();
     const parsed = this.validate(() => updatePostSchema.parse(input));
     await this.assertTopicsExist(parsed.topicIds);
+    const mentions = parsed.mentions
+      ? await this.canonicalPostMentions(parsed.mentions)
+      : undefined;
     const record = await this.getPostRecord(parsed.postId);
     this.assertPostAuthor(record);
     if (record.status === 'archived') {
@@ -1138,11 +1911,13 @@ export class SynomemCore implements SynomemDomainService {
     }
     await this.repository.transaction(async () => {
       const event: SynomemEvent = {
+        ...this.intervention(record.event.actor as ActorRef),
         ...this.eventBase(parsed.postId, await this.repository.nextAggregateVersion(parsed.postId)),
         type: 'post.edited',
         postId: parsed.postId,
         title: parsed.title ?? record.title,
         body: parsed.body ?? record.body,
+        mentions: mentions ?? record.mentions ?? [],
         tags: [...new Set(parsed.tags ?? record.tags ?? [])].sort(),
         topicIds: [...new Set(parsed.topicIds ?? record.topicIds ?? [])].sort(),
         ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
@@ -1151,8 +1926,8 @@ export class SynomemCore implements SynomemDomainService {
     });
     return await this.getPostRecord(parsed.postId);
   }
-
   private async archivePost(input: {
+    expectedVersion: number;
     postId: string;
     reason?: string;
     idempotencyKey?: string;
@@ -1163,6 +1938,7 @@ export class SynomemCore implements SynomemDomainService {
     if (record.status !== 'archived') {
       await this.repository.transaction(async () => {
         const event: SynomemEvent = {
+          ...this.intervention(record.event.actor as ActorRef),
           ...this.eventBase(input.postId, await this.repository.nextAggregateVersion(input.postId)),
           type: 'post.archived',
           postId: input.postId,
@@ -1174,8 +1950,8 @@ export class SynomemCore implements SynomemDomainService {
     }
     return await this.getPostRecord(input.postId);
   }
-
   private async acknowledgePost(input: {
+    expectedVersion: number;
     postId: string;
     note?: string;
     idempotencyKey?: string;
@@ -1201,10 +1977,11 @@ export class SynomemCore implements SynomemDomainService {
     }
     return await this.getPostRecord(input.postId);
   }
-
   private async withdrawPostAcknowledgment(input: {
+    expectedVersion: number;
     postId: string;
     reason?: string;
+    idempotencyKey?: string;
   }): Promise<PostRecord> {
     this.checkAbort();
     const record = await this.getPostRecord(input.postId);
@@ -1224,7 +2001,6 @@ export class SynomemCore implements SynomemDomainService {
     }
     return await this.getPostRecord(input.postId);
   }
-
   private async postRoster(postId: string): Promise<PostRoster> {
     this.checkAbort();
     await this.requireVisibleItem(postId, 'post');
@@ -1232,40 +2008,36 @@ export class SynomemCore implements SynomemDomainService {
     if (!roster) throw new SynomemError('ITEM_NOT_FOUND', `Unknown post: ${postId}`);
     return roster;
   }
-
   private async getNoteRecord(id: string): Promise<NoteRecord> {
     await this.requireVisibleItem(id, 'note');
     const record = noteRecordsFromEvents(await this.repository.getReadableItemEvents(id))[0];
     if (!record) throw new SynomemError('NOTE_NOT_FOUND', `Unknown note: ${id}`);
-    return record;
+    return this.decorateRecord(record);
   }
   private async getNote(id: string): Promise<NoteRecord> {
     this.checkAbort();
     return await this.getNoteRecord(id);
   }
-
   private async createNote(input: CreateNoteInput): Promise<CreateNoteResult> {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
     const parsed = this.validate(() => createNoteSchema.parse(input));
     await this.assertTopicsExist(parsed.topicIds);
-    const ownerId =
-      parsed.ownerAgentId ?? (this.actor.kind === 'agent' ? this.actor.id : undefined);
-    if (!ownerId)
-      throw new SynomemError('INVALID_INPUT', 'A human or system actor must specify ownerAgentId.');
-    const owner = await this.repository.getAgent(ownerId);
-    if (!owner) throw new SynomemError('AGENT_NOT_FOUND', `Unknown note owner: ${ownerId}`);
-    if (!this.administrative && (this.actor.kind !== 'agent' || this.actor.id !== owner.id)) {
-      throw new SynomemError('MUTATION_FORBIDDEN', 'Agents may create notes only for themselves.');
-    }
+    const owner = await this.resolveActor(parsed.owner ?? this.boundRef(), true);
+    if (!this.canManage(owner))
+      throw new SynomemError(
+        'MUTATION_FORBIDDEN',
+        'Only the owner or an authorized overseer may create private memory.',
+      );
     const outcome = await this.repository.transaction(async () => {
       const prior = await this.priorMutation(parsed.idempotencyKey, 'note.created');
       if (prior?.type === 'note.created') return { id: prior.id, created: false };
       const id = this.nextId();
       const event: SynomemEvent = {
         ...this.eventBase(id, 1, id),
+        ...this.intervention({ kind: owner.kind, id: owner.id }),
         type: 'note.created',
-        ownerAgentId: owner.id,
+        owner: { kind: owner.kind, id: owner.id },
         ownerDisplayName: owner.displayName,
         title: parsed.title,
         body: parsed.body,
@@ -1279,26 +2051,20 @@ export class SynomemCore implements SynomemDomainService {
       await this.repository.insertEvent(event);
       return { id, created: true };
     });
-    if (outcome.created) await this.projectionWriter.syncAgent(owner.id);
+    if (outcome.created) await this.syncActor(owner);
     return {
       record: await this.getNoteRecord(outcome.id),
       created: outcome.created,
       deduplicated: !outcome.created,
     };
   }
-
   private assertNoteOwner(record: NoteRecord): void {
-    if (
-      !this.administrative &&
-      !(this.actor.kind === 'agent' && this.actor.id === record.event.ownerAgentId)
-    ) {
+    if (!this.canManage(record.event.owner))
       throw new SynomemError(
         'MUTATION_FORBIDDEN',
-        'Only the note owner or a human administrator may change it.',
+        'Only the owner or an authorized overseer may change private memory.',
       );
-    }
   }
-
   private async reviseNote(input: ReviseNoteInput): Promise<NoteRecord> {
     const parsed = this.validate(() => reviseNoteSchema.parse(input));
     await this.assertTopicsExist(parsed.topicIds);
@@ -1323,6 +2089,7 @@ export class SynomemCore implements SynomemDomainService {
           'The note changed before this revision was stored.',
         );
       const event: SynomemEvent = {
+        ...this.intervention(record.event.owner),
         ...this.eventBase(record.event.id, parsed.expectedVersion + 1),
         type: 'note.revised',
         noteId: record.event.id,
@@ -1337,11 +2104,11 @@ export class SynomemCore implements SynomemDomainService {
       };
       await this.repository.insertEvent(event);
     });
-    await this.projectionWriter.syncAgent(record.event.ownerAgentId);
+    await this.syncActor(record.event.owner);
     return await this.getNoteRecord(parsed.noteId);
   }
-
   private async archiveNote(input: {
+    expectedVersion: number;
     noteId: string;
     idempotencyKey?: string;
   }): Promise<NoteRecord> {
@@ -1352,6 +2119,7 @@ export class SynomemCore implements SynomemDomainService {
       const prior = await this.priorMutation(input.idempotencyKey, 'note.archived');
       if (prior) return;
       const event: SynomemEvent = {
+        ...this.intervention(record.event.owner),
         ...this.eventBase(
           record.event.id,
           await this.repository.nextAggregateVersion(record.event.id),
@@ -1362,51 +2130,40 @@ export class SynomemCore implements SynomemDomainService {
       };
       await this.repository.insertEvent(event);
     });
-    await this.projectionWriter.syncAgent(record.event.ownerAgentId);
+    await this.syncActor(record.event.owner);
     return await this.getNoteRecord(input.noteId);
   }
-
   private async getTaskRecord(id: string): Promise<TaskRecord> {
     await this.requireVisibleItem(id, 'task');
     const record = taskRecordsFromEvents(await this.repository.getReadableItemEvents(id))[0];
     if (!record) throw new SynomemError('TODO_NOT_FOUND', `Unknown task: ${id}`);
-    return record;
+    return this.decorateRecord(record);
   }
   private async getTask(id: string): Promise<TaskRecord> {
     this.checkAbort();
     return await this.getTaskRecord(id);
   }
-
   private async createTask(input: CreateTaskInput): Promise<CreateTaskResult> {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
     const parsed = this.validate(() => createTaskSchema.parse(input));
     await this.assertTopicsExist(parsed.topicIds);
-    const assigneeId =
-      parsed.assigneeAgentId ?? (this.actor.kind === 'agent' ? this.actor.id : undefined);
-    if (!assigneeId)
-      throw new SynomemError(
-        'INVALID_INPUT',
-        'A human or system actor must specify assigneeAgentId.',
-      );
-    const assignee = await this.repository.getAgent(assigneeId);
-    if (!assignee)
-      throw new SynomemError('AGENT_NOT_FOUND', `Unknown task assignee: ${assigneeId}`);
+    const assignee = await this.resolveActor(parsed.assignee ?? this.boundRef(), true);
     if (
       this.actor.kind === 'agent' &&
-      this.actor.id !== assignee.id &&
+      !sameActor(this.actor, assignee) &&
       !this.repository.config.allowCrossAgentTasks
     )
-      throw new SynomemError('POLICY_FORBIDDEN', 'Cross-agent task assignment is disabled.');
+      throw new SynomemError('POLICY_FORBIDDEN', 'Cross-actor task assignment is disabled.');
     const outcome = await this.repository.transaction(async () => {
       const prior = await this.priorMutation(parsed.idempotencyKey, 'task.created');
       if (prior?.type === 'task.created') return { id: prior.id, created: false };
       const id = this.nextId();
-      const requiresAcceptance = this.actor.kind !== 'agent' || this.actor.id !== assignee.id;
+      const requiresAcceptance = !sameActor(this.actor, assignee);
       const event: SynomemEvent = {
         ...this.eventBase(id, 1, id),
         type: 'task.created',
-        assigneeAgentId: assignee.id,
+        assignee: { kind: assignee.kind, id: assignee.id },
         assigneeDisplayName: assignee.displayName,
         title: parsed.title,
         ...(parsed.description !== undefined ? { description: parsed.description } : {}),
@@ -1423,38 +2180,27 @@ export class SynomemCore implements SynomemDomainService {
       await this.repository.insertEvent(event);
       return { id, created: true };
     });
-    if (outcome.created) await this.projectionWriter.syncAgent(assignee.id);
+    if (outcome.created) await this.syncActor(assignee);
     return {
       record: await this.getTaskRecord(outcome.id),
       created: outcome.created,
       deduplicated: !outcome.created,
     };
   }
-
   private assertTaskParticipant(record: TaskRecord): void {
-    const isCreator =
-      record.event.actor.kind === this.actor.kind && record.event.actor.id === this.actor.id;
-    const isAssignee =
-      this.actor.kind === 'agent' && this.actor.id === record.event.assigneeAgentId;
-    if (!this.administrative && !isCreator && !isAssignee)
+    if (!this.canManage(record.event.assignee) && !this.canManage(record.event.actor as ActorRef))
       throw new SynomemError(
         'MUTATION_FORBIDDEN',
-        'Only the task creator, assignee, or a human administrator may change it.',
+        'Only task participants or authorized overseers may change it.',
       );
   }
-
   private assertTaskAssignee(record: TaskRecord): void {
-    if (
-      !this.administrative &&
-      !(this.actor.kind === 'agent' && this.actor.id === record.event.assigneeAgentId)
-    ) {
+    if (!this.canManage(record.event.assignee))
       throw new SynomemError(
         'MUTATION_FORBIDDEN',
-        'Only the assigned agent or a human administrator may accept or reject this task.',
+        'Only the assignee or an authorized overseer may decide this task.',
       );
-    }
   }
-
   private async updateTask(input: UpdateTaskInput): Promise<TaskRecord> {
     const parsed = this.validate(() => updateTaskSchema.parse(input));
     await this.assertTopicsExist(parsed.topicIds);
@@ -1480,6 +2226,7 @@ export class SynomemCore implements SynomemDomainService {
         );
       const due = parsed.due === null ? undefined : (parsed.due ?? record.current.due);
       const event: SynomemEvent = {
+        ...this.intervention(record.event.assignee),
         ...this.eventBase(record.event.id, parsed.expectedVersion + 1),
         type: 'task.updated',
         taskId: record.event.id,
@@ -1500,12 +2247,57 @@ export class SynomemCore implements SynomemDomainService {
       };
       await this.repository.insertEvent(event);
     });
-    await this.projectionWriter.syncAgent(record.event.assigneeAgentId);
+    await this.syncActor(record.event.assignee);
     return await this.getTaskRecord(parsed.taskId);
   }
-
+  private async overrideTaskDecision(input: OverrideTaskDecisionInput): Promise<TaskRecord> {
+    this.checkAbort();
+    const parsed = this.validate(() => overrideTaskDecisionSchema.parse(input));
+    await this.repository.transaction(async () => {
+      const record = await this.getTaskRecord(parsed.taskId);
+      if (
+        this.actor.kind !== 'human' ||
+        !(
+          this.administrative ||
+          (record.event.assignee.kind === 'agent' &&
+            overseesAgent(this.actor, this.authority, record.event.assignee.id)) ||
+          (record.event.actor.kind === 'agent' &&
+            overseesAgent(this.actor, this.authority, record.event.actor.id))
+        )
+      )
+        throw new SynomemError(
+          'MUTATION_FORBIDDEN',
+          'Only an authorized human overseer may override a decision.',
+        );
+      if (record.current.version !== parsed.expectedVersion)
+        throw new SynomemError(
+          'REVISION_CONFLICT',
+          'The task changed. Reload it before overriding.',
+        );
+      if (record.status !== 'open' && record.status !== 'rejected')
+        throw new SynomemError(
+          'INVALID_INPUT',
+          'Only accepted/open or rejected decisions can be overridden.',
+        );
+      if (record.status === parsed.nextStatus)
+        throw new SynomemError('INVALID_INPUT', 'The requested decision is already in effect.');
+      const event: SynomemEvent = {
+        ...this.eventBase(parsed.taskId, parsed.expectedVersion + 1),
+        ...this.intervention(record.event.assignee, parsed.reason),
+        type: 'task.decision_overridden',
+        taskId: parsed.taskId,
+        previousStatus: record.status,
+        nextStatus: parsed.nextStatus,
+        reason: parsed.reason,
+        ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
+      };
+      await this.repository.insertEvent(event);
+    });
+    return this.getTaskRecord(parsed.taskId);
+  }
   private async taskTransition(
     input: {
+      expectedVersion: number;
       taskId: string;
       idempotencyKey?: string;
       note?: string;
@@ -1549,6 +2341,7 @@ export class SynomemCore implements SynomemDomainService {
       const prior = await this.priorMutation(input.idempotencyKey, type);
       if (prior) return;
       const base = {
+        ...this.intervention(record.event.assignee),
         ...this.eventBase(
           record.event.id,
           await this.repository.nextAggregateVersion(record.event.id),
@@ -1572,25 +2365,44 @@ export class SynomemCore implements SynomemDomainService {
                 : { ...base, type };
       await this.repository.insertEvent(event);
     });
-    await this.projectionWriter.syncAgent(record.event.assigneeAgentId);
+    await this.syncActor(record.event.assignee);
     return await this.getTaskRecord(input.taskId);
   }
-  private completeTask(input: { taskId: string; note?: string; idempotencyKey?: string }) {
+  private completeTask(input: {
+    expectedVersion: number;
+    taskId: string;
+    note?: string;
+    idempotencyKey?: string;
+  }) {
     return this.taskTransition(input, 'task.completed');
   }
-  private acceptTask(input: { taskId: string; response?: string; idempotencyKey?: string }) {
+  private acceptTask(input: {
+    expectedVersion: number;
+    taskId: string;
+    response?: string;
+    idempotencyKey?: string;
+  }) {
     return this.taskTransition(input, 'task.accepted');
   }
-  private rejectTask(input: { taskId: string; response: string; idempotencyKey?: string }) {
+  private rejectTask(input: {
+    expectedVersion: number;
+    taskId: string;
+    response: string;
+    idempotencyKey?: string;
+  }) {
     return this.taskTransition(input, 'task.rejected');
   }
-  private reopenTask(input: { taskId: string; idempotencyKey?: string }) {
+  private reopenTask(input: { expectedVersion: number; taskId: string; idempotencyKey?: string }) {
     return this.taskTransition(input, 'task.reopened');
   }
-  private cancelTask(input: { taskId: string; reason?: string; idempotencyKey?: string }) {
+  private cancelTask(input: {
+    expectedVersion: number;
+    taskId: string;
+    reason?: string;
+    idempotencyKey?: string;
+  }) {
     return this.taskTransition(input, 'task.canceled');
   }
-
   /* ----------------------------------------------------------------- todos *
    * A Todo is a private reminder an agent creates for itself. There is no
    * assignee, no acceptance, and no visibility choice: it belongs to its author
@@ -1598,19 +2410,26 @@ export class SynomemCore implements SynomemDomainService {
    * rather than relying on a visibility filter, so a Todo cannot be reached by
    * guessing its id.
    */
-
   private async createTodo(input: CreateTodoInput): Promise<CreateTodoResult> {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
     const parsed = this.validate(() => createTodoSchema.parse(input));
     await this.assertTopicsExist(parsed.topicIds);
+    const owner = await this.resolveActor(parsed.owner ?? this.boundRef(), true);
+    if (!this.canManage(owner))
+      throw new SynomemError(
+        'MUTATION_FORBIDDEN',
+        'Only the owner or an authorized overseer may create private memory.',
+      );
     const outcome = await this.repository.transaction(async () => {
       const prior = await this.priorMutation(parsed.idempotencyKey, 'todo.created');
       if (prior?.type === 'todo.created') return { id: prior.id, created: false };
       const id = this.nextId();
       const event: SynomemEvent = {
         ...this.eventBase(id, 1, id),
+        ...this.intervention({ kind: owner.kind, id: owner.id }),
         type: 'todo.created',
+        owner: { kind: owner.kind, id: owner.id },
         title: parsed.title,
         ...(parsed.details !== undefined ? { details: parsed.details } : {}),
         priority: parsed.priority ?? 3,
@@ -1630,14 +2449,12 @@ export class SynomemCore implements SynomemDomainService {
       deduplicated: !outcome.created,
     };
   }
-
   private async getTodoRecord(id: string): Promise<TodoRecord> {
     const record = todoRecordsFromEvents(await this.repository.getReadableItemEvents(id))[0];
     if (!record) throw new SynomemError('ITEM_NOT_FOUND', `Unknown todo: ${id}`);
     this.assertTodoOwner(record);
-    return record;
+    return this.decorateRecord(record);
   }
-
   /**
    * Todos are owner-only for every ordinary actor — the same rule notes
    * already follow (`assertNoteOwner`): an organization owner or admin is the
@@ -1650,20 +2467,16 @@ export class SynomemCore implements SynomemDomainService {
    * on top of a permission that had already been granted.
    */
   private assertTodoOwner(record: TodoRecord): void {
-    const owner = record.event.actor;
-    if (!this.administrative && (owner.kind !== this.actor.kind || owner.id !== this.actor.id)) {
+    if (!this.canManage(record.event.owner))
       throw new SynomemError(
         'MUTATION_FORBIDDEN',
-        'A todo is private to the actor who created it.',
+        'Only the owner or an authorized overseer may change private memory.',
       );
-    }
   }
-
   private async getTodo(id: string): Promise<TodoRecord> {
     this.checkAbort();
     return await this.getTodoRecord(id);
   }
-
   private async updateTodo(input: UpdateTodoInput): Promise<TodoRecord> {
     this.checkAbort();
     const parsed = this.validate(() => updateTodoSchema.parse(input));
@@ -1680,6 +2493,7 @@ export class SynomemCore implements SynomemDomainService {
       const prior = await this.priorMutation(parsed.idempotencyKey, 'todo.updated');
       if (prior) return;
       const event: SynomemEvent = {
+        ...this.intervention(record.event.owner),
         ...this.eventBase(
           record.event.id,
           await this.repository.nextAggregateVersion(record.event.id),
@@ -1700,12 +2514,18 @@ export class SynomemCore implements SynomemDomainService {
     });
     return await this.getTodoRecord(parsed.todoId);
   }
-
   private async todoTransition(
-    input: { todoId: string; idempotencyKey?: string; note?: string; reason?: string },
+    input: {
+      expectedVersion: number;
+      todoId: string;
+      idempotencyKey?: string;
+      note?: string;
+      reason?: string;
+    },
     type: 'todo.completed' | 'todo.reopened' | 'todo.canceled' | 'todo.archived',
   ): Promise<TodoRecord> {
     const record = await this.getTodoRecord(input.todoId);
+    this.assertTodoOwner(record);
     if (type === 'todo.completed' && record.status !== 'open') {
       if (record.status === 'completed') return record;
       throw new SynomemError('INVALID_INPUT', 'Only an open todo may be completed.');
@@ -1716,7 +2536,6 @@ export class SynomemCore implements SynomemDomainService {
       throw new SynomemError('INVALID_INPUT', 'Only an open todo may be canceled.');
     }
     if (type === 'todo.archived' && record.status === 'archived') return record;
-
     await this.repository.transaction(async () => {
       const prior = await this.priorMutation(input.idempotencyKey, type);
       if (prior) return;
@@ -1738,7 +2557,6 @@ export class SynomemCore implements SynomemDomainService {
     });
     return await this.getTodoRecord(input.todoId);
   }
-
   /**
    * Turns an agent name in a filter into the canonical ID the records hold.
    *
@@ -1755,16 +2573,15 @@ export class SynomemCore implements SynomemDomainService {
     const resolved = await this.repository.resolveAgent(name);
     return resolved.match?.id ?? name;
   }
-
   private async listItems(input: ItemListInput): Promise<Page<ItemSummary>> {
     this.checkAbort();
     const parsed = this.validate(() => itemListInputSchema.parse(input));
     const resolved = {
       ...parsed,
-      ...(parsed.participantAgentId
-        ? { participantAgentId: await this.canonicalAgentId(parsed.participantAgentId) }
+      ...(parsed.participant ? { participant: await this.resolveActor(parsed.participant) } : {}),
+      ...(parsed.actorId && parsed.actorKind === 'agent'
+        ? { actorId: await this.canonicalAgentId(parsed.actorId) }
         : {}),
-      ...(parsed.actorId ? { actorId: await this.canonicalAgentId(parsed.actorId) } : {}),
     };
     return await this.repository.listItemSummaries(resolved, this.actor);
   }
@@ -1800,7 +2617,6 @@ export class SynomemCore implements SynomemDomainService {
     if (summary.kind === 'todo') return this.getTodo(id);
     return this.getTask(id);
   }
-
   async stats(input: KudosListInput = {}): Promise<KudosStats> {
     this.checkAbort();
     const parsed = this.validate(() => listInputSchema.parse(input));
@@ -1808,11 +2624,11 @@ export class SynomemCore implements SynomemDomainService {
     void _cursor;
     void _limit;
     void _offset;
-    const recipient = filters.recipientAgentId
-      ? await this.repository.getAgent(filters.recipientAgentId)
+    const recipient = filters.recipient?.id
+      ? await this.resolveActor(filters.recipient)
       : undefined;
-    if (filters.recipientAgentId && !recipient) {
-      throw new SynomemError('AGENT_NOT_FOUND', `Unknown agent: ${filters.recipientAgentId}`);
+    if (filters.recipient?.id && !recipient) {
+      throw new SynomemError('AGENT_NOT_FOUND', `Unknown agent: ${filters.recipient?.id}`);
     }
     const records: KudosSummary[] = [];
     let cursor: string | undefined;
@@ -1822,7 +2638,7 @@ export class SynomemCore implements SynomemDomainService {
       const page = await this.repository.listKudosSummaries(
         {
           ...filters,
-          ...(recipient ? { recipientAgentId: recipient.id } : {}),
+          ...(recipient ? { recipient: { kind: recipient.kind, id: recipient.id } } : {}),
           limit: 50,
           offset: 0,
           ...(cursor ? { cursor } : {}),
@@ -1848,7 +2664,7 @@ export class SynomemCore implements SynomemDomainService {
       byTag: {},
     };
     for (const record of includedRecords) {
-      stats.byAgent[record.recipientAgentId] = (stats.byAgent[record.recipientAgentId] ?? 0) + 1;
+      stats.byAgent[record.recipient?.id] = (stats.byAgent[record.recipient?.id] ?? 0) + 1;
       const actor = `${record.actor.kind}:${record.actor.id}`;
       stats.byActor[actor] = (stats.byActor[actor] ?? 0) + 1;
       for (const tag of record.tags) stats.byTag[tag] = (stats.byTag[tag] ?? 0) + 1;
@@ -1856,26 +2672,25 @@ export class SynomemCore implements SynomemDomainService {
     return stats;
   }
 }
-
 /**
  * The schema version this package writes and expects. Named rather than
  * repeated as a literal because it is asserted in three places, and a doctor
  * check that silently lags the migration runner reports a healthy database as
  * broken.
  */
-const CURRENT_SCHEMA_VERSION = 8;
-const EXPECTED_APPLIED_MIGRATIONS = [1, 2, 3, 4, 5, 6, 7, 8];
-
+const CURRENT_SCHEMA_VERSION = 9;
+const EXPECTED_APPLIED_MIGRATIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 export class SynomemClient extends SynomemCore implements SynomemService {
   readonly home: string;
   readonly storage: SynomemStorage;
   readonly projections: ProjectionManager;
-
   constructor(options: SynomemClientOptions = {}) {
     const home = resolveHome(options.home);
     const storage = new SynomemStorage({
       home,
+      ...(options.actor ? { actor: options.actor } : {}),
       readOnly: options.readOnly ?? false,
+      ...(options.authority ? { authority: options.authority } : {}),
       ...(options.config ? { config: options.config } : {}),
     });
     const projections = new ProjectionManager(storage);
@@ -1883,16 +2698,16 @@ export class SynomemClient extends SynomemCore implements SynomemService {
       repository: storage,
       projectionWriter: projections,
       ...(options.actor ? { actor: options.actor } : {}),
-      ...(options.administrative !== undefined ? { administrative: options.administrative } : {}),
+      ...(options.authority ? { authority: options.authority } : {}),
       ...(options.clock ? { clock: options.clock } : {}),
       ...(options.idGenerator ? { idGenerator: options.idGenerator } : {}),
       ...(options.signal ? { signal: options.signal } : {}),
+      canWrite: !options.readOnly,
     });
     this.home = home;
     this.storage = storage;
     this.projections = projections;
   }
-
   /*
    * Answers "would a rebuild change anything, and when did one last run?"
    *
@@ -1927,7 +2742,6 @@ export class SynomemClient extends SynomemCore implements SynomemService {
       unexpected: unexpected.slice(0, limit),
     };
   }
-
   async doctor(): Promise<DoctorResult> {
     this.checkAbort();
     const diagnostics: Diagnostic[] = [];
@@ -2055,10 +2869,33 @@ export class SynomemClient extends SynomemCore implements SynomemService {
     }
     return { healthy: !diagnostics.some((item) => item.level === 'error'), diagnostics };
   }
-
   async export(format: 'json' | 'jsonl' | 'markdown'): Promise<string> {
     this.checkAbort();
-    const rows = this.storage.rawEventRows();
+    const rows = [] as ReturnType<SynomemStorage['rawEventRows']>;
+    const access = new Map<string, boolean>();
+    for (const row of this.storage.rawEventRows()) {
+      let event: SynomemEvent;
+      try {
+        event = eventSchema.parse(JSON.parse(row.payload));
+      } catch {
+        if (this.administrative) rows.push(row);
+        continue;
+      }
+      const rootId = 'rootId' in event ? event.rootId : event.aggregateId;
+      if (event.type.startsWith('agent.')) {
+        if (this.administrative) rows.push(row);
+        continue;
+      }
+      if (!access.has(rootId))
+        access.set(rootId, this.storage.canActorReadItem(rootId, this.actor as ActorRef));
+      if (!access.get(rootId)) continue;
+      if (
+        event.type === 'reply.created' &&
+        (await this.storage.participation.getReply(event.id))?.deleted
+      )
+        continue;
+      rows.push(row);
+    }
     if (format === 'jsonl') return `${rows.map((row) => row.payload).join('\n')}\n`;
     const exported = rows.map((row) => {
       try {
@@ -2069,7 +2906,8 @@ export class SynomemClient extends SynomemCore implements SynomemService {
     });
     if (format === 'json') return `${JSON.stringify(exported, null, 2)}\n`;
     const scan = this.storage.scanEvents();
-    const events = scan.events;
+    const allowedIds = new Set(rows.map((row) => row.id));
+    const events = scan.events.filter((event) => allowedIds.has(event.id));
     const records = recordsFromEvents(events);
     const memos = memoRecordsFromEvents(events);
     const notes = noteRecordsFromEvents(events);
@@ -2097,21 +2935,28 @@ export class SynomemClient extends SynomemCore implements SynomemService {
     ];
     return `${warning}${sections.join('\n\n')}\n`;
   }
-
   async backup(destination: string): Promise<string> {
     this.checkAbort();
     return this.storage.backup(resolve(destination));
   }
-
   async rebuild(): Promise<ProjectionRebuildResult> {
     this.checkAbort();
     return this.projections.rebuild();
   }
-
   async capabilities(): Promise<SynomemServiceCapabilities> {
     this.checkAbort();
     return {
       backend: 'local',
+      participation: {
+        version: 2,
+        replies: true,
+        reactions: true,
+        personalInbox: true,
+        search: false,
+        canWrite: !this.storage.readOnly,
+        administrator: this.administrative,
+        managedAgentIds: [...this.authority.operatedAgentIds],
+      },
       binding: { workspaceId: this.storage.config.workspaceId, actor: this.actor },
       administration: {
         agentCreationViaMcp: this.storage.config.allowAgentCreationViaMcp,
@@ -2121,14 +2966,33 @@ export class SynomemClient extends SynomemCore implements SynomemService {
       projections: { ...this.storage.config.projection },
     };
   }
-
   async info(): Promise<SynomemServiceInfo> {
     this.checkAbort();
     return { backend: 'local', home: this.home, databasePath: this.storage.databasePath };
   }
-
   async getCanonicalEvent(id: string): Promise<SynomemEvent | undefined> {
     this.checkAbort();
-    return this.storage.getEvent(id);
+    const event = this.storage.getEvent(id);
+    if (!event) return undefined;
+    if (event.type.startsWith('agent.')) return this.administrative ? event : undefined;
+    const rootId = 'rootId' in event ? event.rootId : event.aggregateId;
+    if (!this.storage.canActorReadItem(rootId, this.actor as ActorRef))
+      throw new SynomemError('POLICY_FORBIDDEN', 'This event is not visible.');
+    if (
+      event.type === 'reply.created' &&
+      (await this.storage.participation.getReply(event.id))?.deleted
+    )
+      return undefined;
+    return event;
   }
+}
+export function createLocalOwnerClient(
+  options: Omit<SynomemClientOptions, 'authority'> = {},
+): SynomemClient {
+  if (options.actor?.kind !== 'human')
+    throw new SynomemError(
+      'POLICY_FORBIDDEN',
+      'Local owner administration requires an explicit human actor.',
+    );
+  return new SynomemClient({ ...options, authority: localOwnerAuthority() });
 }

@@ -51,6 +51,7 @@ try {
     'ARCHITECTURE.md',
     'LICENSE',
     'docs/recovery.md',
+    'docs/human-participation.md',
     'dist/index.js',
     'dist/cli.js',
     'dist/mcp-server.js',
@@ -200,9 +201,10 @@ try {
   const given = JSON.parse(run(synomemBin, giveArgs, consumer, acceptanceEnv));
   const kudosId = given.record?.event?.id;
   if (!kudosId || given.deduplicated) throw new Error('Acceptance kudos was not created.');
-  if (
-    !run(synomemBin, ['--profile', 'codex', 'inbox'], consumer, acceptanceEnv).includes(kudosId)
-  ) {
+  const inbox = JSON.parse(
+    run(synomemBin, ['--profile', 'codex', 'inbox', '--json'], consumer, acceptanceEnv),
+  );
+  if (!inbox.items?.some((item) => item.rootId === kudosId)) {
     throw new Error('Acceptance inbox did not contain the new kudos.');
   }
   if (

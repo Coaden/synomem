@@ -1,10 +1,15 @@
 #!/usr/bin/env node
+import type { RecordKind as HpRecordKind } from './types.js';
+import type { BookmarkInput as HpBookmarkInput } from './bookmarks.js';
+import type { NotificationInput as HpNotificationInput } from './notifications.js';
+import type { ReactionCode as HpReactionCode } from './participation.js';
+import type { ActorRef } from './policy.js';
 import { existsSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Command, CommanderError, Option } from 'commander';
-import { ensureLocalStore, LOCAL_OPERATOR, openLocalService } from './backend.js';
+import { ensureLocalStore, openLocalOwnerService, exportRawLocalEvents } from './backend.js';
 import { cloudApiUrl } from './cloud.js';
 import { resolveHome } from './config.js';
 import {
@@ -78,12 +83,10 @@ import type {
 } from './types.js';
 import { packageVersion } from './version.js';
 import { listLocalWorkspaces, localWorkspaceHome } from './workspaces.js';
-
 export interface CliIo {
   stdout: (text: string) => void;
   stderr: (text: string) => void;
 }
-
 export interface CliDependencies {
   /** Injected so interactive steps can be driven by a test without a terminal. */
   promptIo?: PromptIo;
@@ -106,14 +109,11 @@ export interface CliDependencies {
     planId?: string;
   }) => Promise<ImportPreview | ImportResult>;
 }
-
 const defaultIo: CliIo = {
   stdout: (text) => process.stdout.write(text),
   stderr: (text) => process.stderr.write(text),
 };
-
 const cliExitCodes = new WeakMap<Command, number>();
-
 /**
  * Identity overrides the profile model replaced. Named here so using one fails
  * with a message that points at `--profile`, rather than a generic unknown
@@ -135,7 +135,6 @@ const OBSOLETE_ENV = [
   'SYNOMEM_AGENT_ID',
   'SYNOMEM_WORKSPACE',
 ];
-
 function obsoleteIdentityInput(argv: string[], env: NodeJS.ProcessEnv): string | undefined {
   const args = argv.slice(2);
   for (const argument of args) {
@@ -156,11 +155,9 @@ function obsoleteIdentityInput(argv: string[], env: NodeJS.ProcessEnv): string |
   }
   return OBSOLETE_ENV.find((name) => env[name]?.trim());
 }
-
 function collect(value: string, previous: string[]): string[] {
   return [...previous, value];
 }
-
 function skillRuntimes(values: string[]): SkillRuntime[] | undefined {
   const normalized = values.map((value) => (value === 'grokbot' ? 'grok' : value));
   const invalid = normalized.find(
@@ -172,9 +169,7 @@ function skillRuntimes(values: string[]): SkillRuntime[] | undefined {
   if (!normalized.length || normalized.includes('all')) return undefined;
   return normalized as SkillRuntime[];
 }
-
 const skillRuntimeHelp = `${skillRuntimeNames.join(', ')}, grokbot (alias for grok), or all`;
-
 function parseEvidence(value: string): EvidenceReference {
   const separator = value.indexOf(':');
   if (separator < 1 || separator === value.length - 1) {
@@ -185,7 +180,6 @@ function parseEvidence(value: string): EvidenceReference {
     value: value.slice(separator + 1),
   };
 }
-
 function taskDue(options: {
   dueDate?: string;
   dueAt?: string;
@@ -201,7 +195,6 @@ function taskDue(options: {
   }
   return undefined;
 }
-
 function exitCode(code: SynomemErrorCode): number {
   if (code.endsWith('_NOT_FOUND')) return 3;
   if (
@@ -218,7 +211,6 @@ function exitCode(code: SynomemErrorCode): number {
   if (code === 'INTERNAL_ERROR') return 1;
   return 2;
 }
-
 function lineForSummary(record: KudosSummary): string {
   const state =
     record.revocationStatus === 'revoked'
@@ -226,19 +218,19 @@ function lineForSummary(record: KudosSummary): string {
       : record.status === 'acknowledged'
         ? 'acknowledged'
         : 'new';
-  return `${record.id}  ${record.createdAt.slice(0, 10)}  ${record.recipientAgentId}  [${state}]  ${record.title}`;
+  return `${record.id}  ${record.createdAt.slice(0, 10)}  ${record.recipient?.id}  [${state}]  ${record.title}`;
 }
-
 function lineForItem(item: ItemSummary): string {
   return `${item.id}  ${item.createdAt.slice(0, 10)}  ${item.kind.padEnd(5)}  [${item.status}]  ${item.title}`;
 }
-
 function itemListInput(options: Record<string, string | string[]>): ItemListInput {
   return {
     ...(Array.isArray(options.kind) && options.kind.length
       ? { kinds: options.kind as ItemListInput['kinds'] }
       : {}),
-    ...(typeof options.participant === 'string' ? { participantAgentId: options.participant } : {}),
+    ...(typeof options.participant === 'string'
+      ? { participant: targetRef(options.participant) }
+      : {}),
     ...(typeof options.author === 'string' ? { actorId: options.author } : {}),
     ...(typeof options.status === 'string' ? { status: options.status } : {}),
     ...(typeof options.tag === 'string' ? { tag: options.tag } : {}),
@@ -251,14 +243,20 @@ function itemListInput(options: Record<string, string | string[]>): ItemListInpu
     offset: Number(options.offset ?? 0),
   };
 }
-
+function targetRef(value: string): ActorRef {
+  const match = /^(human|agent):(.+)$/.exec(value);
+  if (match) return { kind: match[1] as 'human' | 'agent', id: match[2]! };
+  if (value.includes(':'))
+    throw new SynomemError('INVALID_INPUT', 'Use human:<handle> or agent:<handle>.');
+  return { kind: 'agent', id: value };
+}
 function showRecord(record: KudosRecord): string {
   const event = record.event;
   const evidence = event.evidence?.map((item) => `  - ${item.kind}: ${item.value}`).join('\n');
   return [
     event.title,
     `ID: ${event.id}`,
-    `Recipient: ${event.recipientDisplayName} (${event.recipientAgentId})`,
+    `Recipient: ${event.recipientDisplayName} (${event.recipient?.id})`,
     `From: ${event.actor.displayName ?? event.actor.id} (${event.actor.kind}:${event.actor.id})`,
     `Date: ${event.createdAt}`,
     `Visibility: ${event.visibility}`,
@@ -274,11 +272,9 @@ function showRecord(record: KudosRecord): string {
     .filter((value) => value !== undefined)
     .join('\n');
 }
-
 function output(io: CliIo, json: boolean, value: unknown, human: string): void {
   io.stdout(json ? `${JSON.stringify(value, null, 2)}\n` : `${human}\n`);
 }
-
 function addListOptions(command: Command): Command {
   return command
     .option('--recipient <agent>')
@@ -297,10 +293,9 @@ function addListOptions(command: Command): Command {
     .option('--cursor <cursor>', 'opaque cursor returned by the previous page')
     .option('--offset <number>', 'pagination offset', '0');
 }
-
 function listInput(options: Record<string, string>): KudosListInput {
   return {
-    ...(options.recipient ? { recipientAgentId: options.recipient } : {}),
+    ...(options.recipient ? { recipient: targetRef(options.recipient) } : {}),
     ...(options.author ? { actorId: options.author } : {}),
     ...(options.authorKind ? { actorKind: options.authorKind as KudosListInput['actorKind'] } : {}),
     ...(options.tag ? { tag: options.tag } : {}),
@@ -318,11 +313,9 @@ function listInput(options: Record<string, string>): KudosListInput {
     offset: Number(options.offset),
   };
 }
-
 function describeEffective(context: EffectiveContext): string {
   return `${context.actor.displayName ?? context.actor.id} (${context.actor.kind}:${context.actor.id}) in ${context.workspaceId}`;
 }
-
 interface Globals {
   home: string;
   explicitHome?: string;
@@ -330,7 +323,6 @@ interface Globals {
   profile?: string;
   preset?: string;
 }
-
 export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies = {}): Command {
   const env = dependencies.env ?? process.env;
   const cwd = dependencies.cwd ?? process.cwd();
@@ -340,7 +332,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
   const oauthLogin = dependencies.oauthLogin ?? loginWithOAuth;
   const storesFor = dependencies.credentialStores ?? defaultCredentialStores;
   const profileStoreFor = dependencies.profileStore ?? ((home: string) => new ProfileStore(home));
-
   const globals = (command: Command): Globals => {
     const options = command.optsWithGlobals<{
       home?: string;
@@ -356,7 +347,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       ...(options.preset ? { preset: options.preset } : {}),
     };
   };
-
   const resolverDeps = (home: string): ResolverDependencies => ({
     stores: storesFor(home),
     env,
@@ -368,7 +358,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       ? { createLocalResolver: dependencies.createLocalResolver }
       : {}),
   });
-
   const selectionFor = (global: Globals, config: ProfilesConfig) =>
     resolveSelection(config, {
       ...(global.profile ? { profile: global.profile } : {}),
@@ -377,7 +366,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       cwd,
       home: global.home,
     });
-
   /**
    * Runs a domain command as the selected profile's single context. Every
    * acting identity comes from here — there is no per-command actor flag.
@@ -413,7 +401,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       await resolver.close?.();
     }
   };
-
   /**
    * Store administration: agent management, rebuild, backup, export, doctor.
    *
@@ -442,14 +429,13 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     }
     const storeHome =
       profile && isLocalProfile(profile) ? (profile.home ?? global.home) : global.home;
-    const client = await openLocalService(storeHome, LOCAL_OPERATOR);
+    const client = await openLocalOwnerService(storeHome);
     try {
       return await operation(client, undefined, storeHome);
     } finally {
       await client.close();
     }
   };
-
   const program = new Command();
   cliExitCodes.set(program, 0);
   program
@@ -462,9 +448,69 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .option('--json', 'emit stable machine-readable JSON', false)
     .showSuggestionAfterError()
     .configureOutput({ writeOut: io.stdout, writeErr: io.stderr });
-
+  const humanCommand = program.command('human').description('Local human identities');
+  humanCommand
+    .command('register <handle>')
+    .requiredOption('--name <display-name>')
+    .action(async (handle: string, options: { name: string }, command: Command) => {
+      await withManagement(command, async (service) => {
+        const human = await service.actors.registerHuman({
+          id: handle,
+          handle,
+          displayName: options.name,
+        });
+        output(
+          io,
+          globals(command).json,
+          human,
+          `Registered ${human.displayName} (human:${human.handle}).`,
+        );
+      });
+    });
+  program
+    .command('actors')
+    .description('Search addressable humans and agents')
+    .option('--query <text>', 'Search name, handle or ID')
+    .option('--kind <kind>', 'human or agent')
+    .option('--cursor <cursor>', 'Signed continuation cursor')
+    .option('--limit <number>', 'Maximum actors', Number, 20)
+    .action(
+      async (
+        options: { query?: string; kind?: 'human' | 'agent'; cursor?: string; limit: number },
+        command: Command,
+      ) => {
+        await withProfile(command, async (service) => {
+          const page = await service.actors.list(options);
+          output(
+            io,
+            globals(command).json,
+            page,
+            page.items
+              .map((actor) => `${actor.kind}:${actor.handle} — ${actor.displayName}`)
+              .join('\n') + (page.nextCursor ? `\nNext cursor: ${page.nextCursor}` : ''),
+          );
+        });
+      },
+    );
+  program
+    .command('actor-profile <target>')
+    .description('Visible authored records and separate kudos/useful counts')
+    .option('--after <cursor>', 'Continue authored record page')
+    .option('--limit <number>', 'Maximum records', Number, 20)
+    .action(
+      async (target: string, options: { after?: string; limit: number }, command: Command) => {
+        await withProfile(command, async (service) => {
+          const profile = await service.actors.profile({ target: targetRef(target), ...options });
+          output(
+            io,
+            globals(command).json,
+            profile,
+            `${profile.actor.displayName}: ${profile.counts.kudosReceived} kudos, ${profile.counts.usefulReceived} useful reactions`,
+          );
+        });
+      },
+    );
   /* ------------------------------------------------------------ setup */
-
   program
     .command('setup')
     .description('Set up a local store with its first agent and a matching fixed profile')
@@ -506,9 +552,8 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         const store = profileStoreFor(global.home);
         ensureLocalStore(global.home);
         const config = store.read();
-
         const existing = config.profiles[profileName];
-        const client = await openLocalService(global.home, LOCAL_OPERATOR);
+        const client = await openLocalOwnerService(global.home);
         let agent;
         let resumed = false;
         try {
@@ -556,7 +601,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         } finally {
           await client.close();
         }
-
         const actor = { kind: 'agent' as const, id: agent.id };
         const profile: LocalProfile = {
           backend: 'local',
@@ -597,13 +641,10 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         );
       },
     );
-
   /* ------------------------------------------------------------ connections */
-
   const connectionCommand = program
     .command('connection')
     .description('Hosted credentials: one per harness installation, shared by its profiles');
-
   const saveCredential = async (
     global: Globals,
     name: string,
@@ -619,11 +660,13 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     store.write(next);
     return next;
   };
-
   const verifyConnection = async (
     apiUrl: string,
     bearer: string,
-  ): Promise<{ identity: IdentityDescription; contexts: ContextSummary[] }> => {
+  ): Promise<{
+    identity: IdentityDescription;
+    contexts: ContextSummary[];
+  }> => {
     const identity = await describeIdentity({
       baseUrl: apiUrl,
       accessToken: bearer,
@@ -636,7 +679,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     });
     return { identity, contexts: listing.contexts };
   };
-
   const connectionSummary = (
     name: string,
     identity: IdentityDescription,
@@ -654,7 +696,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         ? `Next: synomem profile create <name> --connection ${name} --context <context-id>`
         : 'Authorize an agent for it on the consent screen or in the portal.',
     ].join('\n');
-
   connectionCommand
     .command('login')
     .description('Sign in through the browser (OAuth 2.1 + PKCE) and store the credential')
@@ -695,7 +736,7 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
           );
         }
         const callbackPort = Number(options.callbackPort);
-        if (!Number.isSafeInteger(callbackPort) || callbackPort < 1 || callbackPort > 65_535) {
+        if (!Number.isSafeInteger(callbackPort) || callbackPort < 1 || callbackPort > 65535) {
           throw new SynomemError('INVALID_INPUT', '--callback-port must be from 1 through 65535.');
         }
         const credential = await oauthLogin({
@@ -729,7 +770,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         );
       },
     );
-
   connectionCommand
     .command('add-key')
     .description('Store a member-owned access key (read from stdin, never an argument)')
@@ -737,7 +777,14 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .option('--api-url <url>', 'internal: alternate API origin')
     .option('--store <where>', 'keychain (default), file, or environment')
     .action(
-      async (options: { name: string; apiUrl?: string; store?: string }, command: Command) => {
+      async (
+        options: {
+          name: string;
+          apiUrl?: string;
+          store?: string;
+        },
+        command: Command,
+      ) => {
         const global = globals(command);
         const name = assertName(options.name, 'connection');
         const apiUrl = secureUrl(options.apiUrl ?? cloudApiUrl(env), 'API URL').origin;
@@ -793,7 +840,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         );
       },
     );
-
   connectionCommand
     .command('list')
     .description('List connections and the profiles using each, without secrets')
@@ -819,15 +865,12 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
           ? connections
               .map(
                 (connection) =>
-                  `${connection.name}  ${connection.kind}  ${connection.store}  ${connection.label ?? ''}\n  profiles: ${
-                    connection.profiles.join(', ') || 'none'
-                  }`,
+                  `${connection.name}  ${connection.kind}  ${connection.store}  ${connection.label ?? ''}\n  profiles: ${connection.profiles.join(', ') || 'none'}`,
               )
               .join('\n')
           : 'No connections. Run `synomem connection login --name <name>`.',
       );
     });
-
   connectionCommand
     .command('status [name]')
     .description('Check that a connection (or every connection) authenticates')
@@ -875,80 +918,93 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
               .map((result) =>
                 result.ok
                   ? `${String(result.name)}  ok  (${String(result.store)}) — ${String(result.contexts)} context(s)`
-                  : `${String(result.name)}  FAILED  ${(result.error as { message: string }).message}`,
+                  : `${String(result.name)}  FAILED  ${
+                      (
+                        result.error as {
+                          message: string;
+                        }
+                      ).message
+                    }`,
               )
               .join('\n')
           : 'No connections.',
       );
       if (failed) cliExitCodes.set(program, 4);
     });
-
   connectionCommand
     .command('remove')
     .description('Forget a connection and delete its locally stored secret')
     .requiredOption('--name <name>')
     .option('--force', 'also remove the profiles that use it', false)
-    .action(async (options: { name: string; force: boolean }, command: Command) => {
-      const global = globals(command);
-      const store = profileStoreFor(global.home);
-      const config = store.read();
-      const entry = config.credentials[options.name];
-      if (!entry) throw new SynomemError('CONFIG_INVALID', `Unknown connection "${options.name}".`);
-      const dependents = Object.entries(config.profiles)
-        .filter(([, profile]) => !isLocalProfile(profile) && profile.credentialRef === options.name)
-        .map(([profileName]) => profileName);
-      if (dependents.length && !options.force) {
-        throw new SynomemError(
-          'INVALID_INPUT',
-          `Profiles ${dependents.join(', ')} use connection ${options.name}. Remove them first, or pass --force to remove them too.`,
-        );
-      }
-      if (entry.store !== 'environment') {
-        await storeFor(storesFor(global.home), entry).delete(entry.secretRef!);
-      }
-      const profiles = Object.fromEntries(
-        Object.entries(config.profiles).filter(
-          ([profileName]) => !dependents.includes(profileName),
-        ),
-      );
-      const harnessPresets = Object.fromEntries(
-        Object.entries(config.harnessPresets)
-          .map(
-            ([preset, members]) =>
-              [preset, members.filter((member) => !dependents.includes(member))] as const,
+    .action(
+      async (
+        options: {
+          name: string;
+          force: boolean;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const store = profileStoreFor(global.home);
+        const config = store.read();
+        const entry = config.credentials[options.name];
+        if (!entry)
+          throw new SynomemError('CONFIG_INVALID', `Unknown connection "${options.name}".`);
+        const dependents = Object.entries(config.profiles)
+          .filter(
+            ([, profile]) => !isLocalProfile(profile) && profile.credentialRef === options.name,
           )
-          .filter(([, members]) => members.length > 0),
-      );
-      const credentials = Object.fromEntries(
-        Object.entries(config.credentials).filter(([name]) => name !== options.name),
-      );
-      store.write({
-        ...config,
-        credentials,
-        profiles,
-        harnessPresets,
-        ...(config.defaultProfile && dependents.includes(config.defaultProfile)
-          ? { defaultProfile: undefined }
-          : {}),
-      });
-      output(
-        io,
-        global.json,
-        { removed: options.name, profilesRemoved: dependents },
-        [
-          `Removed connection ${options.name} and its local secret.`,
-          ...(dependents.length ? [`Also removed profiles: ${dependents.join(', ')}.`] : []),
-          'The server-side authorization still exists: revoke it in the portal (Connections) to stop it everywhere.',
-        ].join('\n'),
-      );
-    });
-
+          .map(([profileName]) => profileName);
+        if (dependents.length && !options.force) {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            `Profiles ${dependents.join(', ')} use connection ${options.name}. Remove them first, or pass --force to remove them too.`,
+          );
+        }
+        if (entry.store !== 'environment') {
+          await storeFor(storesFor(global.home), entry).delete(entry.secretRef!);
+        }
+        const profiles = Object.fromEntries(
+          Object.entries(config.profiles).filter(
+            ([profileName]) => !dependents.includes(profileName),
+          ),
+        );
+        const harnessPresets = Object.fromEntries(
+          Object.entries(config.harnessPresets)
+            .map(
+              ([preset, members]) =>
+                [preset, members.filter((member) => !dependents.includes(member))] as const,
+            )
+            .filter(([, members]) => members.length > 0),
+        );
+        const credentials = Object.fromEntries(
+          Object.entries(config.credentials).filter(([name]) => name !== options.name),
+        );
+        store.write({
+          ...config,
+          credentials,
+          profiles,
+          harnessPresets,
+          ...(config.defaultProfile && dependents.includes(config.defaultProfile)
+            ? { defaultProfile: undefined }
+            : {}),
+        });
+        output(
+          io,
+          global.json,
+          { removed: options.name, profilesRemoved: dependents },
+          [
+            `Removed connection ${options.name} and its local secret.`,
+            ...(dependents.length ? [`Also removed profiles: ${dependents.join(', ')}.`] : []),
+            'The server-side authorization still exists: revoke it in the portal (Connections) to stop it everywhere.',
+          ].join('\n'),
+        );
+      },
+    );
   /* ------------------------------------------------------------ profiles */
-
   const profileCommand = program
     .command('profile')
     .description('Named identities: one stable context through one connection or local store');
-
   profileCommand
     .command('create <name>')
     .description('Create a profile for a context this connection may already use')
@@ -956,7 +1012,8 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .option('--context <context-id>', 'exact context id (see `connection status`)')
     .option('--agent <handle-or-id>', 'narrow by agent handle, id or display name')
     .option('--workspace <name-or-id>', 'narrow by workspace name or id')
-    .option('--local', 'a local-store profile for an existing local agent', false)
+    .option('--human <handle-or-id>', 'local registered human identity')
+    .option('--local', 'a local-store profile for an existing human or agent', false)
     .option('--store-home <path>', 'local store home (default: the Synomem home)')
     .option('--default', 'make this the default profile', false)
     .action(
@@ -966,6 +1023,7 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
           connection?: string;
           context?: string;
           agent?: string;
+          human?: string;
           workspace?: string;
           local: boolean;
           storeHome?: string;
@@ -983,37 +1041,41 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
             `Profile ${name} already exists. Remove it first to change what it points at.`,
           );
         }
-
         if (options.local) {
-          if (!options.agent)
+          if ((!options.agent && !options.human) || (options.agent && options.human))
             throw new SynomemError(
               'INVALID_INPUT',
-              'A local profile needs --agent <handle-or-id>.',
+              'A local profile needs exactly one of --human or --agent.',
             );
           const storeHome = options.storeHome ? resolve(options.storeHome) : global.home;
-          const client = await openLocalService(storeHome, LOCAL_OPERATOR);
+          const client = await openLocalOwnerService(storeHome);
           let agent;
           try {
-            const resolution = await client.agents.resolve(options.agent);
-            if (!resolution.match) {
-              throw new SynomemError(
-                resolution.candidates.length ? 'CONTEXT_AMBIGUOUS' : 'AGENT_NOT_FOUND',
-                resolution.candidates.length
-                  ? `"${options.agent}" matches several agents: ${resolution.candidates.map((c) => `${c.handle} (${c.id})`).join(', ')}.`
-                  : `No local agent answers to "${options.agent}". Profiles never create agents: run \`synomem agent create\` first.`,
-              );
+            if (options.human) {
+              agent = await client.actors.get({ kind: 'human', id: options.human });
+            } else {
+              const resolution = await client.agents.resolve(options.agent!);
+              if (!resolution.match) {
+                throw new SynomemError(
+                  resolution.candidates.length ? 'CONTEXT_AMBIGUOUS' : 'AGENT_NOT_FOUND',
+                  resolution.candidates.length
+                    ? `"${options.agent}" matches several agents: ${resolution.candidates.map((c) => `${c.handle} (${c.id})`).join(', ')}.`
+                    : `No local agent answers to "${options.agent}". Profiles never create agents: run \`synomem agent create\` first.`,
+                );
+              }
+              agent = resolution.match;
             }
-            agent = resolution.match;
           } finally {
             await client.close();
           }
           const profile: LocalProfile = {
             backend: 'local',
+            actorKind: options.human ? 'human' : 'agent',
             ...(storeHome !== global.home ? { home: storeHome } : {}),
             actorId: agent.id,
             actorName: agent.displayName,
             contextId: localContextId(storeHome, {
-              kind: 'agent',
+              kind: options.human ? 'human' : 'agent',
               id: agent.id,
             }),
           };
@@ -1030,7 +1092,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
           );
           return;
         }
-
         if (!options.connection) {
           throw new SynomemError(
             'INVALID_INPUT',
@@ -1128,7 +1189,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         );
       },
     );
-
   profileCommand
     .command('list')
     .description('List profiles and presets')
@@ -1163,7 +1223,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
           : 'No profiles. Run `synomem setup --backend local`, or `synomem connection login` then `synomem profile create`.',
       );
     });
-
   profileCommand
     .command('show <name>')
     .description('Show one profile')
@@ -1179,49 +1238,56 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         describeProfile(name, profile),
       );
     });
-
   profileCommand
     .command('remove <name>')
     .description('Remove a profile (its connection and credential are kept)')
     .option('--force', 'also remove it from presets that use it', false)
-    .action((name: string, options: { force: boolean }, command: Command) => {
-      const global = globals(command);
-      const store = profileStoreFor(global.home);
-      const config = store.read();
-      if (!config.profiles[name])
-        throw new SynomemError('CONFIG_INVALID', `Unknown profile "${name}".`);
-      const presets = Object.entries(config.harnessPresets)
-        .filter(([, members]) => members.includes(name))
-        .map(([preset]) => preset);
-      if (presets.length && !options.force) {
-        throw new SynomemError(
-          'INVALID_INPUT',
-          `Presets ${presets.join(', ')} use profile ${name}. Pass --force to remove it from them too.`,
+    .action(
+      (
+        name: string,
+        options: {
+          force: boolean;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const store = profileStoreFor(global.home);
+        const config = store.read();
+        if (!config.profiles[name])
+          throw new SynomemError('CONFIG_INVALID', `Unknown profile "${name}".`);
+        const presets = Object.entries(config.harnessPresets)
+          .filter(([, members]) => members.includes(name))
+          .map(([preset]) => preset);
+        if (presets.length && !options.force) {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            `Presets ${presets.join(', ')} use profile ${name}. Pass --force to remove it from them too.`,
+          );
+        }
+        const profiles = Object.fromEntries(
+          Object.entries(config.profiles).filter(([profileName]) => profileName !== name),
         );
-      }
-      const profiles = Object.fromEntries(
-        Object.entries(config.profiles).filter(([profileName]) => profileName !== name),
-      );
-      store.write({
-        ...config,
-        profiles,
-        harnessPresets: Object.fromEntries(
-          Object.entries(config.harnessPresets)
-            .map(
-              ([preset, members]) => [preset, members.filter((member) => member !== name)] as const,
-            )
-            .filter(([, members]) => members.length > 0),
-        ),
-        ...(config.defaultProfile === name ? { defaultProfile: undefined } : {}),
-      });
-      output(
-        io,
-        global.json,
-        { removed: name },
-        `Removed profile ${name}. Its connection and credential were kept.`,
-      );
-    });
-
+        store.write({
+          ...config,
+          profiles,
+          harnessPresets: Object.fromEntries(
+            Object.entries(config.harnessPresets)
+              .map(
+                ([preset, members]) =>
+                  [preset, members.filter((member) => member !== name)] as const,
+              )
+              .filter(([, members]) => members.length > 0),
+          ),
+          ...(config.defaultProfile === name ? { defaultProfile: undefined } : {}),
+        });
+        output(
+          io,
+          global.json,
+          { removed: name },
+          `Removed profile ${name}. Its connection and credential were kept.`,
+        );
+      },
+    );
   profileCommand
     .command('default <name>')
     .description('Make a profile the default when nothing else selects one')
@@ -1234,7 +1300,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       store.write({ ...config, defaultProfile: name });
       output(io, global.json, { defaultProfile: name }, `Default profile: ${name}.`);
     });
-
   profileCommand
     .command('use <name>')
     .description('Bind this directory to a profile (writes .synomem/project.json)')
@@ -1251,11 +1316,9 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         `Wrote ${path}\n\nCommands and MCP servers started here now act as profile ${name} unless --profile or SYNOMEM_PROFILE says otherwise.`,
       );
     });
-
   const presetCommand = program
     .command('preset')
     .description('Several profiles served by one explicit-context MCP server');
-
   presetCommand
     .command('create <name> <profiles...>')
     .description('Create a preset from existing profiles')
@@ -1281,7 +1344,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         `Created preset ${name}: ${members.join(', ')}.\n\nStart it with:\n  synomem mcp --preset ${name} --contexts explicit`,
       );
     });
-
   presetCommand.command('list').action((_options, command: Command) => {
     const global = globals(command);
     const config = profileStoreFor(global.home).read();
@@ -1294,7 +1356,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         .join('\n') || 'No presets.',
     );
   });
-
   presetCommand.command('remove <name>').action((name: string, _options, command: Command) => {
     const global = globals(command);
     const store = profileStoreFor(global.home);
@@ -1307,9 +1368,7 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     store.write({ ...config, harnessPresets });
     output(io, global.json, { removed: name }, `Removed preset ${name}.`);
   });
-
   /* ------------------------------------------------------------ identity */
-
   program
     .command('whoami')
     .description('Show the selected profile, its effective context, and its credential source')
@@ -1373,13 +1432,10 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         await resolver.close?.();
       }
     });
-
   /* ------------------------------------------------------------ local stores */
-
   const workspaceCommand = program
     .command('workspace')
     .description('Local stores on this machine, each a separate SQLite database');
-
   workspaceCommand
     .command('list')
     .description('List the local stores on this machine')
@@ -1398,7 +1454,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
           .join('\n') || 'No local stores.',
       );
     });
-
   workspaceCommand
     .command('create <name>')
     .description('Create a local store (then `profile create --local --store-home <path>`)')
@@ -1411,11 +1466,8 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       ensureLocalStore(home);
       output(io, global.json, { name, home }, `Created local store ${name} at ${home}.`);
     });
-
   /* ------------------------------------------------------------ remote import */
-
   const remoteCommand = program.command('remote').description('Hosted workspace administration');
-
   remoteCommand
     .command('import')
     .description(
@@ -1426,7 +1478,11 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .option('--confirm <plan-id>', 'commit the exact bundle authorized by a preview')
     .action(
       async (
-        options: { fromHome: string; preview?: boolean; confirm?: string },
+        options: {
+          fromHome: string;
+          preview?: boolean;
+          confirm?: string;
+        },
         command: Command,
       ) => {
         const global = globals(command);
@@ -1492,91 +1548,97 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         output(io, global.json, result, human);
       },
     );
-
   /* ------------------------------------------------------------ reset */
-
   program
     .command('reset')
     .description('Remove Synomem configuration, the local database, profiles and stored secrets')
     .option('--integrations', 'also remove installed skills', false)
     .option('--yes', 'apply the displayed plan', false)
-    .action(async (options: { integrations: boolean; yes: boolean }, command: Command) => {
-      const global = globals(command);
-      const home = global.home;
-      const store = profileStoreFor(home);
-      const config = existsSync(store.path) ? store.read() : undefined;
-      const secrets = Object.entries(config?.credentials ?? {})
-        .filter(([, entry]) => entry.store !== 'environment')
-        .map(([name, entry]) => ({ name, entry }));
-      // Every target is an exact path; no recursive delete is derived from a
-      // variable that might be empty.
-      const targets = [
-        join(home, 'config.json'),
-        join(home, 'profiles.json'),
-        join(home, 'synomem.sqlite3'),
-        join(home, 'synomem.sqlite3-wal'),
-        join(home, 'synomem.sqlite3-shm'),
-        ...secrets
-          .filter(({ entry }) => entry.store === 'file')
-          .map(({ entry }) => join(home, 'credentials', `${entry.secretRef}.json`)),
-      ].filter((path) => existsSync(path));
-      const keychain = secrets
-        .filter(({ entry }) => entry.store === 'keychain')
-        .map(({ name }) => name);
-      const skillPlan = options.integrations ? uninstallSkill({ apply: false }) : undefined;
-      const skillTargets =
-        skillPlan?.locations
-          .filter((location) => location.state === 'current' || location.state === 'stale')
-          .map((location) => location.target) ?? [];
-
-      if (!options.yes) {
+    .action(
+      async (
+        options: {
+          integrations: boolean;
+          yes: boolean;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const home = global.home;
+        const store = profileStoreFor(home);
+        const config = existsSync(store.path) ? store.read() : undefined;
+        const secrets = Object.entries(config?.credentials ?? {})
+          .filter(([, entry]) => entry.store !== 'environment')
+          .map(([name, entry]) => ({ name, entry }));
+        // Every target is an exact path; no recursive delete is derived from a
+        // variable that might be empty.
+        const targets = [
+          join(home, 'config.json'),
+          join(home, 'profiles.json'),
+          join(home, 'synomem.sqlite3'),
+          join(home, 'synomem.sqlite3-wal'),
+          join(home, 'synomem.sqlite3-shm'),
+          ...secrets
+            .filter(({ entry }) => entry.store === 'file')
+            .map(({ entry }) => join(home, 'credentials', `${entry.secretRef}.json`)),
+        ].filter((path) => existsSync(path));
+        const keychain = secrets
+          .filter(({ entry }) => entry.store === 'keychain')
+          .map(({ name }) => name);
+        const skillPlan = options.integrations ? uninstallSkill({ apply: false }) : undefined;
+        const skillTargets =
+          skillPlan?.locations
+            .filter((location) => location.state === 'current' || location.state === 'stale')
+            .map((location) => location.target) ?? [];
+        if (!options.yes) {
+          output(
+            io,
+            global.json,
+            { targets, keychain, skillTargets, applied: false },
+            [
+              'This will remove:',
+              ...(targets.length ? targets.map((path) => `  ${path}`) : ['  (no files found)']),
+              ...(keychain.length
+                ? [
+                    '',
+                    'And the keychain secrets of connections:',
+                    ...keychain.map((name) => `  ${name}`),
+                  ]
+                : []),
+              ...(skillTargets.length
+                ? [
+                    '',
+                    'And these Synomem-owned skills:',
+                    ...skillTargets.map((path) => `  ${path}`),
+                  ]
+                : []),
+              '',
+              'Server-side authorizations are not revoked; do that in the portal.',
+              'Run with --yes to continue.',
+            ].join('\n'),
+          );
+          return;
+        }
+        const stores = storesFor(home);
+        for (const { entry } of secrets.filter(({ entry }) => entry.store === 'keychain')) {
+          await stores.keychain.delete(entry.secretRef!).catch(() => false);
+        }
+        for (const path of targets) rmSync(path, { force: true });
+        const skillResult = options.integrations ? uninstallSkill({ apply: true }) : undefined;
         output(
           io,
           global.json,
-          { targets, keychain, skillTargets, applied: false },
+          { removed: targets, keychain, skills: skillResult?.locations ?? [] },
           [
-            'This will remove:',
-            ...(targets.length ? targets.map((path) => `  ${path}`) : ['  (no files found)']),
-            ...(keychain.length
-              ? [
-                  '',
-                  'And the keychain secrets of connections:',
-                  ...keychain.map((name) => `  ${name}`),
-                ]
-              : []),
-            ...(skillTargets.length
-              ? ['', 'And these Synomem-owned skills:', ...skillTargets.map((path) => `  ${path}`)]
-              : []),
-            '',
-            'Server-side authorizations are not revoked; do that in the portal.',
-            'Run with --yes to continue.',
+            `Removed ${targets.length} file(s)${keychain.length ? ` and ${keychain.length} keychain secret(s)` : ''}.`,
+            ...(skillResult ? [`Skill locations processed: ${skillResult.locations.length}.`] : []),
           ].join('\n'),
         );
-        return;
-      }
-      const stores = storesFor(home);
-      for (const { entry } of secrets.filter(({ entry }) => entry.store === 'keychain')) {
-        await stores.keychain.delete(entry.secretRef!).catch(() => false);
-      }
-      for (const path of targets) rmSync(path, { force: true });
-      const skillResult = options.integrations ? uninstallSkill({ apply: true }) : undefined;
-      output(
-        io,
-        global.json,
-        { removed: targets, keychain, skills: skillResult?.locations ?? [] },
-        [
-          `Removed ${targets.length} file(s)${keychain.length ? ` and ${keychain.length} keychain secret(s)` : ''}.`,
-          ...(skillResult ? [`Skill locations processed: ${skillResult.locations.length}.`] : []),
-        ].join('\n'),
-      );
-    });
-
+      },
+    );
   /* ------------------------------------------------------------ agents */
-
   const agentCommand = program
     .command('agent')
     .description('Create and inspect stable agent identities');
-
   agentCommand
     .command('create <handle>')
     .description('Create an agent. The canonical ID is generated, not chosen.')
@@ -1587,7 +1649,12 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .action(
       async (
         handle: string,
-        options: { name: string; alias: string[]; description?: string; createProfile: boolean },
+        options: {
+          name: string;
+          alias: string[];
+          description?: string;
+          createProfile: boolean;
+        },
         command: Command,
       ) => {
         const global = globals(command);
@@ -1635,17 +1702,13 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
           io,
           global.json,
           { ...agent, ...(profileName ? { profileCreated: profileName } : {}) },
-          `Created ${agent.displayName}\n\nHandle:   ${agent.handle}\nAgent ID: ${agent.id}${
-            profileName ? `\nProfile:  ${profileName} (synomem mcp --profile ${profileName})` : ''
-          }`,
+          `Created ${agent.displayName}\n\nHandle:   ${agent.handle}\nAgent ID: ${agent.id}${profileName ? `\nProfile:  ${profileName} (synomem mcp --profile ${profileName})` : ''}`,
         );
       },
     );
-
   const aliasCommand = agentCommand
     .command('alias')
     .description('Add or remove discovery aliases without replacing the set');
-
   aliasCommand
     .command('add <agent> <alias...>')
     .description('Add aliases, keeping the ones already there')
@@ -1656,7 +1719,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       );
       output(io, global.json, profile, `Aliases: ${(profile.aliases ?? []).join(', ') || 'none'}`);
     });
-
   aliasCommand
     .command('remove <agent> <alias...>')
     .description('Remove aliases, keeping the rest')
@@ -1667,7 +1729,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       );
       output(io, global.json, profile, `Aliases: ${(profile.aliases ?? []).join(', ') || 'none'}`);
     });
-
   agentCommand
     .command('rename <agent> <handle>')
     .description('Change an agent handle. Its canonical ID never changes.')
@@ -1683,7 +1744,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         `Handle:   ${profile.handle}\nAgent ID: ${profile.id} (unchanged)`,
       );
     });
-
   agentCommand
     .command('archive <agent>')
     .description('Stop an agent acting, keeping its records and history')
@@ -1692,7 +1752,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       const profile = await withManagement(command, (service) => service.agents.archive(agent));
       output(io, global.json, profile, `Archived ${profile.handle} (${profile.id})`);
     });
-
   agentCommand
     .command('restore <agent>')
     .description('Let an archived agent act again')
@@ -1701,7 +1760,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       const profile = await withManagement(command, (service) => service.agents.restore(agent));
       output(io, global.json, profile, `Restored ${profile.handle} (${profile.id})`);
     });
-
   agentCommand
     .command('list')
     .description('List known agent identities')
@@ -1712,15 +1770,12 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         ? agents
             .map(
               (profile) =>
-                `${profile.handle}  ${profile.displayName}${profile.status === 'archived' ? '  [archived]' : ''}${
-                  profile.aliases?.length ? `  aliases: ${profile.aliases.join(', ')}` : ''
-                }\n  ${profile.id}`,
+                `${profile.handle}  ${profile.displayName}${profile.status === 'archived' ? '  [archived]' : ''}${profile.aliases?.length ? `  aliases: ${profile.aliases.join(', ')}` : ''}\n  ${profile.id}`,
             )
             .join('\n')
         : 'No agents configured.';
       output(io, global.json, { agents }, human);
     });
-
   agentCommand
     .command('show <id>')
     .description('Show one agent profile, resolving aliases')
@@ -1734,7 +1789,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         `${profile.displayName}\n\nHandle:   ${profile.handle}\nAgent ID: ${profile.id}\nStatus:   ${profile.status}\n\n${profile.description ?? 'No description.'}`,
       );
     });
-
   agentCommand
     .command('update <id>')
     .description('Update an agent profile without rewriting history')
@@ -1745,7 +1799,12 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .action(
       async (
         id: string,
-        options: { name?: string; alias: string[]; clearAliases: boolean; description?: string },
+        options: {
+          name?: string;
+          alias: string[];
+          clearAliases: boolean;
+          description?: string;
+        },
         command: Command,
       ) => {
         const global = globals(command);
@@ -1760,7 +1819,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         output(io, global.json, profile, `Updated ${profile.displayName} (${profile.id})`);
       },
     );
-
   agentCommand
     .command('resolve <name>')
     .description('Resolve a name or alias to one agent, or list the candidates')
@@ -1776,7 +1834,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
           : `No agent answers to "${resolution.query}".`;
       output(io, global.json, resolution, human);
     });
-
   agentCommand
     .command('directory')
     .description('List agents with their runtime bindings')
@@ -1801,9 +1858,7 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         : 'No agents configured.';
       output(io, global.json, { entries }, human);
     });
-
   const runtimeCommand = agentCommand.command('runtime').description('Record where an agent runs');
-
   runtimeCommand
     .command('bind <agent>')
     .description('Bind an agent to a runtime')
@@ -1812,7 +1867,10 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .action(
       async (
         agent: string,
-        options: { runtime: string; runtimeProfile?: string },
+        options: {
+          runtime: string;
+          runtimeProfile?: string;
+        },
         command: Command,
       ) => {
         const global = globals(command);
@@ -1831,7 +1889,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         );
       },
     );
-
   runtimeCommand
     .command('list [agent]')
     .description('List runtime bindings for one agent, or for every agent')
@@ -1862,7 +1919,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
           : 'No agent in this workspace has a runtime binding.';
       output(io, global.json, { agents: result }, human);
     });
-
   runtimeCommand
     .command('unbind <binding-id>')
     .description('Remove a runtime binding')
@@ -1878,52 +1934,60 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         removed ? `Removed binding ${bindingId}.` : `No binding ${bindingId}.`,
       );
     });
-
   /* ------------------------------------------------------------ topics */
-
   const topicCommand = program
     .command('topic')
     .description('Create and manage topics — a stable, reusable subject any record can carry');
-
   topicCommand
     .command('create <display-name>')
     .description('Create a topic. Any actor may create one.')
     .option('--alias <name>', 'alias (repeatable)', collect, [])
-    .action(async (displayName: string, options: { alias: string[] }, command: Command) => {
-      const global = globals(command);
-      const topic = await withProfile(command, (service) =>
-        service.topics.create({
-          displayName,
-          ...(options.alias.length ? { aliases: options.alias } : {}),
-        }),
-      );
-      output(io, global.json, topic, `Created ${topic.displayName}\n\nTopic ID: ${topic.id}`);
-    });
-
+    .action(
+      async (
+        displayName: string,
+        options: {
+          alias: string[];
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const topic = await withProfile(command, (service) =>
+          service.topics.create({
+            displayName,
+            ...(options.alias.length ? { aliases: options.alias } : {}),
+          }),
+        );
+        output(io, global.json, topic, `Created ${topic.displayName}\n\nTopic ID: ${topic.id}`);
+      },
+    );
   topicCommand
     .command('list')
     .description('List known topics')
     .option('--status <status>', 'active or archived')
-    .action(async (options: { status?: string }, command: Command) => {
-      const global = globals(command);
-      const topics = await withProfile(command, (service) =>
-        service.topics.list(
-          options.status ? { status: options.status as 'active' | 'archived' } : {},
-        ),
-      );
-      const human = topics.length
-        ? topics
-            .map(
-              (topic) =>
-                `${topic.displayName}${topic.status === 'archived' ? '  [archived]' : ''}${
-                  topic.aliases?.length ? `  aliases: ${topic.aliases.join(', ')}` : ''
-                }\n  ${topic.id}`,
-            )
-            .join('\n')
-        : 'No topics yet.';
-      output(io, global.json, { topics }, human);
-    });
-
+    .action(
+      async (
+        options: {
+          status?: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const topics = await withProfile(command, (service) =>
+          service.topics.list(
+            options.status ? { status: options.status as 'active' | 'archived' } : {},
+          ),
+        );
+        const human = topics.length
+          ? topics
+              .map(
+                (topic) =>
+                  `${topic.displayName}${topic.status === 'archived' ? '  [archived]' : ''}${topic.aliases?.length ? `  aliases: ${topic.aliases.join(', ')}` : ''}\n  ${topic.id}`,
+              )
+              .join('\n')
+          : 'No topics yet.';
+        output(io, global.json, { topics }, human);
+      },
+    );
   topicCommand
     .command('show <id>')
     .description('Show one topic, resolving aliases')
@@ -1937,7 +2001,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         `${topic.displayName}\n\nTopic ID: ${topic.id}\nStatus:   ${topic.status}\nAliases:  ${topic.aliases?.join(', ') ?? 'none'}`,
       );
     });
-
   topicCommand
     .command('resolve <name>')
     .description('Resolve a name or alias to one topic, or list the candidates')
@@ -1953,7 +2016,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
           : `No topic answers to "${resolution.query}".`;
       output(io, global.json, resolution, human);
     });
-
   topicCommand
     .command('rename <id> <display-name>')
     .description("Change a topic's display name. Its ID never changes.")
@@ -1969,7 +2031,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         `Renamed to ${topic.displayName}\nTopic ID: ${topic.id} (unchanged)`,
       );
     });
-
   topicCommand
     .command('archive <id>')
     .description('Stop a topic being attached to new records, keeping the ones it already has')
@@ -1978,7 +2039,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       const topic = await withProfile(command, (service) => service.topics.archive(id));
       output(io, global.json, topic, `Archived ${topic.displayName} (${topic.id})`);
     });
-
   topicCommand
     .command('restore <id>')
     .description('Let an archived topic be attached to new records again')
@@ -1987,13 +2047,10 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       const topic = await withProfile(command, (service) => service.topics.restore(id));
       output(io, global.json, topic, `Restored ${topic.displayName} (${topic.id})`);
     });
-
   /* ------------------------------------------------------------ skills */
-
   const skillCommand = program
     .command('skill')
     .description('Install and maintain the packaged agent skill');
-
   skillCommand
     .command('install')
     .description('Plan or install the skill for detected agent runtimes')
@@ -2003,7 +2060,12 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .option('--link', 'symlink to the packaged skill instead of copying it', false)
     .action(
       async (
-        options: { runtime: string[]; yes: boolean; force: boolean; link: boolean },
+        options: {
+          runtime: string[];
+          yes: boolean;
+          force: boolean;
+          link: boolean;
+        },
         command: Command,
       ) => {
         const global = globals(command);
@@ -2049,40 +2111,51 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         );
       },
     );
-
   skillCommand
     .command('status')
     .description('Show installed, stale, missing, or conflicting skill copies')
     .option('--runtime <runtime>', `${skillRuntimeHelp} (repeatable)`, collect, [])
-    .action((options: { runtime: string[] }, command: Command) => {
-      const global = globals(command);
-      const result = skillStatus({
-        runtimes: skillRuntimes(options.runtime),
-        ...(global.profile ? { profile: global.profile } : {}),
-      });
-      output(io, global.json, result, formatSkillResult(result, 'status'));
-    });
-
+    .action(
+      (
+        options: {
+          runtime: string[];
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const result = skillStatus({
+          runtimes: skillRuntimes(options.runtime),
+          ...(global.profile ? { profile: global.profile } : {}),
+        });
+        output(io, global.json, result, formatSkillResult(result, 'status'));
+      },
+    );
   skillCommand
     .command('uninstall')
     .description('Plan or remove Synomem-owned skill installations')
     .option('--runtime <runtime>', `${skillRuntimeHelp} (repeatable)`, collect, [])
     .option('--yes', 'apply the displayed plan', false)
     .option('--force', 'remove a conflicting synomem directory', false)
-    .action((options: { runtime: string[]; yes: boolean; force: boolean }, command: Command) => {
-      const global = globals(command);
-      const result = uninstallSkill({
-        runtimes: skillRuntimes(options.runtime),
-        apply: options.yes,
-        force: options.force,
-      });
-      output(io, global.json, result, formatSkillResult(result, 'uninstall'));
-    });
-
+    .action(
+      (
+        options: {
+          runtime: string[];
+          yes: boolean;
+          force: boolean;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const result = uninstallSkill({
+          runtimes: skillRuntimes(options.runtime),
+          apply: options.yes,
+          force: options.force,
+        });
+        output(io, global.json, result, formatSkillResult(result, 'uninstall'));
+      },
+    );
   /* ------------------------------------------------------------ posts */
-
   const postCommand = program.command('post').description('Publish to everyone in the workspace');
-
   postCommand
     .command('create')
     .description('Publish a post the whole workspace can read')
@@ -2090,10 +2163,14 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .requiredOption('--body <body>')
     .option('--tag <tag>', 'repeatable', collect, [])
     .option('--topic <id>', 'topic ID (repeatable)', collect, [])
-    .option('--reply-to <post-id>')
     .action(
       async (
-        options: { title: string; body: string; tag: string[]; topic: string[]; replyTo?: string },
+        options: {
+          title: string;
+          body: string;
+          tag: string[];
+          topic: string[];
+        },
         command: Command,
       ) => {
         const global = globals(command);
@@ -2103,28 +2180,32 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
             body: options.body,
             ...(options.tag.length ? { tags: options.tag } : {}),
             ...(options.topic.length ? { topicIds: options.topic } : {}),
-            ...(options.replyTo ? { replyTo: options.replyTo } : {}),
           }),
         );
         output(io, global.json, result, `Published ${result.record.event.id}`);
       },
     );
-
   postCommand
     .command('list')
     .description('List posts in this workspace')
     .option('--limit <n>', 'default 10, maximum 50')
-    .action(async (options: { limit?: string }, command: Command) => {
-      const global = globals(command);
-      const page = await withProfile(command, (service) =>
-        service.posts.list(options.limit ? { limit: Number(options.limit) } : {}),
-      );
-      const human = page.items.length
-        ? page.items.map((item) => `${item.id}  ${item.title}`).join('\n')
-        : 'No posts yet.';
-      output(io, global.json, page, human);
-    });
-
+    .action(
+      async (
+        options: {
+          limit?: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const page = await withProfile(command, (service) =>
+          service.posts.list(options.limit ? { limit: Number(options.limit) } : {}),
+        );
+        const human = page.items.length
+          ? page.items.map((item) => `${item.id}  ${item.title}`).join('\n')
+          : 'No posts yet.';
+        output(io, global.json, page, human);
+      },
+    );
   postCommand
     .command('show <post-id>')
     .description('Show one post with its acknowledgements')
@@ -2143,19 +2224,29 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         `${record.title}\n\n${record.body}\n\nAcknowledged by:\n${acks}`,
       );
     });
-
   postCommand
     .command('acknowledge <post-id>')
     .description('Say you have seen a post')
     .option('--note <text>', 'optional context for the author')
-    .action(async (postId: string, options: { note?: string }, command: Command) => {
-      const global = globals(command);
-      const record = await withProfile(command, (service) =>
-        service.posts.acknowledge({ postId, ...(options.note ? { note: options.note } : {}) }),
-      );
-      output(io, global.json, record, `Acknowledged ${postId}`);
-    });
-
+    .action(
+      async (
+        postId: string,
+        options: {
+          note?: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const record = await withProfile(command, async (service) =>
+          service.posts.acknowledge({
+            expectedVersion: (await service.posts.get(postId)).lifecycleVersion!,
+            postId,
+            ...(options.note ? { note: options.note } : {}),
+          }),
+        );
+        output(io, global.json, record, `Acknowledged ${postId}`);
+      },
+    );
   postCommand
     .command('roster <post-id>')
     .description('Who has acknowledged a post, and who has not')
@@ -2177,23 +2268,31 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       }
       output(io, global.json, roster, lines.join('\n'));
     });
-
   postCommand
     .command('archive <post-id>')
     .description('Archive a post you wrote')
     .option('--reason <text>')
-    .action(async (postId: string, options: { reason?: string }, command: Command) => {
-      const global = globals(command);
-      const record = await withProfile(command, (service) =>
-        service.posts.archive({ postId, ...(options.reason ? { reason: options.reason } : {}) }),
-      );
-      output(io, global.json, record, `Archived ${postId}`);
-    });
-
+    .action(
+      async (
+        postId: string,
+        options: {
+          reason?: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const record = await withProfile(command, async (service) =>
+          service.posts.archive({
+            expectedVersion: (await service.posts.get(postId)).lifecycleVersion!,
+            postId,
+            ...(options.reason ? { reason: options.reason } : {}),
+          }),
+        );
+        output(io, global.json, record, `Archived ${postId}`);
+      },
+    );
   /* ------------------------------------------------------------ kudos */
-
   const kudosCommand = program.command('kudos').description('Give and manage agent recognition');
-
   kudosCommand
     .command('give <recipient>')
     .description('Give specific, evidence-based kudos to an agent')
@@ -2221,7 +2320,7 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         const global = globals(command);
         const result = await withProfile(command, (service) =>
           service.kudos.give({
-            recipientAgentId: recipient,
+            recipient: targetRef(recipient),
             title: options.title,
             reason: options.reason,
             visibility: options.visibility,
@@ -2240,7 +2339,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         );
       },
     );
-
   addListOptions(kudosCommand.command('list').description('List and filter kudos')).action(
     async (options: Record<string, string>, command: Command) => {
       const global = globals(command);
@@ -2255,7 +2353,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       );
     },
   );
-
   kudosCommand
     .command('show <kudos-id>')
     .description('Show one kudos item and its current state')
@@ -2264,19 +2361,29 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       const record = await withProfile(command, (service) => service.kudos.get(id));
       output(io, global.json, record, showRecord(record));
     });
-
   kudosCommand
     .command('acknowledge <kudos-id>')
     .description('Record that you (the recipient) reviewed kudos')
     .option('--note <text>')
-    .action(async (id: string, options: { note?: string }, command: Command) => {
-      const global = globals(command);
-      const record = await withProfile(command, (service) =>
-        service.kudos.acknowledge({ kudosId: id, ...(options.note ? { note: options.note } : {}) }),
-      );
-      output(io, global.json, record, `Acknowledged ${id}.`);
-    });
-
+    .action(
+      async (
+        id: string,
+        options: {
+          note?: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const record = await withProfile(command, async (service) =>
+          service.kudos.acknowledge({
+            expectedVersion: (await service.kudos.get(id)).lifecycleVersion!,
+            kudosId: id,
+            ...(options.note ? { note: options.note } : {}),
+          }),
+        );
+        output(io, global.json, record, `Acknowledged ${id}.`);
+      },
+    );
   kudosCommand
     .command('revoke <kudos-id>')
     .description('Record a revocation while preserving history')
@@ -2285,12 +2392,16 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .action(
       async (
         id: string,
-        options: { reason: string; administrative: boolean },
+        options: {
+          reason: string;
+          administrative: boolean;
+        },
         command: Command,
       ) => {
         const global = globals(command);
-        const record = await withProfile(command, (service) =>
+        const record = await withProfile(command, async (service) =>
           service.kudos.revoke({
+            expectedVersion: (await service.kudos.get(id)).lifecycleVersion!,
             kudosId: id,
             reason: options.reason,
             administrative: options.administrative,
@@ -2299,7 +2410,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         output(io, global.json, record, `Revoked ${id}; the audit trail was preserved.`);
       },
     );
-
   kudosCommand
     .command('wins [agent]')
     .description('Print the generated WINS.md path or content (local stores)')
@@ -2308,7 +2418,10 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .action(
       async (
         agentId: string | undefined,
-        options: { open: boolean; print: boolean },
+        options: {
+          open: boolean;
+          print: boolean;
+        },
         command: Command,
       ) => {
         const global = globals(command);
@@ -2355,7 +2468,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         output(io, global.json, details, options.print ? details.content.trimEnd() : details.path);
       },
     );
-
   addListOptions(
     kudosCommand.command('stats').description('Show aggregate kudos statistics'),
   ).action(async (options: Record<string, string>, command: Command) => {
@@ -2368,48 +2480,51 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       `Total: ${stats.total}\nActive: ${stats.active}\nAcknowledged: ${stats.acknowledged}\nRevoked: ${stats.revoked}`,
     );
   });
-
   /* ------------------------------------------------------------ cross-kind */
-
   program
-    .command('inbox [agent]')
-    .description("Show pending kudos, memos, and tasks (the profile's own agent by default)")
-    .option('--limit <number>', 'maximum results (default 10, maximum 50)', '10')
-    .option('--cursor <cursor>', 'opaque cursor returned by the previous page')
+    .command('inbox')
+    .description('Read notifications belonging to the profile effective actor')
+    .option('--limit <number>', 'Maximum results', '20')
+    .option('--after <cursor>', 'Signed continuation cursor')
+    .option('--view <view>', 'all, unread, action_required or default', 'default')
     .action(
       async (
-        agentId: string | undefined,
-        options: { limit: string; cursor?: string },
+        options: {
+          limit: string;
+          after?: string;
+          view: HpNotificationInput['view'];
+        },
         command: Command,
       ) => {
-        const global = globals(command);
-        const page = await withProfile(command, (service, context) => {
-          const recipient =
-            agentId ?? (context.actor.kind === 'agent' ? context.actor.id : undefined);
-          if (!recipient) {
-            throw new SynomemError(
-              'INVALID_INPUT',
-              'This profile is not an agent; name the agent whose inbox to show.',
-            );
-          }
-          return service.items.list({
-            participantAgentId: recipient,
-            pending: true,
+        const page = await withProfile(command, (service) =>
+          service.notifications.list({
             limit: Number(options.limit),
-            ...(options.cursor ? { cursor: options.cursor } : {}),
-          });
-        });
+            view: options.view,
+            ...(options.after ? { after: options.after } : {}),
+          }),
+        );
         output(
           io,
-          global.json,
+          globals(command).json,
           page,
           page.items.length
-            ? `${page.items.map(lineForItem).join('\n')}${page.hasMore ? `\nNext cursor: ${page.nextCursor}` : ''}`
+            ? page.items
+                .map(
+                  (item) =>
+                    `${item.read ? 'Read' : 'Unread'} ${item.root?.kind ?? 'record'}: ${item.root?.title ?? item.rootId} [${item.id}]`,
+                )
+                .join('\n')
             : 'Inbox is clear.',
         );
       },
     );
-
+  program
+    .command('notification-read <notification-id>')
+    .description('Mark your notification read without performing a lifecycle action')
+    .action(async (id: string, _options: object, command: Command) => {
+      await withProfile(command, (service) => service.notifications.read(id));
+      output(io, globals(command).json, { updated: true }, 'Notification marked read.');
+    });
   program
     .command('list')
     .description('List compact summaries across all record types')
@@ -2437,7 +2552,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
           : 'No items found.',
       );
     });
-
   program
     .command('changes')
     .description('List compact changes across all record types after an opaque watermark')
@@ -2445,7 +2559,14 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .option('--after <watermark>', 'watermark or change cursor from a previous response')
     .option('--limit <number>', 'maximum changes (default 20, maximum 100)', '20')
     .action(
-      async (options: { after?: string; limit: string; kind: string[] }, command: Command) => {
+      async (
+        options: {
+          after?: string;
+          limit: string;
+          kind: string[];
+        },
+        command: Command,
+      ) => {
         const global = globals(command);
         const page = await withProfile(command, (service) =>
           service.items.changes({
@@ -2465,11 +2586,8 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         output(io, global.json, page, human);
       },
     );
-
   /* ------------------------------------------------------------ memos */
-
   const memoCommand = program.command('memo').description('Send and manage durable messages');
-
   memoCommand
     .command('send <recipient>')
     .description('Send a durable one-to-one memo')
@@ -2495,7 +2613,7 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         const global = globals(command);
         const result = await withProfile(command, (service) =>
           service.memos.send({
-            recipientAgentId: recipient,
+            recipient: targetRef(recipient),
             subject: options.subject,
             body: options.body,
             visibility: options.visibility,
@@ -2512,7 +2630,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         );
       },
     );
-
   memoCommand
     .command('list')
     .description('List memos')
@@ -2522,13 +2639,18 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .option('--cursor <cursor>')
     .action(
       async (
-        options: { participant?: string; status?: string; limit: string; cursor?: string },
+        options: {
+          participant?: string;
+          status?: string;
+          limit: string;
+          cursor?: string;
+        },
         command: Command,
       ) => {
         const global = globals(command);
         const page = await withProfile(command, (service) =>
           service.memos.list({
-            ...(options.participant ? { participantAgentId: options.participant } : {}),
+            ...(options.participant ? { participant: targetRef(options.participant) } : {}),
             ...(options.status ? { status: options.status } : {}),
             limit: Number(options.limit),
             ...(options.cursor ? { cursor: options.cursor } : {}),
@@ -2537,7 +2659,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         output(io, global.json, page, page.items.map(lineForItem).join('\n') || 'No memos found.');
       },
     );
-
   memoCommand
     .command('show <memo-id>')
     .description('Show one memo')
@@ -2551,7 +2672,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         `${record.event.subject}\nID: ${record.event.id}\nStatus: ${record.status}\n\n${record.event.body}`,
       );
     });
-
   for (const operation of ['read', 'archive'] as const) {
     memoCommand
       .command(`${operation} <memo-id>`)
@@ -2561,24 +2681,30 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
           : 'Archive a memo addressed to you',
       )
       .option('--idempotency-key <key>')
-      .action(async (id: string, options: { idempotencyKey?: string }, command: Command) => {
-        const global = globals(command);
-        const record = await withProfile(command, (service) =>
-          service.memos[operation]({
-            memoId: id,
-            ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-          }),
-        );
-        output(io, global.json, record, `Memo ${id} is ${record.status}.`);
-      });
+      .action(
+        async (
+          id: string,
+          options: {
+            idempotencyKey?: string;
+          },
+          command: Command,
+        ) => {
+          const global = globals(command);
+          const record = await withProfile(command, async (service) =>
+            service.memos[operation]({
+              expectedVersion: (await service.memos.get(id)).lifecycleVersion!,
+              memoId: id,
+              ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+            }),
+          );
+          output(io, global.json, record, `Memo ${id} is ${record.status}.`);
+        },
+      );
   }
-
   /* ------------------------------------------------------------ notes */
-
   const noteCommand = program
     .command('note')
     .description('Retain and revise agent-owned knowledge');
-
   noteCommand
     .command('create')
     .description('Create an owner-private note')
@@ -2603,7 +2729,7 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         const global = globals(command);
         const result = await withProfile(command, (service) =>
           service.notes.create({
-            ...(options.owner ? { ownerAgentId: options.owner } : {}),
+            ...(options.owner ? { owner: targetRef(options.owner) } : {}),
             title: options.title,
             body: options.body,
             ...(options.tag.length ? { tags: options.tag } : {}),
@@ -2619,7 +2745,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         );
       },
     );
-
   noteCommand
     .command('list')
     .description('List notes')
@@ -2627,11 +2752,18 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .option('--status <status>')
     .option('--limit <number>', 'maximum results', '10')
     .action(
-      async (options: { owner?: string; status?: string; limit: string }, command: Command) => {
+      async (
+        options: {
+          owner?: string;
+          status?: string;
+          limit: string;
+        },
+        command: Command,
+      ) => {
         const global = globals(command);
         const page = await withProfile(command, (service) =>
           service.notes.list({
-            ...(options.owner ? { participantAgentId: options.owner } : {}),
+            ...(options.owner ? { participant: targetRef(options.owner) } : {}),
             ...(options.status ? { status: options.status } : {}),
             limit: Number(options.limit),
           }),
@@ -2639,7 +2771,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         output(io, global.json, page, page.items.map(lineForItem).join('\n') || 'No notes found.');
       },
     );
-
   noteCommand
     .command('show <note-id>')
     .description('Show one note')
@@ -2653,7 +2784,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         `${record.current.title}\nID: ${record.event.id}\nVersion: ${record.current.version}\n\n${record.current.body}`,
       );
     });
-
   noteCommand
     .command('revise <note-id>')
     .description('Revise a note (optimistic concurrency)')
@@ -2688,28 +2818,33 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         output(io, global.json, record, `Revised note ${id} to version ${record.current.version}.`);
       },
     );
-
   noteCommand
     .command('archive <note-id>')
     .description('Archive a note')
     .option('--idempotency-key <key>')
-    .action(async (id: string, options: { idempotencyKey?: string }, command: Command) => {
-      const global = globals(command);
-      const record = await withProfile(command, (service) =>
-        service.notes.archive({
-          noteId: id,
-          ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-        }),
-      );
-      output(io, global.json, record, `Archived note ${id}.`);
-    });
-
+    .action(
+      async (
+        id: string,
+        options: {
+          idempotencyKey?: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const record = await withProfile(command, async (service) =>
+          service.notes.archive({
+            expectedVersion: (await service.notes.get(id)).lifecycleVersion!,
+            noteId: id,
+            ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+          }),
+        );
+        output(io, global.json, record, `Archived note ${id}.`);
+      },
+    );
   /* ------------------------------------------------------------ todos */
-
   const todoCommand = program
     .command('todo')
     .description('Create and manage your own private reminders');
-
   todoCommand
     .command('create')
     .description('Create a private todo')
@@ -2757,32 +2892,38 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         );
       },
     );
-
   todoCommand
     .command('list')
     .description('List your todos')
     .option('--status <status>')
     .option('--limit <number>', 'maximum results', '10')
-    .action(async (options: { status?: string; limit: string }, command: Command) => {
-      const global = globals(command);
-      const page = await withProfile(command, (service) =>
-        service.todos.list({
-          ...(options.status ? { status: options.status } : {}),
-          limit: Number(options.limit),
-        }),
-      );
-      output(
-        io,
-        global.json,
-        page,
-        page.items.length
-          ? page.items
-              .map((item) => `${item.id}  ${item.status.padEnd(9)}  ${item.title}`)
-              .join('\n')
-          : 'No todos.',
-      );
-    });
-
+    .action(
+      async (
+        options: {
+          status?: string;
+          limit: string;
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const page = await withProfile(command, (service) =>
+          service.todos.list({
+            ...(options.status ? { status: options.status } : {}),
+            limit: Number(options.limit),
+          }),
+        );
+        output(
+          io,
+          global.json,
+          page,
+          page.items.length
+            ? page.items
+                .map((item) => `${item.id}  ${item.status.padEnd(9)}  ${item.title}`)
+                .join('\n')
+            : 'No todos.',
+        );
+      },
+    );
   todoCommand
     .command('show <todo-id>')
     .description('Show one of your todos')
@@ -2796,7 +2937,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         `${record.current.title}\nStatus: ${record.status}\nPriority: ${record.current.priority}\nVersion: ${record.current.version}${record.current.details ? `\n\n${record.current.details}` : ''}`,
       );
     });
-
   for (const operation of ['complete', 'reopen', 'cancel', 'archive'] as const) {
     todoCommand
       .command(`${operation} <todo-id>`)
@@ -2807,37 +2947,48 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       .action(
         async (
           id: string,
-          options: { note?: string; reason?: string; idempotencyKey?: string },
+          options: {
+            note?: string;
+            reason?: string;
+            idempotencyKey?: string;
+          },
           command: Command,
         ) => {
           const global = globals(command);
           const key = options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {};
-          const record = await withProfile(command, (service) =>
+          const record = await withProfile(command, async (service) =>
             operation === 'complete'
               ? service.todos.complete({
+                  expectedVersion: (await service.todos.get(id)).lifecycleVersion!,
                   todoId: id,
                   ...(options.note ? { note: options.note } : {}),
                   ...key,
                 })
               : operation === 'cancel'
                 ? service.todos.cancel({
+                    expectedVersion: (await service.todos.get(id)).lifecycleVersion!,
                     todoId: id,
                     ...(options.reason ? { reason: options.reason } : {}),
                     ...key,
                   })
                 : operation === 'archive'
-                  ? service.todos.archive({ todoId: id, ...key })
-                  : service.todos.reopen({ todoId: id, ...key }),
+                  ? service.todos.archive({
+                      expectedVersion: (await service.todos.get(id)).lifecycleVersion!,
+                      todoId: id,
+                      ...key,
+                    })
+                  : service.todos.reopen({
+                      expectedVersion: (await service.todos.get(id)).lifecycleVersion!,
+                      todoId: id,
+                      ...key,
+                    }),
           );
           output(io, global.json, record, `Todo ${id} is now ${record.status}.`);
         },
       );
   }
-
   /* ------------------------------------------------------------ tasks */
-
   const taskCommand = program.command('task').description('Create and manage agent tasks');
-
   taskCommand
     .command('create <assignee>')
     .description('Assign a task to an agent')
@@ -2871,7 +3022,7 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         const global = globals(command);
         const result = await withProfile(command, (service) =>
           service.tasks.create({
-            assigneeAgentId: assignee,
+            assignee: targetRef(assignee),
             title: options.title,
             ...(options.description ? { description: options.description } : {}),
             priority: Number(options.priority) as 1 | 2 | 3 | 4,
@@ -2890,7 +3041,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         );
       },
     );
-
   taskCommand
     .command('list')
     .description('List tasks')
@@ -2898,11 +3048,18 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     .option('--status <status>')
     .option('--limit <number>', 'maximum results', '10')
     .action(
-      async (options: { assignee?: string; status?: string; limit: string }, command: Command) => {
+      async (
+        options: {
+          assignee?: string;
+          status?: string;
+          limit: string;
+        },
+        command: Command,
+      ) => {
         const global = globals(command);
         const page = await withProfile(command, (service) =>
           service.tasks.list({
-            ...(options.assignee ? { participantAgentId: options.assignee } : {}),
+            ...(options.assignee ? { participant: targetRef(options.assignee) } : {}),
             ...(options.status ? { status: options.status } : {}),
             limit: Number(options.limit),
           }),
@@ -2910,7 +3067,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         output(io, global.json, page, page.items.map(lineForItem).join('\n') || 'No tasks found.');
       },
     );
-
   taskCommand
     .command('show <task-id>')
     .description('Show one task')
@@ -2924,7 +3080,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         `${record.current.title}\nID: ${record.event.id}\nStatus: ${record.status}\nVersion: ${record.current.version}`,
       );
     });
-
   taskCommand
     .command('update <task-id>')
     .description('Update a task (optimistic concurrency)')
@@ -2972,7 +3127,35 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         output(io, global.json, record, `Updated task ${id} to version ${record.current.version}.`);
       },
     );
-
+  taskCommand
+    .command('override <task-id>')
+    .requiredOption('--decision <status>', 'open or rejected')
+    .requiredOption('--reason <text>')
+    .requiredOption('--expected-version <number>')
+    .option('--idempotency-key <key>')
+    .action(
+      async (
+        id: string,
+        options: {
+          decision: 'open' | 'rejected';
+          reason: string;
+          expectedVersion: string;
+          idempotencyKey?: string;
+        },
+        command: Command,
+      ) => {
+        const record = await withProfile(command, (service) =>
+          service.tasks.overrideDecision({
+            taskId: id,
+            nextStatus: options.decision,
+            reason: options.reason,
+            expectedVersion: Number(options.expectedVersion),
+            ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+          }),
+        );
+        output(io, globals(command).json, record, `Task decision overridden: ${record.status}.`);
+      },
+    );
   for (const operation of ['accept', 'reject', 'complete', 'reopen', 'cancel'] as const) {
     const command_ = taskCommand
       .command(`${operation} <task-id>`)
@@ -2989,49 +3172,251 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
     command_.action(
       async (
         id: string,
-        options: { note?: string; reason?: string; response?: string; idempotencyKey?: string },
+        options: {
+          note?: string;
+          reason?: string;
+          response?: string;
+          idempotencyKey?: string;
+        },
         command: Command,
       ) => {
         const global = globals(command);
         const key = options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {};
-        const record = await withProfile(command, (service) =>
+        const record = await withProfile(command, async (service) =>
           operation === 'accept'
             ? service.tasks.accept({
+                expectedVersion: (await service.tasks.get(id)).lifecycleVersion!,
                 taskId: id,
                 ...(options.response ? { response: options.response } : {}),
                 ...key,
               })
             : operation === 'reject'
               ? service.tasks.reject({
+                  expectedVersion: (await service.tasks.get(id)).lifecycleVersion!,
                   taskId: id,
                   response: options.response ?? options.reason ?? '',
                   ...key,
                 })
               : operation === 'complete'
                 ? service.tasks.complete({
+                    expectedVersion: (await service.tasks.get(id)).lifecycleVersion!,
                     taskId: id,
                     ...(options.note ? { note: options.note } : {}),
                     ...key,
                   })
                 : operation === 'cancel'
                   ? service.tasks.cancel({
+                      expectedVersion: (await service.tasks.get(id)).lifecycleVersion!,
                       taskId: id,
                       ...(options.reason ? { reason: options.reason } : {}),
                       ...key,
                     })
-                  : service.tasks.reopen({ taskId: id, ...key }),
+                  : service.tasks.reopen({
+                      expectedVersion: (await service.tasks.get(id)).lifecycleVersion!,
+                      taskId: id,
+                      ...key,
+                    }),
         );
         output(io, global.json, record, `Task ${id} is ${record.status}.`);
       },
     );
   }
-
+  program
+    .command('search <query>')
+    .option('--kind <kind>')
+    .option('--after <cursor>')
+    .option('--limit <number>')
+    .action(
+      async (
+        q: string,
+        options: { kind?: string; after?: string; limit?: string },
+        command: Command,
+      ) => {
+        const page = await withProfile(command, (service) =>
+          service.search({
+            q,
+            ...(options.kind ? { kinds: [options.kind as HpRecordKind] } : {}),
+            ...(options.after ? { after: options.after } : {}),
+            ...(options.limit ? { limit: Number(options.limit) } : {}),
+          }),
+        );
+        output(
+          io,
+          globals(command).json,
+          page,
+          page.items
+            .map(
+              (hit) => `${hit.kind}: ${hit.title} [${hit.rootId}]
+${hit.snippet}`,
+            )
+            .join('\n') || 'No visible results.',
+        );
+      },
+    );
+  const bookmarkCommand = program.command('bookmark').description('Your own saved records');
+  bookmarkCommand
+    .command('list')
+    .option('--after <cursor>')
+    .option('--limit <number>')
+    .action(async (options: { after?: string; limit?: string }, command: Command) => {
+      const page = await withProfile(command, (service) =>
+        service.bookmarks.list({
+          ...options,
+          ...(options.limit ? { limit: Number(options.limit) } : {}),
+        } as HpBookmarkInput),
+      );
+      output(
+        io,
+        globals(command).json,
+        page,
+        page.items
+          .map((entry) => `${entry.root.kind}: ${entry.root.title} [${entry.root.id}]`)
+          .join('\n') || 'No visible bookmarks.',
+      );
+    });
+  for (const operation of ['set', 'remove'] as const)
+    bookmarkCommand
+      .command(`${operation} <root-id>`)
+      .action(async (rootId: string, _options: object, command: Command) => {
+        const result = await withProfile(command, (service) =>
+          service.bookmarks.set({ rootId, present: operation === 'set' }),
+        );
+        output(
+          io,
+          globals(command).json,
+          result,
+          operation === 'set' ? 'Bookmark saved.' : 'Bookmark removed.',
+        );
+      });
+  const replyCommand = program
+    .command('reply')
+    .description('Discuss any visible record without changing its lifecycle');
+  replyCommand
+    .command('create <root-id>')
+    .requiredOption('--body <text>', 'Immutable reply body')
+    .option('--parent <reply-id>', 'Reply to a parent in this thread')
+    .option(
+      '--mention <actor>',
+      'Mention a typed human/agent',
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
+    .option('--idempotency-key <key>', 'Stable retry key')
+    .action(
+      async (
+        rootId: string,
+        options: { body: string; parent?: string; mention: string[]; idempotencyKey?: string },
+        command: Command,
+      ) => {
+        const result = await withProfile(command, (service) =>
+          service.replies.create({
+            rootId,
+            body: options.body,
+            ...(options.parent ? { parentId: options.parent } : {}),
+            mentions: options.mention.map(targetRef),
+            ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+          }),
+        );
+        output(
+          io,
+          globals(command).json,
+          result,
+          `Reply ${result.id} created by ${result.author.kind}:${result.author.id}.`,
+        );
+      },
+    );
+  replyCommand
+    .command('show <reply-id>')
+    .action(async (id: string, _options: object, command: Command) => {
+      const result = await withProfile(command, (service) => service.replies.get(id));
+      output(
+        io,
+        globals(command).json,
+        result,
+        result.deleted ? 'Deleted reply.' : (result.body ?? ''),
+      );
+    });
+  replyCommand
+    .command('delete <reply-id>')
+    .requiredOption('--expected-version <number>', 'Current reply version')
+    .option('--reason <text>', 'Moderation reason')
+    .option('--idempotency-key <key>', 'Stable retry key')
+    .action(
+      async (
+        replyId: string,
+        options: { expectedVersion: string; reason?: string; idempotencyKey?: string },
+        command: Command,
+      ) => {
+        const result = await withProfile(command, (service) =>
+          service.replies.delete({
+            replyId,
+            expectedVersion: Number(options.expectedVersion),
+            ...(options.reason ? { reason: options.reason } : {}),
+            ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+          }),
+        );
+        output(io, globals(command).json, result, 'Visible reply removed; audit history remains.');
+      },
+    );
+  const threadCommand = program.command('thread').description('Read and follow record timelines');
+  threadCommand
+    .command('show <root-id>')
+    .option('--after <cursor>', 'Continue a signed snapshot')
+    .option('--limit <number>', 'Page size')
+    .action(
+      async (rootId: string, options: { after?: string; limit?: string }, command: Command) => {
+        const result = await withProfile(command, (service) =>
+          service.threads.get({
+            rootId,
+            ...(options.after ? { after: options.after } : {}),
+            ...(options.limit ? { limit: Number(options.limit) } : {}),
+          }),
+        );
+        output(io, globals(command).json, result, JSON.stringify(result, null, 2));
+      },
+    );
+  threadCommand
+    .command('subscription <root-id>')
+    .option('--follow', 'Follow new replies')
+    .option('--mute', 'Mute notifications')
+    .action(
+      async (rootId: string, options: { follow?: boolean; mute?: boolean }, command: Command) => {
+        await withProfile(command, (service) =>
+          service.threads.subscription({
+            rootId,
+            following: !!options.follow,
+            muted: !!options.mute,
+          }),
+        );
+        output(io, globals(command).json, { updated: true }, 'Thread subscription updated.');
+      },
+    );
+  program
+    .command('react <target-id> <code>')
+    .option('--remove', 'Set absent instead of present')
+    .option('--idempotency-key <key>', 'Stable retry key')
+    .action(
+      async (
+        targetId: string,
+        code: HpReactionCode,
+        options: { remove?: boolean; idempotencyKey?: string },
+        command: Command,
+      ) => {
+        const result = await withProfile(command, (service) =>
+          service.reactions.set({
+            targetId,
+            code,
+            present: !options.remove,
+            ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+          }),
+        );
+        output(io, globals(command).json, result, 'Reaction updated.');
+      },
+    );
   /* ------------------------------------------------------------ maintenance */
-
   const projectionCommand = program
     .command('projection')
     .description('Inspect the generated files Synomem derives from events');
-
   projectionCommand
     .command('status')
     .description('Report whether the generated files match the canonical events (local stores)')
@@ -3061,7 +3446,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       for (const path of status.unexpected) lines.push(`  unexpected  ${path}`);
       output(io, global.json, status, lines.join('\n'));
     });
-
   program
     .command('rebuild')
     .description('Regenerate current-state and filesystem projections from canonical events')
@@ -3075,7 +3459,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         `Rebuilt ${result.generated.length} file(s); removed ${result.removed.length} stale file(s).`,
       );
     });
-
   program
     .command('backup <destination>')
     .description('Create a transactionally consistent SQLite backup (local stores)')
@@ -3092,21 +3475,33 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       });
       output(io, global.json, { path }, `Created backup at ${path}`);
     });
-
   program
     .command('export')
     .description('Export canonical events for portability')
+    .option(
+      '--raw',
+      'filesystem-owner recovery: export unchanged JSON events without opening or migrating the store',
+      false,
+    )
     .addOption(
       new Option('--format <format>').choices(['json', 'jsonl', 'markdown']).default('json'),
     )
     .option('--output <path>', 'write to an explicit destination instead of stdout')
     .action(
       async (
-        options: { format: 'json' | 'jsonl' | 'markdown'; output?: string },
+        options: {
+          format: 'json' | 'jsonl' | 'markdown';
+          raw: boolean;
+          output?: string;
+        },
         command: Command,
       ) => {
         const global = globals(command);
-        const content = await withManagement(command, (service) => service.export(options.format));
+        if (options.raw && options.format === 'markdown')
+          throw new SynomemError('INVALID_INPUT', 'Raw recovery supports json or jsonl only.');
+        const content = options.raw
+          ? exportRawLocalEvents(global.home, options.format as 'json' | 'jsonl')
+          : await withManagement(command, (service) => service.export(options.format));
         if (options.output) {
           const destination = resolve(options.output);
           atomicWriteFile(destination, content, 0o600);
@@ -3121,7 +3516,6 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         }
       },
     );
-
   program
     .command('doctor')
     .description('Run safe diagnostics')
@@ -3134,9 +3528,7 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
       output(io, global.json, result, human);
       if (!result.healthy) cliExitCodes.set(program, 5);
     });
-
   /* ------------------------------------------------------------ mcp */
-
   program
     .command('mcp')
     .description('Run the MCP server over stdio for a profile (fixed) or a preset (explicit)')
@@ -3146,34 +3538,39 @@ export function createCli(io: CliIo = defaultIo, dependencies: CliDependencies =
         'explicit',
       ]),
     )
-    .action(async (options: { contexts?: 'fixed' | 'explicit' }, command: Command) => {
-      const global = globals(command);
-      const config = profileStoreFor(global.home).read();
-      const selection = selectionFor(global, config);
-      if (!selection) throw noSelectionError();
-      if (selection.kind === 'preset' && options.contexts !== 'explicit') {
-        throw new SynomemError(
-          'INVALID_INPUT',
-          `Preset ${selection.name} serves several identities; start it with --contexts explicit so every tool call names its context.`,
-        );
-      }
-      if (selection.kind === 'profile' && options.contexts === 'explicit') {
-        throw new SynomemError(
-          'INVALID_INPUT',
-          'A profile is one fixed identity. Use --preset <name> --contexts explicit for several.',
-        );
-      }
-      const deps = resolverDeps(global.home);
-      const resolver: ContextResolver =
-        selection.kind === 'profile'
-          ? profileResolver(global.home, config, selection.name, deps)
-          : presetResolver(global.home, config, selection.name, deps);
-      await (dependencies.startMcpServer ?? runStdioServer)({ resolver });
-    });
-
+    .action(
+      async (
+        options: {
+          contexts?: 'fixed' | 'explicit';
+        },
+        command: Command,
+      ) => {
+        const global = globals(command);
+        const config = profileStoreFor(global.home).read();
+        const selection = selectionFor(global, config);
+        if (!selection) throw noSelectionError();
+        if (selection.kind === 'preset' && options.contexts !== 'explicit') {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            `Preset ${selection.name} serves several identities; start it with --contexts explicit so every tool call names its context.`,
+          );
+        }
+        if (selection.kind === 'profile' && options.contexts === 'explicit') {
+          throw new SynomemError(
+            'INVALID_INPUT',
+            'A profile is one fixed identity. Use --preset <name> --contexts explicit for several.',
+          );
+        }
+        const deps = resolverDeps(global.home);
+        const resolver: ContextResolver =
+          selection.kind === 'profile'
+            ? profileResolver(global.home, config, selection.name, deps)
+            : presetResolver(global.home, config, selection.name, deps);
+        await (dependencies.startMcpServer ?? runStdioServer)({ resolver });
+      },
+    );
   return program;
 }
-
 /**
  * Serves one resolver over stdio until the client disconnects.
  *
@@ -3197,7 +3594,6 @@ async function runStdioServer(options: { resolver: ContextResolver }): Promise<v
   await runtime.close().catch(() => undefined);
   await options.resolver.close?.();
 }
-
 export async function runCli(
   argv = process.argv,
   io: CliIo = defaultIo,
@@ -3235,7 +3631,6 @@ export async function runCli(
     return exitCode(synomemError.code);
   }
 }
-
 if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   process.exitCode = await runCli();
 }

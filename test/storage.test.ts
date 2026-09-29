@@ -1,3 +1,5 @@
+import { resolveAuthority } from '../src/policy.js';
+import { exportRawLocalEvents } from '../src/backend.js';
 import {
   existsSync,
   mkdirSync,
@@ -17,7 +19,6 @@ import { describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
 import { SynomemClient } from '../src/index.js';
 import { tempHome, testClient } from './helpers.js';
-
 describe('SQLite storage and projections', () => {
   it('enforces append-only canonical events at the database layer', async () => {
     const home = tempHome();
@@ -29,7 +30,6 @@ describe('SQLite storage and projections', () => {
     expect(() => client.storage.db().prepare('DELETE FROM events').run()).toThrow(/append-only/);
     await client.close();
   });
-
   it('builds escaped deterministic projections and preserves human-owned files', async () => {
     const home = tempHome();
     const client = await testClient(home);
@@ -37,7 +37,7 @@ describe('SQLite storage and projections', () => {
     const notesPath = join(home, 'codex', 'NOTES.md');
     writeFileSync(notesPath, 'Troy owns this.\n');
     const given = await client.kudos.give({
-      recipientAgentId: 'codex',
+      recipient: { kind: 'agent', id: 'codex' },
       title: '# Review *win*',
       reason: '<script>alert(1)</script> caught before merge.',
       evidence: [{ kind: 'file', value: 'src/client.ts' }],
@@ -47,10 +47,14 @@ describe('SQLite storage and projections', () => {
     expect(readFileSync(join(home, 'codex', 'WINS.md'), 'utf8')).toContain('&lt;script&gt;');
     expect(readFileSync(notesPath, 'utf8')).toBe('Troy owns this.\n');
     expect(existsSync(inboxPath)).toBe(true);
-
     const unrelated = join(home, 'codex', 'inbox', 'human-note.md');
     writeFileSync(unrelated, 'Never delete me.\n');
-    await client.kudos.acknowledge({ kudosId: given.record.event.id });
+    const recipientClient = await testClient(client.home, { kind: 'agent', id: 'codex' });
+    await recipientClient.kudos.acknowledge({
+      expectedVersion: (await recipientClient.kudos.get(given.record.event.id)).lifecycleVersion!,
+      kudosId: given.record.event.id,
+    });
+    await recipientClient.close();
     expect(existsSync(inboxPath)).toBe(false);
     expect(readFileSync(unrelated, 'utf8')).toBe('Never delete me.\n');
     const first = readFileSync(join(home, 'codex', 'WINS.md'), 'utf8');
@@ -58,7 +62,6 @@ describe('SQLite storage and projections', () => {
     expect(readFileSync(join(home, 'codex', 'WINS.md'), 'utf8')).toBe(first);
     await client.close();
   });
-
   it('renders legacy multiline titles once without allowing heading injection', async () => {
     const home = tempHome();
     const client = await testClient(home);
@@ -66,7 +69,7 @@ describe('SQLite storage and projections', () => {
     const id = '01ARZ3NDEKTSV4RRFFQ69G5FAA';
     await client.storage.transaction(() =>
       client.storage.insertEvent({
-        schemaVersion: 1,
+        schemaVersion: 2,
         id,
         workspaceId: 'test',
         aggregateId: id,
@@ -76,7 +79,7 @@ describe('SQLite storage and projections', () => {
         actor: { kind: 'human', id: 'troy' },
         // Raw insertion bypasses the client, so the canonical ID is supplied
         // directly: projections are keyed by the agent this actually names.
-        recipientAgentId: codex.id,
+        recipient: { kind: 'agent', id: codex.id },
         recipientDisplayName: 'Codex',
         title: 'First line\n# Injected heading',
         reason: 'Legacy event created before titles became single-line input.',
@@ -90,7 +93,6 @@ describe('SQLite storage and projections', () => {
     expect(inbox).toContain('\\# Injected heading');
     await client.close();
   });
-
   it('rejects symlink traversal outside the configured home', async () => {
     const home = tempHome();
     const outside = tempHome();
@@ -103,7 +105,6 @@ describe('SQLite storage and projections', () => {
     });
     await client.close();
   });
-
   it('isolates unsupported rows for reads and raw export while failing closed on writes', async () => {
     const home = tempHome();
     const client = await testClient(home);
@@ -120,7 +121,7 @@ describe('SQLite storage and projections', () => {
         unsupportedId,
         new Date().toISOString(),
         JSON.stringify({
-          schemaVersion: 1,
+          schemaVersion: 2,
           id: unsupportedId,
           type: 'kudos.future',
           createdAt: new Date().toISOString(),
@@ -139,24 +140,22 @@ describe('SQLite storage and projections', () => {
     expect(await client.export('json')).toContain(unsupportedId);
     await expect(
       client.kudos.give({
-        recipientAgentId: 'codex',
+        recipient: { kind: 'agent', id: 'codex' },
         title: 'Unsafe write',
         reason: 'Must not write across an event stream with unknown semantics.',
       }),
     ).rejects.toMatchObject({ code: 'UNSUPPORTED_EVENT' });
     await client.close();
-
     const otherHome = tempHome();
     const initialized = await testClient(otherHome);
     const dbPath = initialized.storage.databasePath;
     await initialized.close();
     const raw = new DatabaseSync(dbPath);
-    raw.exec('PRAGMA user_version = 9');
+    raw.exec('PRAGMA user_version = 10');
     raw.close();
     const unsupported = new SynomemClient({ home: otherHome, readOnly: true });
     await expect(unsupported.init()).rejects.toMatchObject({ code: 'UNSUPPORTED_SCHEMA' });
   });
-
   it('creates a consistent independent backup', async () => {
     const home = tempHome();
     const client = await testClient(home);
@@ -170,15 +169,17 @@ describe('SQLite storage and projections', () => {
     };
     expect(count.count).toBe(1);
     expect(
-      (database.prepare('PRAGMA integrity_check').get() as { integrity_check: string })
-        .integrity_check,
+      (
+        database.prepare('PRAGMA integrity_check').get() as {
+          integrity_check: string;
+        }
+      ).integrity_check,
     ).toBe('ok');
     database.close();
     if (process.platform !== 'win32') {
       expect(statSync(backup).mode & 0o777).toBe(0o600);
     }
   });
-
   it('keeps live SQLite files private to the filesystem owner', async () => {
     const home = tempHome();
     const client = await testClient(home);
@@ -192,7 +193,6 @@ describe('SQLite storage and projections', () => {
     }
     await client.close();
   });
-
   it('rolls back all writes when a transaction fails', async () => {
     const client = await testClient(tempHome());
     await expect(
@@ -210,7 +210,6 @@ describe('SQLite storage and projections', () => {
     expect(client.storage.getAgent('rollback')).toBeUndefined();
     await client.close();
   });
-
   it('migrates an empty version-zero database transactionally', async () => {
     const home = tempHome();
     const kudosDirectory = join(home, 'kudos');
@@ -219,31 +218,32 @@ describe('SQLite storage and projections', () => {
     new DatabaseSync(path).close();
     const client = await testClient(home);
     expect(
-      (client.storage.db().prepare('PRAGMA user_version').get() as { user_version: number })
-        .user_version,
-    ).toBe(8);
+      (
+        client.storage.db().prepare('PRAGMA user_version').get() as {
+          user_version: number;
+        }
+      ).user_version,
+    ).toBe(9);
     expect(
       (
         client.storage.db().prepare('SELECT COUNT(*) AS count FROM schema_migrations').get() as {
           count: number;
         }
       ).count,
-    ).toBe(8);
+    ).toBe(9);
     await client.close();
   });
-
-  it('migrates version one events into the sequence and current-state index', async () => {
+  it('preserves legacy stores unchanged and permits raw recovery', async () => {
     const home = tempHome();
     const initial = await testClient(home);
     await initial.agents.create({ handle: 'codex', displayName: 'Codex' });
     const given = await initial.kudos.give({
-      recipientAgentId: 'codex',
+      recipient: { kind: 'agent', id: 'codex' },
       title: 'Pre-index recognition',
       reason: 'Represents a record created under database schema version one.',
     });
     const path = initial.storage.databasePath;
     await initial.close();
-
     const legacy = new DatabaseSync(path);
     legacy.exec(`
       DROP INDEX events_workspace_sequence;
@@ -274,34 +274,39 @@ describe('SQLite storage and projections', () => {
       PRAGMA user_version = 1;
     `);
     legacy.close();
-
+    const bytes = readFileSync(path);
+    const before = {
+      database: statSync(path).mtimeMs,
+      home: statSync(home).mtimeMs,
+      homeMode: statSync(home).mode & 0o777,
+    };
     const readOnly = new SynomemClient({ home, readOnly: true });
-    await expect(readOnly.init()).rejects.toThrow(/readOnly: false/);
-
-    const migrated = await testClient(home);
-    expect(
-      (migrated.storage.db().prepare('PRAGMA user_version').get() as { user_version: number })
-        .user_version,
-    ).toBe(8);
-    expect((await migrated.kudos.list()).items[0]?.id).toBe(given.record.event.id);
-    expect(migrated.storage.currentIndexHealth()).toEqual({
-      given: 1,
-      indexed: 1,
-      stateMismatches: 0,
-    });
-    await migrated.close();
+    await expect(readOnly.init()).rejects.toMatchObject({ code: 'UNSUPPORTED_SCHEMA' });
+    await expect(testClient(home)).rejects.toMatchObject({ code: 'UNSUPPORTED_SCHEMA' });
+    expect({
+      database: statSync(path).mtimeMs,
+      home: statSync(home).mtimeMs,
+      homeMode: statSync(home).mode & 0o777,
+    }).toEqual(before);
+    expect(exportRawLocalEvents(home)).toContain(given.record.event.id);
+    expect(readFileSync(path)).toEqual(bytes);
   });
-
   it('diagnoses and rebuilds current-state status drift', async () => {
     const client = await testClient(tempHome());
     await client.agents.create({ handle: 'codex', displayName: 'Codex' });
     const given = await client.kudos.give({
-      recipientAgentId: 'codex',
+      recipient: { kind: 'agent', id: 'codex' },
       title: 'Recoverable recognition',
       reason: 'Canonical history can recreate a damaged derived query index.',
     });
-    await client.kudos.acknowledge({ kudosId: given.record.event.id });
+    const recipientClient = await testClient(client.home, { kind: 'agent', id: 'codex' });
+    await recipientClient.kudos.acknowledge({
+      expectedVersion: (await recipientClient.kudos.get(given.record.event.id)).lifecycleVersion!,
+      kudosId: given.record.event.id,
+    });
+    await recipientClient.close();
     await client.kudos.revoke({
+      expectedVersion: (await client.kudos.get(given.record.event.id)).lifecycleVersion!,
       kudosId: given.record.event.id,
       reason: 'Exercises repair of both derived state fields.',
     });
@@ -327,7 +332,6 @@ describe('SQLite storage and projections', () => {
     expect(await client.doctor()).toMatchObject({ healthy: true });
     await client.close();
   });
-
   it('diagnoses migration metadata and alias-to-identity conflicts', async () => {
     const client = await testClient(tempHome());
     await client.agents.create({ handle: 'codex', displayName: 'Codex' });
@@ -339,7 +343,6 @@ describe('SQLite storage and projections', () => {
       .prepare('INSERT INTO aliases(alias, agent_id, normalized_alias) VALUES (?, ?, ?)')
       .run('codex', gracie.id, 'codex');
     client.storage.db().prepare('DELETE FROM schema_migrations WHERE version = 2').run();
-
     const doctor = await client.doctor();
     expect(doctor.healthy).toBe(false);
     expect(doctor.diagnostics).toEqual(
@@ -350,7 +353,6 @@ describe('SQLite storage and projections', () => {
     );
     await client.close();
   });
-
   /*
    * Agents carry an opaque canonical ID and a separate handle, and the two are
    * used for different things: stored events reference the ID, while projected
@@ -364,18 +366,16 @@ describe('SQLite storage and projections', () => {
     const codex = await client.agents.create({ handle: 'codex', displayName: 'Codex' });
     expect(codex.id).not.toBe(codex.handle);
     await client.kudos.give({
-      recipientAgentId: codex.id,
+      recipient: { kind: 'agent', id: codex.id },
       title: 'Projection paths',
       reason: 'Gives the inbox projection something to write.',
     });
     client.projections.rebuild();
-
     // Nothing has changed since the rebuild, so nothing is stale.
     const healthy = await client.doctor();
     expect(healthy.diagnostics).toEqual(
       expect.arrayContaining([expect.objectContaining({ code: 'PROJECTIONS_CURRENT' })]),
     );
-
     // And the directory the writers actually create is the one guarded.
     rmSync(join(client.home, codex.handle), { recursive: true, force: true });
     symlinkSync(tmpdir(), join(client.home, codex.handle), 'dir');
@@ -386,7 +386,6 @@ describe('SQLite storage and projections', () => {
     );
     await client.close();
   });
-
   it('keeps give latency practical with a realistic pending inbox', async () => {
     const client = await testClient(tempHome());
     try {
@@ -394,20 +393,19 @@ describe('SQLite storage and projections', () => {
       const started = performance.now();
       for (let index = 0; index < 100; index += 1) {
         await client.kudos.give({
-          recipientAgentId: 'codex',
+          recipient: { kind: 'agent', id: 'codex' },
           title: `Scale contribution ${index}`,
           reason: 'Exercises incremental projection maintenance with pending recognition.',
         });
       }
       const elapsed = performance.now() - started;
-      const platformBudget = process.platform === 'win32' ? 25_000 : 10_000;
+      const platformBudget = process.platform === 'win32' ? 25000 : 10000;
       expect(elapsed).toBeLessThan(platformBudget);
       expect(readdirSync(join(client.home, 'codex', 'inbox', 'kudos'))).toHaveLength(100);
     } finally {
       await client.close();
     }
-  }, 30_000);
-
+  }, 30000);
   it('keeps discovery responses bounded with five thousand kudos', async () => {
     const client = await testClient(
       tempHome(),
@@ -417,19 +415,19 @@ describe('SQLite storage and projections', () => {
       },
     );
     await client.agents.create({ handle: 'codex', displayName: 'Codex' });
-    await client.storage.transaction(() => {
-      for (let index = 0; index < 5_000; index += 1) {
-        const id = ulid(1_700_000_000_000 + index);
-        client.storage.insertEvent({
-          schemaVersion: 1,
+    await client.storage.transaction(async () => {
+      for (let index = 0; index < 5000; index += 1) {
+        const id = ulid(1700000000000 + index);
+        await client.storage.insertEvent({
+          schemaVersion: 2,
           id,
           workspaceId: 'test',
           aggregateId: id,
           aggregateVersion: 1,
           type: 'kudos.given',
-          createdAt: new Date(1_700_000_000_000 + index).toISOString(),
+          createdAt: new Date(1700000000000 + index).toISOString(),
           actor: { kind: 'human', id: 'scale-test' },
-          recipientAgentId: 'codex',
+          recipient: { kind: 'agent', id: 'codex' },
           recipientDisplayName: 'Codex',
           title: `Bounded discovery ${index}`,
           reason: 'This full detail must not appear in compact list responses.',
@@ -438,19 +436,17 @@ describe('SQLite storage and projections', () => {
         });
       }
     });
-
     const first = await client.kudos.list();
-    expect(first.total).toBe(5_000);
+    expect(first.total).toBe(5000);
     expect(first.items).toHaveLength(10);
     expect(first.hasMore).toBe(true);
-    expect(Buffer.byteLength(JSON.stringify(first), 'utf8')).toBeLessThan(26_000);
+    expect(Buffer.byteLength(JSON.stringify(first), 'utf8')).toBeLessThan(26000);
     expect(first.items[0]).not.toHaveProperty('reason');
     const second = await client.kudos.list({ cursor: first.nextCursor! });
     expect(second.items).toHaveLength(10);
     expect(second.items[0]?.id).not.toBe(first.items[0]?.id);
     await client.close();
   });
-
   it('shortens unusually wide summary pages at the byte budget', async () => {
     const client = await testClient(tempHome(), {
       kind: 'human',
@@ -459,19 +455,19 @@ describe('SQLite storage and projections', () => {
     });
     await client.agents.create({ handle: 'codex', displayName: 'C'.repeat(200) });
     const tags = Array.from({ length: 20 }, (_, index) => `tag-${index}-${'x'.repeat(50)}`);
-    await client.storage.transaction(() => {
+    await client.storage.transaction(async () => {
       for (let index = 0; index < 50; index += 1) {
-        const id = ulid(1_800_000_000_000 + index);
-        client.storage.insertEvent({
-          schemaVersion: 1,
+        const id = ulid(1800000000000 + index);
+        await client.storage.insertEvent({
+          schemaVersion: 2,
           id,
           workspaceId: 'test',
           aggregateId: id,
           aggregateVersion: 1,
           type: 'kudos.given',
-          createdAt: new Date(1_800_000_000_000 + index).toISOString(),
+          createdAt: new Date(1800000000000 + index).toISOString(),
           actor: client.actor,
-          recipientAgentId: 'codex',
+          recipient: { kind: 'agent', id: 'codex' },
           recipientDisplayName: 'C'.repeat(200),
           title: `Wide ${index} ${'T'.repeat(180)}`,
           reason: 'The summary excludes this detail.',
@@ -480,20 +476,20 @@ describe('SQLite storage and projections', () => {
         });
       }
     });
-
     const page = await client.kudos.list({ limit: 50 });
     expect(page.contextLimited).toBe(true);
     expect(page.hasMore).toBe(true);
     expect(page.items.length).toBeLessThan(50);
-    expect(Buffer.byteLength(JSON.stringify(page), 'utf8')).toBeLessThan(26_000);
+    expect(Buffer.byteLength(JSON.stringify(page), 'utf8')).toBeLessThan(26000);
     expect(page.nextCursor).toBeDefined();
     await client.close();
   });
-
   it('handles concurrent writers without lost or duplicate events', async () => {
     const home = tempHome();
     const setup = await testClient(home);
     await setup.agents.create({ handle: 'codex', displayName: 'Codex' });
+    for (const id of ['one', 'two', 'three', 'four'])
+      await setup.agents.create({ handle: id, displayName: id });
     await setup.close();
     const moduleUrl = pathToFileURL(join(process.cwd(), 'dist', 'index.js')).href;
     const workerSource = `
@@ -507,7 +503,7 @@ describe('SQLite storage and projections', () => {
         await client.init();
         for (let i = 0; i < 8; i++) {
           await client.kudos.give({
-            recipientAgentId: 'codex',
+            recipient: {kind:'agent',id:'codex'},
             title: 'Concurrent contribution ' + workerData.actor + '-' + i,
             reason: 'Recorded during a concurrent writer stress test.',
             idempotencyKey: workerData.actor + '-' + i
@@ -522,7 +518,10 @@ describe('SQLite storage and projections', () => {
     const results = await Promise.all(
       ['one', 'two', 'three', 'four'].map(
         (actorId) =>
-          new Promise<{ ok: boolean; error?: string }>((resolveWorker, rejectWorker) => {
+          new Promise<{
+            ok: boolean;
+            error?: string;
+          }>((resolveWorker, rejectWorker) => {
             const worker = new Worker(
               new URL(`data:text/javascript,${encodeURIComponent(workerSource)}`),
               { workerData: { home, moduleUrl, actor: actorId } },
@@ -539,28 +538,30 @@ describe('SQLite storage and projections', () => {
     expect(new Set(page.items.map((item) => item.id)).size).toBe(32);
     await inspect.close();
   });
-
   it('waits for a bounded interval and reports a busy database', async () => {
     const home = tempHome();
     const setup = await testClient(home);
     await setup.agents.create({ handle: 'codex', displayName: 'Codex' });
     const databasePath = setup.storage.databasePath;
     await setup.close();
-
     const lock = new DatabaseSync(databasePath);
     lock.exec('PRAGMA journal_mode = WAL; BEGIN IMMEDIATE');
-    const contender = await testClient(home, { kind: 'human', id: 'contender' });
+    const contender = await testClient(
+      home,
+      { kind: 'human', id: 'contender' },
+      { authority: resolveAuthority() },
+    );
     try {
       contender.storage.db().exec('PRAGMA busy_timeout = 50');
       const started = performance.now();
       await expect(
         contender.kudos.give({
-          recipientAgentId: 'codex',
+          recipient: { kind: 'agent', id: 'codex' },
           title: 'Contended write',
           reason: 'Verifies bounded SQLite busy handling.',
         }),
       ).rejects.toMatchObject({ code: 'DATABASE_BUSY' });
-      expect(performance.now() - started).toBeLessThan(1_000);
+      expect(performance.now() - started).toBeLessThan(1000);
     } finally {
       await contender.close();
       lock.exec('ROLLBACK');

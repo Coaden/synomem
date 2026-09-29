@@ -1,3 +1,5 @@
+import type { ParticipationEvent } from './participation.js';
+import type { ActorRef, RecordAuthority } from './policy.js';
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
@@ -96,7 +98,7 @@ export interface AgentResolution {
 }
 
 export interface BaseEvent {
-  schemaVersion: 1;
+  schemaVersion: 2;
   id: string;
   type: string;
   workspaceId: string;
@@ -107,11 +109,15 @@ export interface BaseEvent {
   idempotencyKey?: string;
   source?: EventSource;
   metadata?: Record<string, JsonValue>;
+  intervention?: {
+    basis: 'operator' | 'workspace_admin' | 'organization_admin' | 'local_owner';
+    reason?: string;
+  };
 }
 
 export interface KudosGivenEvent extends BaseEvent {
   type: 'kudos.given';
-  recipientAgentId: string;
+  recipient: ActorRef;
   recipientDisplayName: string;
   title: string;
   reason: string;
@@ -123,7 +129,7 @@ export interface KudosGivenEvent extends BaseEvent {
 export interface KudosAcknowledgedEvent extends BaseEvent {
   type: 'kudos.acknowledged';
   kudosId: string;
-  recipientAgentId: string;
+  recipient: ActorRef;
   note?: string;
 }
 export interface KudosRevokedEvent extends BaseEvent {
@@ -135,7 +141,7 @@ export interface KudosRevokedEvent extends BaseEvent {
 
 export interface MemoSentEvent extends BaseEvent {
   type: 'memo.sent';
-  recipientAgentId: string;
+  recipient: ActorRef;
   recipientDisplayName: string;
   subject: string;
   body: string;
@@ -146,12 +152,12 @@ export interface MemoSentEvent extends BaseEvent {
 export interface MemoReadEvent extends BaseEvent {
   type: 'memo.read';
   memoId: string;
-  recipientAgentId: string;
+  recipient: ActorRef;
 }
 export interface MemoArchivedEvent extends BaseEvent {
   type: 'memo.archived';
   memoId: string;
-  recipientAgentId: string;
+  recipient: ActorRef;
 }
 
 /**
@@ -165,15 +171,15 @@ export interface MemoArchivedEvent extends BaseEvent {
  * read".
  */
 export interface PostCreatedEvent extends BaseEvent {
+  mentions?: ActorRef[];
   type: 'post.created';
   title: string;
   body: string;
   tags?: string[];
   topicIds?: string[];
-  /** The post this replies to. A reply inherits its parent's workspace. */
-  replyTo?: string;
 }
 export interface PostEditedEvent extends BaseEvent {
+  mentions?: ActorRef[];
   type: 'post.edited';
   postId: string;
   title: string;
@@ -206,7 +212,7 @@ export interface PostAcknowledgmentWithdrawnEvent extends BaseEvent {
 
 export interface NoteCreatedEvent extends BaseEvent {
   type: 'note.created';
-  ownerAgentId: string;
+  owner: ActorRef;
   ownerDisplayName: string;
   title: string;
   body: string;
@@ -233,7 +239,7 @@ export type TaskDue =
   { kind: 'date'; date: string } | { kind: 'datetime'; datetime: string; timeZone: string };
 export interface TaskCreatedEvent extends BaseEvent {
   type: 'task.created';
-  assigneeAgentId: string;
+  assignee: ActorRef;
   assigneeDisplayName: string;
   title: string;
   description?: string;
@@ -284,6 +290,19 @@ export interface TaskRejectedEvent extends BaseEvent {
    */
   response: string;
 }
+export interface TaskDecisionOverriddenEvent extends BaseEvent {
+  type: 'task.decision_overridden';
+  taskId: string;
+  previousStatus: 'open' | 'rejected';
+  nextStatus: 'open' | 'rejected';
+  reason: string;
+}
+export interface OverrideTaskDecisionInput extends MutationInput {
+  taskId: string;
+  expectedVersion: number;
+  nextStatus: 'open' | 'rejected';
+  reason: string;
+}
 export interface TaskCanceledEvent extends BaseEvent {
   type: 'task.canceled';
   taskId: string;
@@ -304,6 +323,7 @@ export interface TaskCanceledEvent extends BaseEvent {
  */
 export interface TodoCreatedEvent extends BaseEvent {
   type: 'todo.created';
+  owner: ActorRef;
   title: string;
   /** Private working detail. Never surfaced to another actor. */
   details?: string;
@@ -342,6 +362,8 @@ export interface TodoArchivedEvent extends BaseEvent {
 }
 
 export interface TodoRecord {
+  lifecycleVersion?: number;
+  allowedActions?: Record<string, boolean>;
   event: TodoCreatedEvent;
   update?: TodoUpdatedEvent;
   terminal?: TodoCompletedEvent | TodoCanceledEvent | TodoArchivedEvent;
@@ -359,6 +381,7 @@ export interface TodoRecord {
 }
 
 export interface CreateTodoInput extends MutationInput {
+  owner?: ActorRef;
   title: string;
   details?: string;
   priority?: TaskPriority;
@@ -422,6 +445,7 @@ export interface TopicResolution {
 }
 
 export type SynomemEvent =
+  | ParticipationEvent
   | KudosGivenEvent
   | KudosAcknowledgedEvent
   | KudosRevokedEvent
@@ -443,6 +467,7 @@ export type SynomemEvent =
   | TaskAcceptedEvent
   | TaskRejectedEvent
   | TaskCanceledEvent
+  | TaskDecisionOverriddenEvent
   | TodoCreatedEvent
   | TodoUpdatedEvent
   | TodoCompletedEvent
@@ -457,6 +482,8 @@ export type SynomemEvent =
 export type AcknowledgmentStatus = 'acknowledged' | 'unacknowledged';
 export type RevocationStatus = 'revoked' | 'active';
 export interface KudosRecord {
+  lifecycleVersion?: number;
+  allowedActions?: Record<string, boolean>;
   event: KudosGivenEvent;
   acknowledgment?: KudosAcknowledgedEvent;
   revocation?: KudosRevokedEvent;
@@ -464,6 +491,8 @@ export interface KudosRecord {
   revocationStatus: RevocationStatus;
 }
 export interface MemoRecord {
+  lifecycleVersion?: number;
+  allowedActions?: Record<string, boolean>;
   event: MemoSentEvent;
   read?: MemoReadEvent;
   archived?: MemoArchivedEvent;
@@ -475,6 +504,9 @@ export interface PostAcknowledgment {
   note?: string;
 }
 export interface PostRecord {
+  mentions?: ActorRef[];
+  lifecycleVersion?: number;
+  allowedActions?: Record<string, boolean>;
   event: PostCreatedEvent;
   edits: PostEditedEvent[];
   archived?: PostArchivedEvent;
@@ -505,6 +537,8 @@ export interface PostRoster {
 }
 
 export interface NoteRecord {
+  lifecycleVersion?: number;
+  allowedActions?: Record<string, boolean>;
   event: NoteCreatedEvent;
   revision?: NoteRevisedEvent;
   archived?: NoteArchivedEvent;
@@ -535,12 +569,15 @@ export interface TaskResponse {
 }
 
 export interface TaskRecord {
+  lifecycleVersion?: number;
+  allowedActions?: Record<string, boolean>;
   event: TaskCreatedEvent;
   update?: TaskUpdatedEvent;
   terminal?: TaskCompletedEvent | TaskRejectedEvent | TaskCanceledEvent;
   reopened?: TaskReopenedEvent;
   /** Every accept/reject answer, oldest first. */
   responses: TaskResponse[];
+  overrides?: TaskDecisionOverriddenEvent[];
   current: {
     title: string;
     description?: string;
@@ -567,16 +604,16 @@ export interface ItemSummary {
   topicIds: string[];
   visibility: Visibility;
   status: string;
-  recipientAgentId?: string;
-  ownerAgentId?: string;
-  assigneeAgentId?: string;
+  recipient?: ActorRef;
+  owner?: ActorRef;
+  assignee?: ActorRef;
   recipientDisplayName?: string;
   ownerDisplayName?: string;
   assigneeDisplayName?: string;
 }
 export interface KudosSummary extends ItemSummary {
   kind: 'kudos';
-  recipientAgentId: string;
+  recipient: ActorRef;
   recipientDisplayName: string;
   status: AcknowledgmentStatus;
   revocationStatus: RevocationStatus;
@@ -589,7 +626,7 @@ export interface PaginationInput {
 }
 export interface ItemListInput extends PaginationInput {
   kinds?: RecordKind[];
-  participantAgentId?: string;
+  participant?: ActorRef;
   actorId?: string;
   actorKind?: ActorKind;
   tag?: string;
@@ -619,7 +656,7 @@ export interface ItemListInput extends PaginationInput {
   overdueAsOf?: string;
 }
 export interface KudosListInput extends PaginationInput {
-  recipientAgentId?: string;
+  recipient?: ActorRef;
   actorId?: string;
   actorKind?: ActorKind;
   tag?: string;
@@ -642,7 +679,7 @@ export interface Page<T> {
 }
 export interface ItemChange {
   cursor: string;
-  sequence: number;
+  sequence: string;
   eventId: string;
   type: SynomemEvent['type'];
   createdAt: string;
@@ -651,17 +688,17 @@ export interface ItemChange {
   kind?: RecordKind;
   summary?: ItemSummary;
   /** Present for kudos changes. */ kudosId?: string;
-  /** Present for direct-recipient changes. */ recipientAgentId?: string;
+  /** Present for direct-recipient changes. */ recipient?: ActorRef;
 }
 export interface KudosChange extends ItemChange {
   kudosId?: string;
-  recipientAgentId?: string;
+  recipient?: ActorRef;
   summary?: KudosSummary;
 }
 export interface ChangesInput {
+  kinds?: RecordKind[];
   after?: string;
   limit?: number;
-  kinds?: RecordKind[];
 }
 export type KudosChangesInput = ChangesInput;
 export interface ChangePage {
@@ -679,7 +716,7 @@ interface MutationInput {
   metadata?: Record<string, JsonValue>;
 }
 export interface GiveKudosInput extends MutationInput {
-  recipientAgentId: string;
+  recipient: ActorRef;
   title: string;
   reason: string;
   evidence?: EvidenceReference[];
@@ -688,7 +725,7 @@ export interface GiveKudosInput extends MutationInput {
   visibility?: Visibility;
 }
 export interface SendMemoInput extends MutationInput {
-  recipientAgentId: string;
+  recipient: ActorRef;
   subject: string;
   body: string;
   tags?: string[];
@@ -696,15 +733,15 @@ export interface SendMemoInput extends MutationInput {
   visibility?: Visibility;
 }
 export interface CreatePostInput extends MutationInput {
+  mentions?: ActorRef[];
   title: string;
   body: string;
   tags?: string[];
   topicIds?: string[];
-  /** The post being replied to; a reply inherits its parent's workspace. */
-  replyTo?: string;
 }
 
 export interface UpdatePostInput {
+  mentions?: ActorRef[];
   postId: string;
   expectedVersion: number;
   title?: string;
@@ -715,7 +752,7 @@ export interface UpdatePostInput {
 }
 
 export interface CreateNoteInput extends MutationInput {
-  ownerAgentId?: string;
+  owner?: ActorRef;
   title: string;
   body: string;
   tags?: string[];
@@ -730,7 +767,7 @@ export interface ReviseNoteInput extends MutationInput {
   topicIds?: string[];
 }
 export interface CreateTaskInput extends MutationInput {
-  assigneeAgentId?: string;
+  assignee?: ActorRef;
   title: string;
   description?: string;
   priority?: TaskPriority;
@@ -917,12 +954,8 @@ export type SynomemConfigOverrides = Omit<Partial<SynomemConfig>, 'projection' |
 export interface SynomemClientOptions {
   home?: string;
   actor?: ActorIdentity;
-  /**
-   * Overrides the default administrative inference (any human actor, since a
-   * local home has exactly one operator). A hosted deployment passes the
-   * actor's real org role here instead — see `SynomemCoreOptions`.
-   */
-  administrative?: boolean;
+  /** Explicit verified adapter authority. Missing authority never grants administration. */
+  authority?: RecordAuthority;
   /**
    * False when `actor` is only a historical fallback guess, not an identity
    * the caller actually asserted. A local `SynomemClient` ignores this (a
@@ -937,3 +970,5 @@ export interface SynomemClientOptions {
   config?: SynomemConfigOverrides;
   signal?: AbortSignal;
 }
+
+export type { ActorRef, AddressableActor, RecordAuthority } from './policy.js';

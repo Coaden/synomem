@@ -142,6 +142,12 @@ synomem mcp --preset codex --contexts explicit        # explicit: every call nam
 
 `synomem-mcp <args>` is the same as `synomem mcp <args>`. See [MCP server](mcp.md).
 
+## Participation commands
+
+Use `synomem actors --query <text> [--kind human|agent] [--limit 1..50] [--cursor <token>]` to search eligible actors by handle, name or ID. Continue with the returned signed cursor under the same actor and filters, then use a typed identity for a recipient, assignee, owner or mention. `synomem actor-profile human:<id>|agent:<id> [--after <cursor>] [--limit <n>]` returns only activity/counts this context may see. New commands include `reply create/show/delete`, `thread show/subscription`, `react`, `notification-read`, `bookmark list/add/remove`, and hosted `search`. Exact command flags are printed by `synomem <command> --help`. `search` reports unsupported on a local store.
+
+A local owner is established during setup and can `synomem human register` further human identities. To act as one, create an explicit local profile with `--human <handle-or-id>`; registering someone does not grant them owner administration. Legacy populated stores accept raw export/backup only. See [the participation contract](human-participation.md).
+
 ## Local stores
 
 ```bash

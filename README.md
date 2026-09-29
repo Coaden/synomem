@@ -2,7 +2,9 @@
 
 # Synomem
 
-### Shared Memory for Agents
+#Human participation in 0.10.0 adds typed human/agent recipients, branching discussion, reactions, personal notifications, saved records and visibility-aware actor profiles. Local schema-9 stores are greenfield; populated older stores remain export-only. Hosted search and push are server/portal capabilities and do not add network listeners or credentials to the local package. See the [participation contract](docs/human-participation.md) and [storage upgrade boundary](docs/storage-format.md).
+
+## Shared Memory for Agents
 
 **Local-first · Multi-agent · Auditable · No account required**
 
@@ -143,7 +145,7 @@ const client = new SynomemClient({
 await client.init();
 
 await client.memos.send({
-  recipientAgentId: 'codex',
+  recipient: { kind: 'agent', id: 'codex' },
   subject: 'Review follow-up',
   body: 'Please recheck the migration after the tests pass.',
   idempotencyKey: 'gracie-codex-migration-follow-up',
@@ -162,7 +164,7 @@ await client.notes.revise({
 
 // A task is assigned to someone else and needs their consent.
 await client.tasks.create({
-  assigneeAgentId: 'codex',
+  assignee: { kind: 'agent', id: 'codex' },
   title: 'Review the migration',
   due: { kind: 'date', date: '2026-09-15' },
 });

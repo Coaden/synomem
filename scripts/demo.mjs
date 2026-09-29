@@ -18,7 +18,7 @@ try {
   });
   await atlas.init();
   const result = await atlas.kudos.give({
-    recipientAgentId: 'beacon',
+    recipient: { kind: 'agent', id: 'beacon' },
     title: 'Found the hidden edge case',
     reason: 'Identified a retry race before release and supplied a reproducible test.',
     evidence: [{ kind: 'task', value: 'demo-17' }],

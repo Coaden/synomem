@@ -1,3 +1,4 @@
+import { DatabaseSync } from 'node:sqlite';
 /**
  * Local store helpers.
  *
@@ -13,7 +14,7 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { ulid } from 'ulid';
-import { SynomemClient } from './client.js';
+import { createLocalOwnerClient, SynomemClient } from './client.js';
 import { defaultConfig, mergeConfig, resolveHome } from './config.js';
 import { SynomemError } from './errors.js';
 import {
@@ -72,10 +73,10 @@ export function ensureLocalStore(explicitHome?: string): SynomemConfig {
   if (lstatSync(home).isSymbolicLink()) {
     throw new SynomemError('UNSAFE_PATH', 'The configured Synomem home cannot be a symbolic link.');
   }
-  ensureDirectory(home);
-  chmodSync(home, 0o700);
   const existing = readSynomemConfig(explicitHome, {});
   if (existing) return existing;
+  ensureDirectory(home);
+  chmodSync(home, 0o700);
   const config = mergeConfig(
     { ...defaultConfig, backend: { kind: 'local' }, workspaceId: ulid() },
     undefined,
@@ -99,4 +100,29 @@ export async function openLocalService(
   const client = new SynomemClient({ ...(home ? { home } : {}), actor });
   await client.init();
   return client;
+}
+
+export async function openLocalOwnerService(home?: string): Promise<SynomemClient> {
+  ensureLocalStore(home);
+  const client = createLocalOwnerClient({ ...(home ? { home } : {}), actor: LOCAL_OPERATOR });
+  await client.init();
+  return client;
+}
+
+/** Filesystem-owner recovery path: no migration, normalization or writes. */
+export function exportRawLocalEvents(home?: string, format: 'json' | 'jsonl' = 'jsonl'): string {
+  const root = resolveHome(home);
+  const databasePath = join(root, 'synomem.sqlite3');
+  assertNoSymlinkEscape(root, databasePath);
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const rows = database.prepare('SELECT payload FROM events ORDER BY rowid').all() as Array<{
+      payload: string;
+    }>;
+    return format === 'jsonl'
+      ? rows.map((row) => row.payload).join('\n') + (rows.length ? '\n' : '')
+      : `[${rows.map((row) => row.payload).join(',\n')}]\n`;
+  } finally {
+    database.close();
+  }
 }
