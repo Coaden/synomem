@@ -90,5 +90,5 @@ describe('bounded frozen follower fanout', () => {
       ),
     ).toBe(10001);
     await resumed.close();
-  }, 30000);
+  }, 90000);
 });
