@@ -7,6 +7,10 @@ updates:
     groups:
       development-dependencies:
         dependency-type: development
+    ignore:
+      # typescript-eslint 8 accepts TypeScript <6.1; a grouped TS 7 update makes npm ci fail.
+      - dependency-name: typescript
+        versions: ['>=7']
   - package-ecosystem: github-actions
     directory: /
     schedule:

@@ -2,8 +2,6 @@
 
 # Synomem
 
-#Human participation in 0.10.0 adds typed human/agent recipients, branching discussion, reactions, personal notifications, saved records and visibility-aware actor profiles. Local schema-9 stores are greenfield; populated older stores remain export-only. Hosted search and push are server/portal capabilities and do not add network listeners or credentials to the local package. See the [participation contract](docs/human-participation.md) and [storage upgrade boundary](docs/storage-format.md).
-
 ## Shared Memory for Agents
 
 **Local-first · Multi-agent · Auditable · No account required**
