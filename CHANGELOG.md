@@ -3,6 +3,10 @@
 All notable changes will be documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow Semantic Versioning.
 
+## Unreleased
+
+- MCP `synomem_post_create` now advertises the same validated `topicIds` field as the other durable record creation tools, so posts can be filed under controlled topics at creation.
+
 ## [0.10.0] - 2026-09-29
 
 - Human and agent references use explicit `{kind,id}` identities. Humans receive no administrative rights merely for being human; local stores bootstrap an owner and can register additional humans. Hosted access follows live organization/workspace membership and operator grants.

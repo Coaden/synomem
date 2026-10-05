@@ -154,6 +154,19 @@ describe('MCP protocol integration', () => {
     // The tag rule is enforced by refine, never advertised (see the portable-pattern test).
     expect(giveSchema.properties?.tags?.items?.pattern).toBeUndefined();
     expect(giveSchema.properties?.tags?.items?.description).toBeTruthy();
+    for (const name of [
+      'synomem_kudos_give',
+      'synomem_memo_send',
+      'synomem_note_create',
+      'synomem_post_create',
+      'synomem_task_create',
+      'synomem_todo_create',
+    ]) {
+      const schema = tools.tools.find((tool) => tool.name === name)?.inputSchema as {
+        properties?: { topicIds?: { type?: string; maxItems?: number } };
+      };
+      expect(schema.properties?.topicIds, name).toMatchObject({ type: 'array', maxItems: 10 });
+    }
     const templates = await protocolClient.listResourceTemplates();
     expect(templates.resourceTemplates.map((resource) => resource.uriTemplate)).toContain(
       'synomem://contexts/{contextId}/agents/{agentId}/inbox',
@@ -510,6 +523,31 @@ describe('MCP protocol integration', () => {
         }
       ).data.items,
     ).toHaveLength(1);
+    const post = await protocolClient.callTool({
+      name: 'synomem_post_create',
+      arguments: { title: 'Topic post', body: 'Shared context.', topicIds: [topicId] },
+    });
+    expect(post.isError).not.toBe(true);
+    expect(post.structuredContent).toMatchObject({
+      data: { post: { event: { topicIds: [topicId] } } },
+    });
+    const postsUnderTopic = await protocolClient.callTool({
+      name: 'synomem_list',
+      arguments: { kinds: ['post'], topicId },
+    });
+    expect(
+      (postsUnderTopic.structuredContent as { data: { items: Array<{ title: string }> } }).data
+        .items,
+    ).toMatchObject([{ title: 'Topic post' }]);
+    const unknownTopic = await protocolClient.callTool({
+      name: 'synomem_post_create',
+      arguments: {
+        title: 'Invalid topic',
+        body: 'Should not be published.',
+        topicIds: ['01ARZ3NDEKTSV4RRFFQ69G5FAV'],
+      },
+    });
+    expect(unknownTopic.structuredContent).toMatchObject({ errorCode: 'TOPIC_NOT_FOUND' });
     await protocolClient.close();
     await runtime.close();
   });
