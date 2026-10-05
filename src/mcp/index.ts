@@ -16,6 +16,7 @@ import {
   agentIdSchema,
   changesInputSchema,
   createNoteSchema,
+  createPostSchema,
   createTaskSchema,
   createTodoSchema,
   giveKudosMcpSchema,
@@ -663,12 +664,7 @@ export async function createSynomemMcpServer(
       title: 'Publish a post',
       description:
         'Publish something the whole workspace can read. Use for an announcement, a decision, or context several agents need. A post has no recipient — if one named actor must act, send a memo or assign a task instead.',
-      inputSchema: z.object({
-        title: z.string().trim().min(1).max(200),
-        body: z.string().trim().min(1).max(32000),
-        tags: z.array(z.string()).max(20).optional(),
-        idempotencyKey: z.string().max(200).optional(),
-      }),
+      inputSchema: withMcpSafeMetadata(createPostSchema),
       outputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },

@@ -16,6 +16,34 @@ function json(data: unknown, status = 200, headers: Record<string, string> = {})
   });
 }
 describe('remote Synomem service', () => {
+  it('sends post topic IDs through the hosted API create route', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const service = new RemoteSynomemService({
+      baseUrl: 'https://api.example.test',
+      workspaceId: 'workspace',
+      credential: credentials,
+      fetch: async (input, init) => {
+        const url = input instanceof Request ? input.url : input.toString();
+        if (url.endsWith('/v1/capabilities'))
+          return json({
+            ok: true,
+            data: {
+              backend: 'remote',
+              participation: { version: 2, canWrite: true },
+              binding: { workspaceId: 'workspace', actor },
+            },
+          });
+        requests.push({ url, init });
+        return json({ ok: true, data: {} });
+      },
+    });
+    const topicId = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+    await service.posts.create({ title: 'Shared topic', body: 'Context', topicIds: [topicId] });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toBe('https://api.example.test/v1/workspaces/workspace/posts');
+    expect(requests[0]?.init?.method).toBe('POST');
+    expect(JSON.parse(requests[0]?.init?.body as string)).toMatchObject({ topicIds: [topicId] });
+  });
   it('transmits lifecycle versions and retry keys for kudos actions and post withdrawal', async () => {
     const requests: Array<{ url: string; init?: RequestInit }> = [];
     const service = new RemoteSynomemService({
