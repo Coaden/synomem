@@ -120,6 +120,7 @@ import type {
   UpdateTopicInput,
   TopicListInput,
   TopicResolution,
+  TopicReferenceInput,
   ItemSummary,
   ChangesInput,
   KudosChangesInput,
@@ -1497,18 +1498,61 @@ export class SynomemCore implements SynomemDomainService {
     const resolved = await this.repository.resolveTopic(trimmed);
     return { query: trimmed, ...resolved };
   }
-  /**
-   * Every topic in `topicIds` must already exist and be active — a record
-   * cannot be filed under a subject that does not exist, or one somebody
-   * archived precisely to stop new records collecting under it.
-   */
-  private async assertTopicsExist(topicIds: string[] | undefined): Promise<void> {
-    for (const topicId of topicIds ?? []) {
-      const topic = await this.repository.getTopic(topicId);
-      if (!topic || topic.status !== 'active') {
-        throw new SynomemError('TOPIC_NOT_FOUND', `Unknown or archived topic: ${topicId}`);
+  /** Resolve and validate every topic against this service's configured workspace. */
+  private async resolveTopicReferences(input: TopicReferenceInput): Promise<string[]> {
+    const resolved = new Set<string>();
+    const activeTopics = await this.repository.listTopics('active');
+    for (const topicId of input.topicIds ?? []) {
+      if (!activeTopics.some((topic) => topic.id === topicId)) {
+        throw new SynomemError(
+          'TOPIC_NOT_FOUND',
+          `Topic ID ${topicId} is unknown, archived, or unavailable in the current workspace.`,
+          { topicId, workspaceId: this.repository.config.workspaceId },
+        );
       }
+      resolved.add(topicId);
     }
+
+    for (const suppliedName of input.topicNames ?? []) {
+      const name = suppliedName.trim();
+      const normalized = name.toLowerCase();
+      const { candidates } = await this.repository.resolveTopic(name);
+      const matching = candidates.filter(
+        (topic) =>
+          topic.displayName.trim().toLowerCase() === normalized ||
+          (topic.aliases ?? []).some((alias) => alias.trim().toLowerCase() === normalized),
+      );
+      const unique = [...new Map(matching.map((topic) => [topic.id, topic])).values()];
+      if (unique.length > 1) {
+        throw new SynomemError(
+          'TOPIC_AMBIGUOUS',
+          `Topic name or alias is ambiguous in this workspace: "${name}".`,
+          { query: name, candidates: unique.map(({ id, displayName }) => ({ id, displayName })) },
+        );
+      }
+      if (unique.length === 1) {
+        const topic = unique[0]!;
+        if (topic.status !== 'active') {
+          throw new SynomemError(
+            'TOPIC_NOT_FOUND',
+            `Topic "${name}" exists in this workspace but is archived.`,
+            { topicId: topic.id, displayName: topic.displayName },
+          );
+        }
+        resolved.add(topic.id);
+        continue;
+      }
+      if (!input.createMissingTopics) {
+        throw new SynomemError(
+          'TOPIC_NAME_NOT_FOUND',
+          `No topic named "${name}" or alias exists in this workspace. Set createMissingTopics to true to create it.`,
+          { query: name },
+        );
+      }
+      const created = await this.createTopic({ displayName: name });
+      resolved.add(created.id);
+    }
+    return [...resolved].sort();
   }
   private async giveKudos(input: GiveKudosInput): Promise<GiveKudosResult> {
     this.checkAbort();
@@ -1519,7 +1563,6 @@ export class SynomemCore implements SynomemDomainService {
         visibility: input.visibility ?? this.repository.config.defaultVisibility,
       }),
     );
-    await this.assertTopicsExist(parsed.topicIds);
     const recipient = await this.resolveActor(parsed.recipient, true);
     if (!recipient) {
       throw new SynomemError('AGENT_NOT_FOUND', `Unknown recipient: ${parsed.recipient?.id}`);
@@ -1537,6 +1580,7 @@ export class SynomemCore implements SynomemDomainService {
     const outcome = await this.repository.transaction(async () => {
       const prior = await this.priorMutation(parsed.idempotencyKey, 'kudos.given');
       if (prior?.type === 'kudos.given') return { event: prior, created: false };
+      const topicIds = await this.resolveTopicReferences(parsed);
       const id = this.nextId();
       const event: KudosGivenEvent = {
         ...this.eventBase(id, 1, id),
@@ -1548,7 +1592,7 @@ export class SynomemCore implements SynomemDomainService {
         visibility: parsed.visibility,
         ...(parsed.evidence ? { evidence: parsed.evidence } : {}),
         ...(parsed.tags ? { tags: [...new Set(parsed.tags)].sort() } : {}),
-        ...(parsed.topicIds ? { topicIds: [...new Set(parsed.topicIds)].sort() } : {}),
+        ...(topicIds.length ? { topicIds } : {}),
         ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
         ...(parsed.source ? { source: parsed.source } : {}),
         ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
@@ -1732,13 +1776,13 @@ export class SynomemCore implements SynomemDomainService {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
     const parsed = this.validate(() => sendMemoSchema.parse(input));
-    await this.assertTopicsExist(parsed.topicIds);
     const recipient = await this.resolveActor(parsed.recipient, true);
     if (!recipient)
       throw new SynomemError('AGENT_NOT_FOUND', `Unknown recipient: ${parsed.recipient?.id}`);
     const outcome = await this.repository.transaction(async () => {
       const prior = await this.priorMutation(parsed.idempotencyKey, 'memo.sent');
       if (prior?.type === 'memo.sent') return { id: prior.id, created: false };
+      const topicIds = await this.resolveTopicReferences(parsed);
       const id = this.nextId();
       const event: SynomemEvent = {
         ...this.eventBase(id, 1, id),
@@ -1748,7 +1792,7 @@ export class SynomemCore implements SynomemDomainService {
         subject: parsed.subject,
         body: parsed.body,
         tags: [...new Set(parsed.tags ?? [])].sort(),
-        topicIds: [...new Set(parsed.topicIds ?? [])].sort(),
+        topicIds,
         visibility: parsed.visibility ?? this.repository.config.defaultVisibility,
         ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
         ...(parsed.source ? { source: parsed.source } : {}),
@@ -1850,13 +1894,13 @@ export class SynomemCore implements SynomemDomainService {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
     const parsed = this.validate(() => createPostSchema.parse(input));
-    await this.assertTopicsExist(parsed.topicIds);
     const mentions = parsed.mentions
       ? await this.canonicalPostMentions(parsed.mentions)
       : undefined;
     const outcome = await this.repository.transaction(async () => {
       const prior = await this.priorMutation(parsed.idempotencyKey, 'post.created');
       if (prior?.type === 'post.created') return { id: prior.id, created: false };
+      const topicIds = await this.resolveTopicReferences(parsed);
       const id = this.nextId();
       const event: SynomemEvent = {
         ...this.eventBase(id, 1, id),
@@ -1865,7 +1909,7 @@ export class SynomemCore implements SynomemDomainService {
         body: parsed.body,
         mentions: mentions ?? [],
         tags: [...new Set(parsed.tags ?? [])].sort(),
-        topicIds: [...new Set(parsed.topicIds ?? [])].sort(),
+        topicIds,
         ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
         ...(parsed.source ? { source: parsed.source } : {}),
         ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
@@ -1894,7 +1938,6 @@ export class SynomemCore implements SynomemDomainService {
   private async updatePost(input: UpdatePostInput): Promise<PostRecord> {
     this.checkAbort();
     const parsed = this.validate(() => updatePostSchema.parse(input));
-    await this.assertTopicsExist(parsed.topicIds);
     const mentions = parsed.mentions
       ? await this.canonicalPostMentions(parsed.mentions)
       : undefined;
@@ -1910,6 +1953,10 @@ export class SynomemCore implements SynomemDomainService {
       );
     }
     await this.repository.transaction(async () => {
+      const topicIds =
+        parsed.topicIds !== undefined || parsed.topicNames !== undefined
+          ? await this.resolveTopicReferences(parsed)
+          : [...new Set(record.topicIds ?? [])].sort();
       const event: SynomemEvent = {
         ...this.intervention(record.event.actor as ActorRef),
         ...this.eventBase(parsed.postId, await this.repository.nextAggregateVersion(parsed.postId)),
@@ -1919,7 +1966,7 @@ export class SynomemCore implements SynomemDomainService {
         body: parsed.body ?? record.body,
         mentions: mentions ?? record.mentions ?? [],
         tags: [...new Set(parsed.tags ?? record.tags ?? [])].sort(),
-        topicIds: [...new Set(parsed.topicIds ?? record.topicIds ?? [])].sort(),
+        topicIds,
         ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
       };
       await this.repository.insertEvent(event);
@@ -2022,7 +2069,6 @@ export class SynomemCore implements SynomemDomainService {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
     const parsed = this.validate(() => createNoteSchema.parse(input));
-    await this.assertTopicsExist(parsed.topicIds);
     const owner = await this.resolveActor(parsed.owner ?? this.boundRef(), true);
     if (!this.canManage(owner))
       throw new SynomemError(
@@ -2032,6 +2078,7 @@ export class SynomemCore implements SynomemDomainService {
     const outcome = await this.repository.transaction(async () => {
       const prior = await this.priorMutation(parsed.idempotencyKey, 'note.created');
       if (prior?.type === 'note.created') return { id: prior.id, created: false };
+      const topicIds = await this.resolveTopicReferences(parsed);
       const id = this.nextId();
       const event: SynomemEvent = {
         ...this.eventBase(id, 1, id),
@@ -2042,7 +2089,7 @@ export class SynomemCore implements SynomemDomainService {
         title: parsed.title,
         body: parsed.body,
         tags: [...new Set(parsed.tags ?? [])].sort(),
-        topicIds: [...new Set(parsed.topicIds ?? [])].sort(),
+        topicIds,
         visibility: 'private',
         ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
         ...(parsed.source ? { source: parsed.source } : {}),
@@ -2067,7 +2114,6 @@ export class SynomemCore implements SynomemDomainService {
   }
   private async reviseNote(input: ReviseNoteInput): Promise<NoteRecord> {
     const parsed = this.validate(() => reviseNoteSchema.parse(input));
-    await this.assertTopicsExist(parsed.topicIds);
     const record = await this.getNoteRecord(parsed.noteId);
     this.assertNoteOwner(record);
     if (record.status === 'archived')
@@ -2096,7 +2142,10 @@ export class SynomemCore implements SynomemDomainService {
         title: parsed.title ?? record.current.title,
         body: parsed.body ?? record.current.body,
         tags: parsed.tags ?? record.current.tags,
-        topicIds: parsed.topicIds ?? record.current.topicIds,
+        topicIds:
+          parsed.topicIds !== undefined || parsed.topicNames !== undefined
+            ? await this.resolveTopicReferences(parsed)
+            : record.current.topicIds,
         visibility: 'private',
         ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
         ...(parsed.source ? { source: parsed.source } : {}),
@@ -2147,7 +2196,6 @@ export class SynomemCore implements SynomemDomainService {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
     const parsed = this.validate(() => createTaskSchema.parse(input));
-    await this.assertTopicsExist(parsed.topicIds);
     const assignee = await this.resolveActor(parsed.assignee ?? this.boundRef(), true);
     if (
       this.actor.kind === 'agent' &&
@@ -2158,6 +2206,7 @@ export class SynomemCore implements SynomemDomainService {
     const outcome = await this.repository.transaction(async () => {
       const prior = await this.priorMutation(parsed.idempotencyKey, 'task.created');
       if (prior?.type === 'task.created') return { id: prior.id, created: false };
+      const topicIds = await this.resolveTopicReferences(parsed);
       const id = this.nextId();
       const requiresAcceptance = !sameActor(this.actor, assignee);
       const event: SynomemEvent = {
@@ -2170,7 +2219,7 @@ export class SynomemCore implements SynomemDomainService {
         priority: parsed.priority ?? 3,
         ...(parsed.due ? { due: parsed.due } : {}),
         tags: [...new Set(parsed.tags ?? [])].sort(),
-        topicIds: [...new Set(parsed.topicIds ?? [])].sort(),
+        topicIds,
         visibility: parsed.visibility ?? this.repository.config.defaultVisibility,
         requiresAcceptance,
         ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
@@ -2203,7 +2252,6 @@ export class SynomemCore implements SynomemDomainService {
   }
   private async updateTask(input: UpdateTaskInput): Promise<TaskRecord> {
     const parsed = this.validate(() => updateTaskSchema.parse(input));
-    await this.assertTopicsExist(parsed.topicIds);
     const record = await this.getTaskRecord(parsed.taskId);
     this.assertTaskParticipant(record);
     if (record.status !== 'open')
@@ -2239,7 +2287,10 @@ export class SynomemCore implements SynomemDomainService {
         priority: parsed.priority ?? record.current.priority,
         ...(due ? { due } : {}),
         tags: parsed.tags ?? record.current.tags,
-        topicIds: parsed.topicIds ?? record.current.topicIds,
+        topicIds:
+          parsed.topicIds !== undefined || parsed.topicNames !== undefined
+            ? await this.resolveTopicReferences(parsed)
+            : record.current.topicIds,
         visibility: parsed.visibility ?? record.current.visibility,
         ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
         ...(parsed.source ? { source: parsed.source } : {}),
@@ -2414,7 +2465,6 @@ export class SynomemCore implements SynomemDomainService {
     this.checkAbort();
     await this.repository.assertEventCompatibility();
     const parsed = this.validate(() => createTodoSchema.parse(input));
-    await this.assertTopicsExist(parsed.topicIds);
     const owner = await this.resolveActor(parsed.owner ?? this.boundRef(), true);
     if (!this.canManage(owner))
       throw new SynomemError(
@@ -2424,6 +2474,7 @@ export class SynomemCore implements SynomemDomainService {
     const outcome = await this.repository.transaction(async () => {
       const prior = await this.priorMutation(parsed.idempotencyKey, 'todo.created');
       if (prior?.type === 'todo.created') return { id: prior.id, created: false };
+      const topicIds = await this.resolveTopicReferences(parsed);
       const id = this.nextId();
       const event: SynomemEvent = {
         ...this.eventBase(id, 1, id),
@@ -2435,7 +2486,7 @@ export class SynomemCore implements SynomemDomainService {
         priority: parsed.priority ?? 3,
         ...(parsed.due ? { due: parsed.due } : {}),
         tags: [...new Set(parsed.tags ?? [])].sort(),
-        topicIds: [...new Set(parsed.topicIds ?? [])].sort(),
+        topicIds,
         ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
         ...(parsed.source ? { source: parsed.source } : {}),
         ...(parsed.metadata ? { metadata: parsed.metadata } : {}),
@@ -2480,7 +2531,6 @@ export class SynomemCore implements SynomemDomainService {
   private async updateTodo(input: UpdateTodoInput): Promise<TodoRecord> {
     this.checkAbort();
     const parsed = this.validate(() => updateTodoSchema.parse(input));
-    await this.assertTopicsExist(parsed.topicIds);
     const record = await this.getTodoRecord(parsed.todoId);
     if (record.current.version !== parsed.expectedVersion) {
       throw new SynomemError(
@@ -2507,7 +2557,10 @@ export class SynomemCore implements SynomemDomainService {
         priority: parsed.priority ?? record.current.priority,
         ...(due ? { due } : {}),
         tags: [...new Set<string>(parsed.tags ?? record.current.tags)].sort(),
-        topicIds: [...new Set<string>(parsed.topicIds ?? record.current.topicIds)].sort(),
+        topicIds:
+          parsed.topicIds !== undefined || parsed.topicNames !== undefined
+            ? await this.resolveTopicReferences(parsed)
+            : [...new Set<string>(record.current.topicIds)].sort(),
         ...(parsed.idempotencyKey ? { idempotencyKey: parsed.idempotencyKey } : {}),
       };
       await this.repository.insertEvent(event);

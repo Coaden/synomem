@@ -83,9 +83,12 @@ synomem_doctor           synomem_rebuild
 There is no workspace- or agent-switching tool. An identity the connection cannot use is a
 different profile or connection, set up by a person.
 
-Create tools for kudos, memos, notes, posts, tasks and todos accept optional `topicIds` (up to 10
-active topic IDs). Resolve an existing topic with `synomem_topic_resolve` before creating a new one;
-the same IDs can be used to filter records with `synomem_list`.
+Create and update tools for kudos, memos, notes, posts, tasks and todos accept optional `topicIds`
+and `topicNames` (up to 10 each). `topicIds` are strict references: an unknown ID fails and never
+creates a topic. `topicNames` resolve canonical display names and aliases in the current workspace.
+An unknown name fails unless `createMissingTopics: true`, which creates it in that workspace.
+Resolved IDs are deduplicated, and records persist topic IDs only. Use `synomem_topic_resolve` to
+inspect a topic and the same IDs to filter records with `synomem_list`.
 
 `synomem_list` returns 10 compact summaries by default and at most 50; `synomem_changes` 20 by
 default and at most 100. Both stop around a 24 KiB budget. Full bodies need one `synomem_get`.

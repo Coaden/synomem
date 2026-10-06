@@ -86,6 +86,85 @@ describe('topics', () => {
     expect(onlyDocMatching.items.map((item) => item.id)).toEqual([todo.record.event.id]);
     await gracie.close();
   });
+  it('resolves names and aliases, creates only when requested, combines references, and deduplicates', async () => {
+    const home = tempHome();
+    const client = await testClient(home);
+    const topic = await client.topics.create({ displayName: 'Testing', aliases: ['test'] });
+
+    const byName = await client.posts.create({
+      title: 'Filed by display name',
+      body: 'Existing canonical topic.',
+      topicNames: ['testing'],
+    });
+    expect(byName.record.event.topicIds).toEqual([topic.id]);
+    expect((await client.items.list({ topicId: topic.id })).items.map((item) => item.id)).toContain(
+      byName.record.event.id,
+    );
+
+    const byAlias = await client.todos.create({ title: 'Filed by alias', topicNames: ['test'] });
+    expect(byAlias.record.event.topicIds).toEqual([topic.id]);
+
+    const missingNameError = await client.posts
+      .create({ title: 'Missing', body: 'Should fail.', topicNames: ['Does Not Exist'] })
+      .catch((error: unknown) => error);
+    expect(missingNameError).toBeInstanceOf(Error);
+    expect((missingNameError as Error & { code?: string }).code).toBe('TOPIC_NAME_NOT_FOUND');
+    expect(String(missingNameError)).toContain('Does Not Exist');
+
+    const created = await client.notes.create({
+      title: 'Auto-created topic',
+      body: 'The topic and note are stored together.',
+      topicNames: ['Brand New Topic'],
+      createMissingTopics: true,
+    });
+    const newTopic = (await client.topics.list()).find(
+      (item) => item.displayName === 'Brand New Topic',
+    );
+    expect(newTopic).toBeDefined();
+    expect(created.record.event.topicIds).toEqual([newTopic!.id]);
+
+    const combined = await client.posts.create({
+      title: 'Combined ID and name',
+      body: 'One explicit ID and one resolved display name.',
+      topicIds: [topic.id],
+      topicNames: ['Brand New Topic'],
+    });
+    expect(combined.record.event.topicIds?.slice().sort()).toEqual([topic.id, newTopic!.id].sort());
+
+    const deduplicated = await client.posts.create({
+      title: 'Combined and deduplicated',
+      body: 'ID, display name, and alias refer to one topic.',
+      topicIds: [topic.id],
+      topicNames: ['Testing', 'test'],
+    });
+    expect(deduplicated.record.event.topicIds).toEqual([topic.id]);
+    await client.close();
+  });
+  it('keeps topic-name resolution isolated between workspaces and never creates from an invalid ID', async () => {
+    const first = await testClient(tempHome());
+    const firstTopic = await first.topics.create({ displayName: 'Shared name' });
+    const second = await testClient(tempHome());
+    const secondTopic = await second.topics.create({ displayName: 'Shared name' });
+    const filed = await second.posts.create({
+      title: 'Workspace-local resolution',
+      body: 'Resolve only the current workspace topic.',
+      topicNames: ['SHARED NAME'],
+    });
+    expect(firstTopic.id).not.toBe(secondTopic.id);
+    expect(filed.record.event.topicIds).toEqual([secondTopic.id]);
+
+    const before = (await second.topics.list()).length;
+    await expect(
+      second.posts.create({
+        title: 'Invalid explicit ID',
+        body: 'The auto-create flag applies only to names.',
+        topicIds: ['01ARZ3NDEKTSV4RRFFQ69G5FAV'],
+        createMissingTopics: true,
+      }),
+    ).rejects.toMatchObject({ code: 'TOPIC_NOT_FOUND' });
+    expect((await second.topics.list()).length).toBe(before);
+    await Promise.all([first.close(), second.close()]);
+  });
   it('keeps a kudos filed under a topic reachable by kudos.list(topicId)', async () => {
     const home = tempHome();
     const gracie = await testClient(home, { kind: 'agent', id: 'gracie' });
@@ -119,6 +198,12 @@ describe('topics', () => {
       title: 'Track this, renamed',
     });
     expect(updated.current.topicIds).toEqual([topic.id]);
+    const resolvedUpdate = await gracie.todos.update({
+      todoId: todo.record.event.id,
+      expectedVersion: 2,
+      topicNames: ['ongoing'],
+    });
+    expect(resolvedUpdate.current.topicIds).toEqual([topic.id]);
     await gracie.close();
   });
 });

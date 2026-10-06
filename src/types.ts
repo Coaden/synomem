@@ -380,16 +380,15 @@ export interface TodoRecord {
   status: 'open' | 'completed' | 'canceled' | 'archived';
 }
 
-export interface CreateTodoInput extends MutationInput {
+export interface CreateTodoInput extends MutationInput, TopicReferenceInput {
   owner?: ActorRef;
   title: string;
   details?: string;
   priority?: TaskPriority;
   due?: TaskDue;
   tags?: string[];
-  topicIds?: string[];
 }
-export interface UpdateTodoInput extends MutationInput {
+export interface UpdateTodoInput extends MutationInput, TopicReferenceInput {
   todoId: string;
   expectedVersion: number;
   title?: string;
@@ -397,7 +396,6 @@ export interface UpdateTodoInput extends MutationInput {
   priority?: TaskPriority;
   due?: TaskDue | null;
   tags?: string[];
-  topicIds?: string[];
 }
 export type CreateTodoResult = MutationResult<TodoRecord>;
 
@@ -715,68 +713,69 @@ interface MutationInput {
   source?: EventSource;
   metadata?: Record<string, JsonValue>;
 }
-export interface GiveKudosInput extends MutationInput {
+export interface TopicReferenceInput {
+  /** Explicit stable IDs. Every ID must already exist and be active. */
+  topicIds?: string[];
+  /** Topic display names or aliases resolved case-insensitively in this workspace. */
+  topicNames?: string[];
+  /** Create unresolved topicNames in this workspace. Defaults to false. */
+  createMissingTopics?: boolean;
+}
+export interface GiveKudosInput extends MutationInput, TopicReferenceInput {
   recipient: ActorRef;
   title: string;
   reason: string;
   evidence?: EvidenceReference[];
   tags?: string[];
-  topicIds?: string[];
   visibility?: Visibility;
 }
-export interface SendMemoInput extends MutationInput {
+export interface SendMemoInput extends MutationInput, TopicReferenceInput {
   recipient: ActorRef;
   subject: string;
   body: string;
   tags?: string[];
-  topicIds?: string[];
   visibility?: Visibility;
 }
-export interface CreatePostInput extends MutationInput {
+export interface CreatePostInput extends MutationInput, TopicReferenceInput {
   mentions?: ActorRef[];
   title: string;
   body: string;
   tags?: string[];
-  topicIds?: string[];
 }
 
-export interface UpdatePostInput {
+export interface UpdatePostInput extends TopicReferenceInput {
   mentions?: ActorRef[];
   postId: string;
   expectedVersion: number;
   title?: string;
   body?: string;
   tags?: string[];
-  topicIds?: string[];
   idempotencyKey?: string;
 }
 
-export interface CreateNoteInput extends MutationInput {
+export interface CreateNoteInput extends MutationInput, TopicReferenceInput {
   owner?: ActorRef;
   title: string;
   body: string;
   tags?: string[];
-  topicIds?: string[];
 }
-export interface ReviseNoteInput extends MutationInput {
+export interface ReviseNoteInput extends MutationInput, TopicReferenceInput {
   noteId: string;
   expectedVersion: number;
   title?: string;
   body?: string;
   tags?: string[];
-  topicIds?: string[];
 }
-export interface CreateTaskInput extends MutationInput {
+export interface CreateTaskInput extends MutationInput, TopicReferenceInput {
   assignee?: ActorRef;
   title: string;
   description?: string;
   priority?: TaskPriority;
   due?: TaskDue;
   tags?: string[];
-  topicIds?: string[];
   visibility?: Visibility;
 }
-export interface UpdateTaskInput extends MutationInput {
+export interface UpdateTaskInput extends MutationInput, TopicReferenceInput {
   taskId: string;
   expectedVersion: number;
   title?: string;
@@ -784,7 +783,6 @@ export interface UpdateTaskInput extends MutationInput {
   priority?: TaskPriority;
   due?: TaskDue | null;
   tags?: string[];
-  topicIds?: string[];
   visibility?: Visibility;
 }
 export interface MutationResult<T> {
