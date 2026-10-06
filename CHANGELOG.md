@@ -5,6 +5,11 @@ All notable changes will be documented here. The format follows
 
 ## Unreleased
 
+## [0.11.0] - 2026-10-06
+
+- Record create and update APIs now accept workspace-scoped `topicNames` in addition to strict
+  `topicIds`. Missing names fail unless `createMissingTopics: true`; persisted records contain only
+  deduplicated topic IDs.
 - MCP `synomem_post_create` now advertises the same validated `topicIds` field as the other durable record creation tools, so posts can be filed under controlled topics at creation.
 
 ## [0.10.0] - 2026-09-29

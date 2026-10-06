@@ -93,7 +93,28 @@ export const topicIdSchema = z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/);
  * stable subject a record genuinely belongs to, not a place to accumulate
  * every word that might one day be searched for.
  */
-const topicIdsFieldSchema = z.array(topicIdSchema).max(10).optional();
+const topicIdsFieldSchema = z
+  .array(topicIdSchema)
+  .max(10)
+  .optional()
+  .describe(
+    'Strict IDs for existing topics in the current workspace. Unknown IDs fail validation.',
+  );
+const topicNamesFieldSchema = z
+  .array(z.string().trim().min(1).max(80))
+  .max(10)
+  .optional()
+  .describe('Topic display names or aliases resolved only in the current workspace.');
+const topicReferenceInputFields = {
+  topicIds: topicIdsFieldSchema,
+  topicNames: topicNamesFieldSchema,
+  createMissingTopics: z
+    .boolean()
+    .optional()
+    .describe(
+      'When true, create topicNames not found in the current workspace. Defaults to false.',
+    ),
+};
 
 export const actorSchema = z.object({
   kind: z.enum(['human', 'agent', 'system']),
@@ -738,7 +759,7 @@ const giveKudosInputSchema = kudosGivenSchema
     title: kudosTitleSchema,
     evidence: z.array(evidenceSchema).max(10).optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
-    topicIds: topicIdsFieldSchema,
+    ...topicReferenceInputFields,
   })
   .strict();
 
@@ -792,7 +813,7 @@ export const sendMemoSchema = z
     subject: memoSentSchema.shape.subject,
     body: memoSentSchema.shape.body,
     tags: z.array(kudosTagSchema).max(20).optional(),
-    topicIds: topicIdsFieldSchema,
+    ...topicReferenceInputFields,
     visibility: z.enum(['private', 'workspace', 'public']).optional(),
     ...mutationMetadata,
   })
@@ -800,6 +821,8 @@ export const sendMemoSchema = z
 export const createPostSchema = z
   .object({
     ...postFields,
+    topicNames: topicNamesFieldSchema,
+    createMissingTopics: z.boolean().optional(),
     ...mutationMetadata,
   })
   .strict();
@@ -811,7 +834,7 @@ export const updatePostSchema = z
     title: postFields.title.optional(),
     body: postFields.body.optional(),
     tags: postFields.tags,
-    topicIds: postFields.topicIds,
+    ...topicReferenceInputFields,
     idempotencyKey: z.string().trim().min(1).max(200).optional(),
   })
   .strict();
@@ -822,7 +845,7 @@ export const createNoteSchema = z
     title: noteCreatedSchema.shape.title,
     body: noteCreatedSchema.shape.body,
     tags: z.array(kudosTagSchema).max(20).optional(),
-    topicIds: topicIdsFieldSchema,
+    ...topicReferenceInputFields,
     ...mutationMetadata,
   })
   .strict();
@@ -833,7 +856,7 @@ export const reviseNoteSchema = z
     title: noteCreatedSchema.shape.title.optional(),
     body: noteCreatedSchema.shape.body.optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
-    topicIds: topicIdsFieldSchema,
+    ...topicReferenceInputFields,
     ...mutationMetadata,
   })
   .strict();
@@ -845,7 +868,7 @@ export const createTaskSchema = z
     priority: taskCreatedSchema.shape.priority.optional(),
     due: taskDueSchema.optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
-    topicIds: topicIdsFieldSchema,
+    ...topicReferenceInputFields,
     visibility: z.enum(['private', 'workspace', 'public']).optional(),
     ...mutationMetadata,
   })
@@ -859,7 +882,7 @@ export const updateTaskSchema = z
     priority: taskCreatedSchema.shape.priority.optional(),
     due: taskDueSchema.nullable().optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
-    topicIds: topicIdsFieldSchema,
+    ...topicReferenceInputFields,
     visibility: z.enum(['private', 'workspace', 'public']).optional(),
     ...mutationMetadata,
   })
@@ -878,7 +901,7 @@ export const createTodoSchema = z
     priority: todoCreatedSchema.shape.priority.optional(),
     due: taskDueSchema.optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
-    topicIds: topicIdsFieldSchema,
+    ...topicReferenceInputFields,
     ...mutationMetadata,
   })
   .strict();
@@ -891,7 +914,7 @@ export const updateTodoSchema = z
     priority: todoCreatedSchema.shape.priority.optional(),
     due: taskDueSchema.nullable().optional(),
     tags: z.array(kudosTagSchema).max(20).optional(),
-    topicIds: topicIdsFieldSchema,
+    ...topicReferenceInputFields,
     ...mutationMetadata,
   })
   .strict();

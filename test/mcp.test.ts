@@ -158,14 +158,23 @@ describe('MCP protocol integration', () => {
       'synomem_kudos_give',
       'synomem_memo_send',
       'synomem_note_create',
+      'synomem_note_revise',
       'synomem_post_create',
       'synomem_task_create',
+      'synomem_task_update',
       'synomem_todo_create',
+      'synomem_todo_update',
     ]) {
       const schema = tools.tools.find((tool) => tool.name === name)?.inputSchema as {
-        properties?: { topicIds?: { type?: string; maxItems?: number } };
+        properties?: {
+          topicIds?: { type?: string; maxItems?: number };
+          topicNames?: { type?: string; maxItems?: number };
+          createMissingTopics?: { type?: string };
+        };
       };
       expect(schema.properties?.topicIds, name).toMatchObject({ type: 'array', maxItems: 10 });
+      expect(schema.properties?.topicNames, name).toMatchObject({ type: 'array', maxItems: 10 });
+      expect(schema.properties?.createMissingTopics, name).toMatchObject({ type: 'boolean' });
     }
     const templates = await protocolClient.listResourceTemplates();
     expect(templates.resourceTemplates.map((resource) => resource.uriTemplate)).toContain(
