@@ -519,6 +519,11 @@ export class PresetResolver implements ContextResolver {
     return 'explicit';
   }
 
+  backend(): 'local' | 'remote' | 'mixed' {
+    const kinds = new Set(this.routes.map((route) => route.resolver.backend?.() ?? 'local'));
+    return kinds.size === 1 ? [...kinds][0]! : 'mixed';
+  }
+
   async resolve(contextId?: string) {
     if (!contextId) {
       throw new SynomemError(

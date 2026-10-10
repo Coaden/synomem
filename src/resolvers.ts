@@ -49,6 +49,11 @@ export interface ContextResolver {
   resolve(contextId?: string): Promise<ResolvedContext>;
   list(): Promise<ContextListing>;
   describe?(): Promise<IdentityDescription | undefined>;
+  /**
+   * Where this resolver's contexts live. Hosted-only tools (email) are offered only when
+   * some context is remote; `mixed` presets re-check per call. Absent means local.
+   */
+  backend?(): 'local' | 'remote' | 'mixed';
   close?(): Promise<void>;
 }
 
@@ -257,6 +262,7 @@ export function createRemoteResolver(options: {
   };
 
   return {
+    backend: () => 'remote',
     mode() {
       if (pinned) return 'fixed';
       if (allowed) return 'explicit';
@@ -340,6 +346,7 @@ export function createLocalResolver(
   };
 
   return {
+    backend: () => 'local',
     mode: () => 'fixed',
     async resolve(contextId) {
       const bound = await open();

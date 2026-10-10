@@ -40,6 +40,54 @@ async function connectResolver(resolver: ContextResolver) {
   return { runtime, protocolClient };
 }
 describe('MCP protocol integration', () => {
+  it('returns full posts, replies, timelines and failures to text-only clients', async () => {
+    const home = tempHome();
+    const { runtime, protocolClient } = await setupRuntime(home);
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const result = await protocolClient.callTool({ name, arguments: args });
+      const blocks = result.content as Array<{ type: string; text?: string }>;
+      const text = blocks
+        .filter((block) => block.type === 'text')
+        .map((block) => block.text)
+        .join('');
+      const envelope = JSON.parse(text) as {
+        ok: boolean;
+        errorCode?: string;
+        effectiveContext: { actor: { id: string } };
+        data: { id: string; body: string; post: { event: { id: string } } };
+      };
+      expect(envelope).toEqual(result.structuredContent);
+      return { result, envelope, text };
+    };
+    try {
+      await call('synomem_context_list', {});
+      const post = await call('synomem_post_create', {
+        title: 'Draft topic',
+        body: 'Original post — context.',
+      });
+      const rootId = post.envelope.data.post.event.id;
+      const reply = await call('synomem_reply_create', {
+        rootId,
+        body: 'Gracie’s R1: fluent is not true.\nGo upstream.',
+      });
+      const replyId = reply.envelope.data.id;
+      const read = await call('synomem_reply_get', { replyId });
+      expect(read.envelope.data.body).toBe('Gracie’s R1: fluent is not true.\nGo upstream.');
+      expect(read.envelope.effectiveContext.actor.id).toBeDefined();
+      const thread = await call('synomem_thread_get', { rootId });
+      expect(thread.text).toContain('Gracie’s R1');
+      const item = await call('synomem_get', { itemId: rootId });
+      expect(item.text).toContain('Original post — context.');
+      const missing = await call('synomem_reply_get', { replyId: '01ARZ3NDEKTSV4RRFFQ69G5FAV' });
+      expect(missing.result.isError).toBe(true);
+      expect(missing.envelope.ok).toBe(false);
+      expect(missing.envelope.errorCode).toBeDefined();
+    } finally {
+      await protocolClient.close();
+      await runtime.close();
+    }
+  });
+
   it('binds a local session to one stable lctx_ context and reports it on every result', async () => {
     const home = tempHome();
     const { runtime, protocolClient } = await setupRuntime(home);

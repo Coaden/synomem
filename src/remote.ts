@@ -1,4 +1,16 @@
 import type {
+  EmailAttachmentContent,
+  EmailComposeInput,
+  EmailDraftInput,
+  EmailForwardInput,
+  EmailListInput,
+  EmailMailbox,
+  EmailMessage,
+  EmailMessagePage,
+  EmailMessageSummary,
+  EmailReplyInput,
+} from './email.js';
+import type {
   ActorDirectoryInput,
   ActorDirectoryPage,
   ActorProfile,
@@ -531,6 +543,89 @@ export class RemoteSynomemService implements SynomemService {
       ),
   };
 
+  /**
+   * Hosted email for the bound agent's own mailbox. There is no local equivalent: a mailbox
+   * needs the hosted mail edge, so this exists only on the remote service.
+   */
+  readonly email = {
+    mailbox: () => this.request<EmailMailbox>('GET', 'email/mailbox'),
+    list: (input: EmailListInput = {}) =>
+      this.request<EmailMessagePage>('GET', `email/messages${queryString(input)}`),
+    get: (input: { messageId: string; includeHtml?: boolean; markSeen?: boolean }) =>
+      this.request<EmailMessage>(
+        'GET',
+        `email/messages/${encodeURIComponent(input.messageId)}${queryString({
+          includeHtml: input.includeHtml,
+          markSeen: input.markSeen,
+        })}`,
+      ),
+    thread: (threadId: string) =>
+      this.request<{ threadId: string; messages: EmailMessage[] }>(
+        'GET',
+        `email/threads/${encodeURIComponent(threadId)}`,
+      ),
+    attachment: (input: { messageId: string; index: number }) =>
+      this.request<EmailAttachmentContent>(
+        'GET',
+        `email/messages/${encodeURIComponent(input.messageId)}/attachments/${input.index}`,
+        undefined,
+        undefined,
+        // Attachments arrive base64-encoded; allow up to the API's 10 MiB fetch limit.
+        16 * 1024 * 1024,
+      ),
+    send: (input: EmailComposeInput) => this.mutation<EmailMessage>('POST', 'email/send', input),
+    reply: (input: EmailReplyInput) =>
+      this.mutation<EmailMessage>(
+        'POST',
+        `email/messages/${encodeURIComponent(input.messageId)}/reply`,
+        input,
+        ['messageId'],
+      ),
+    forward: (input: EmailForwardInput) =>
+      this.mutation<EmailMessage>(
+        'POST',
+        `email/messages/${encodeURIComponent(input.messageId)}/forward`,
+        input,
+        ['messageId'],
+      ),
+    saveDraft: (input: EmailDraftInput) =>
+      input.draftId
+        ? this.mutation<EmailMessage>(
+            'PATCH',
+            `email/drafts/${encodeURIComponent(input.draftId)}`,
+            input,
+            ['draftId'],
+          )
+        : this.mutation<EmailMessage>('POST', 'email/drafts', input, ['draftId']),
+    sendDraft: (draftId: string) =>
+      this.mutation<EmailMessage>('POST', `email/drafts/${encodeURIComponent(draftId)}/send`, {}),
+    move: (input: { messageId: string; folder: 'inbox' | 'spam' | 'archive' | 'trash' }) =>
+      this.mutation<EmailMessageSummary>(
+        'POST',
+        `email/messages/${encodeURIComponent(input.messageId)}/move`,
+        input,
+        ['messageId'],
+      ),
+    mark: (input: { messageId: string; seen?: boolean; flagged?: boolean }) =>
+      this.mutation<EmailMessageSummary>(
+        'POST',
+        `email/messages/${encodeURIComponent(input.messageId)}/flags`,
+        input,
+        ['messageId'],
+      ),
+    delete: (messageId: string) =>
+      this.mutation<{ id: string; deleted: boolean; folder?: string }>(
+        'DELETE',
+        `email/messages/${encodeURIComponent(messageId)}`,
+        {},
+      ),
+    audit: (input: { limit?: number; cursor?: string } = {}) =>
+      this.request<{ entries: Record<string, unknown>[]; nextCursor?: string }>(
+        'GET',
+        `email/audit${queryString(input)}`,
+      ),
+  };
+
   readonly memos = {
     send: (input: SendMemoInput) =>
       this.mutation<Awaited<ReturnType<SynomemService['memos']['send']>>>('POST', 'memos', input),
@@ -897,6 +992,7 @@ export class RemoteSynomemService implements SynomemService {
     path: string,
     body?: object,
     idempotencyKey?: string,
+    maximumResponseBytes = this.maximumResponseBytes,
   ): Promise<T> {
     if (method !== 'GET') {
       await this.init();
@@ -944,10 +1040,10 @@ export class RemoteSynomemService implements SynomemService {
       throw new SynomemError('REMOTE_PROTOCOL', 'Remote redirects are not followed.');
     }
     const declaredLength = Number(response.headers.get('content-length') ?? 0);
-    if (declaredLength > this.maximumResponseBytes) {
+    if (declaredLength > maximumResponseBytes) {
       throw new SynomemError('REMOTE_PROTOCOL', 'Remote response exceeded the configured limit.');
     }
-    const bytes = await boundedResponseBytes(response, this.maximumResponseBytes);
+    const bytes = await boundedResponseBytes(response, maximumResponseBytes);
     let envelope: ApiSuccessEnvelope<T> | ApiErrorEnvelope;
     try {
       envelope = JSON.parse(new TextDecoder().decode(bytes)) as
@@ -960,15 +1056,17 @@ export class RemoteSynomemService implements SynomemService {
         throw new SynomemError('REMOTE_PROTOCOL', 'Remote Synomem returned an invalid error.');
       }
       const reported = knownErrorCode(envelope.error.code);
-      const code = contextCodes.has(reported)
-        ? reported
-        : response.status === 401
-          ? 'AUTH_REQUIRED'
-          : response.status === 403
-            ? 'AUTH_FORBIDDEN'
-            : response.status === 429
-              ? 'RATE_LIMITED'
-              : knownErrorCode(envelope.error.code);
+      // Hosted email reports its own refusals (policy, limits, missing mailbox) precisely.
+      const code =
+        contextCodes.has(reported) || reported.startsWith('EMAIL_')
+          ? reported
+          : response.status === 401
+            ? 'AUTH_REQUIRED'
+            : response.status === 403
+              ? 'AUTH_FORBIDDEN'
+              : response.status === 429
+                ? 'RATE_LIMITED'
+                : knownErrorCode(envelope.error.code);
       throw new SynomemError(code, envelope.error.message, {
         ...(envelope.error.details ?? {}),
         ...(envelope.error.requestId ? { requestId: envelope.error.requestId } : {}),

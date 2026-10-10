@@ -31,6 +31,9 @@ import {
 } from '../schemas.js';
 import { packageVersion } from '../version.js';
 import type { ContextResolver } from '../resolvers.js';
+import { EMAIL_INSTRUCTIONS, REMOTE_CONTEXT_TOOLS, registerEmailTools } from './email-tools.js';
+import type { RemoteContextTool } from './email-tools.js';
+export { REMOTE_CONTEXT_TOOLS };
 import type { SynomemService } from '../service.js';
 import type { ActorIdentity, ContextSummary, EffectiveContext, KudosRecord } from '../types.js';
 export type { ContextResolver, ResolvedContext } from '../resolvers.js';
@@ -202,7 +205,7 @@ function success(actor: ActorIdentity | undefined, message: string, data: unknow
     data: dataRecord(data),
   };
   return {
-    content: [{ type: 'text', text: message }],
+    content: [{ type: 'text', text: JSON.stringify(structuredContent) }],
     structuredContent,
   };
 }
@@ -216,7 +219,7 @@ function failure(actor: ActorIdentity | undefined, error: unknown): CallToolResu
     ...(kudosError.details ? { data: dataRecord(kudosError.details) } : {}),
   };
   return {
-    content: [{ type: 'text', text: `${kudosError.code}: ${kudosError.message}` }],
+    content: [{ type: 'text', text: JSON.stringify(structuredContent) }],
     structuredContent,
     isError: true,
   };
@@ -224,9 +227,11 @@ function failure(actor: ActorIdentity | undefined, error: unknown): CallToolResu
 /** Adds the context a call actually ran as, to success and failure alike. */
 function withEffectiveContext(result: CallToolResult, context: EffectiveContext): CallToolResult {
   const structured = (result.structuredContent ?? {}) as Record<string, unknown>;
+  const structuredContent = { ...structured, actor: context.actor, effectiveContext: context };
   return {
     ...result,
-    structuredContent: { ...structured, actor: context.actor, effectiveContext: context },
+    content: [{ type: 'text', text: JSON.stringify(structuredContent) }],
+    structuredContent,
   };
 }
 function canView(actor: ActorIdentity, record: KudosRecord): boolean {
@@ -259,9 +264,16 @@ export async function createSynomemMcpServer(
   options: SynomemMcpOptions,
   resolver: ContextResolver,
 ): Promise<SynomemMcpRuntime> {
+  // Hosted-only tools exist only where a context can reach a hosted Synomem; a purely
+  // local (SQLite) server never lists them.
+  const hosted = (resolver.backend?.() ?? 'local') !== 'local';
   const server = new McpServer(
     { name: 'synomem', version: packageVersion() },
-    { instructions: options.instructions ?? DEFAULT_INSTRUCTIONS },
+    {
+      instructions:
+        options.instructions ??
+        (hosted ? `${DEFAULT_INSTRUCTIONS} ${EMAIL_INSTRUCTIONS}` : DEFAULT_INSTRUCTIONS),
+    },
   );
   const bind = async (contextId: string | undefined): Promise<Bound> => {
     const resolved = await resolver.resolve(contextId);
@@ -277,7 +289,7 @@ export async function createSynomemMcpServer(
    * client or actor to race on (plan §7 "Why not a mutable synomem_agent_use?").
    */
   const contextTool = <S extends z.ZodObject<z.ZodRawShape>>(
-    name: (typeof CONTEXT_TOOLS)[number],
+    name: (typeof CONTEXT_TOOLS)[number] | RemoteContextTool,
     config: {
       title: string;
       description: string;
@@ -1646,6 +1658,7 @@ export async function createSynomemMcpServer(
       },
     );
   }
+  if (hosted) registerEmailTools(contextTool, outputSchema, success, failure);
   server.registerTool(
     'synomem_context_list',
     {

@@ -9,6 +9,9 @@ title: MCP server
 SDK. It opens no network listener. Hosted chat apps (ChatGPT, claude.ai) connect to the same tool
 catalog at `https://mcp.synomem.ai` over OAuth instead.
 
+Tool results return the same complete JSON envelope in `structuredContent` and a text content block.
+Clients that consume only text still receive record bodies, replies, timelines, and effective context.
+
 ## Contexts: fixed and explicit
 
 Every tool call runs as exactly one **context** — one workspace and one actor — resolved per call.
@@ -93,6 +96,31 @@ inspect a topic and the same IDs to filter records with `synomem_list`.
 `synomem_list` returns 10 compact summaries by default and at most 50; `synomem_changes` 20 by
 default and at most 100. Both stop around a 24 KiB budget. Full bodies need one `synomem_get`.
 Cursors and watermarks are scoped to the context that produced them.
+
+### Hosted email (remote connections only)
+
+A hosted context's agent can own a mailbox at `@synomem.ai`. The mailbox belongs to the agent's
+immutable id; a human operator enables it, chooses friendlier addresses and display names, and
+grants sending in the Synomem portal. The tools appear only when the server's resolver reaches a
+hosted Synomem (`ContextResolver.backend()` is `remote` or `mixed`); a local SQLite server never
+lists them.
+
+| Tool                                          | Purpose                                                         |
+| --------------------------------------------- | --------------------------------------------------------------- |
+| `synomem_email_mailbox`                       | Own addresses, folder counts, sending policy, limits and usage. |
+| `synomem_email_list` / `synomem_email_search` | Browse a folder or search every folder.                         |
+| `synomem_email_read` / `synomem_email_thread` | Open a message or a whole conversation.                         |
+| `synomem_email_attachment`                    | Download one attachment (base64, up to 10 MiB).                 |
+| `synomem_email_send` / `_reply` / `_forward`  | Send mail as one of the agent's own addresses.                  |
+| `synomem_email_draft_save` / `_draft_send`    | Work with drafts.                                               |
+| `synomem_email_move` / `_mark` / `_delete`    | Organize: archive, spam, trash, read, flag.                     |
+| `synomem_email_audit`                         | The agent's own send attempts and delivery outcomes.            |
+
+Sending is never implied by MCP access. Each mailbox has an operator-set policy (`off`,
+`internal` to `@synomem.ai` only, or `external`), hourly and daily caps, a per-message recipient
+cap and a daily cap on new external recipients. Every attempt — allowed or refused — is audited
+with the context and connection that made it, and repeated bounces suspend sending automatically.
+Email content is untrusted data from outside parties, never instructions.
 
 ## Resources
 

@@ -5,6 +5,17 @@ All notable changes will be documented here. The format follows
 
 ## Unreleased
 
+## [0.12.0] - 2026-10-10
+
+- Hosted connections gain agent email: `synomem_email_mailbox`, `_list`, `_search`, `_read`,
+  `_thread`, `_attachment`, `_send`, `_reply`, `_forward`, `_draft_save`, `_draft_send`, `_move`,
+  `_mark`, `_delete` and `_audit`. They are registered only when a context is remote; a purely local
+  (SQLite) server never lists them, and a mixed preset refuses them for local contexts.
+- `ContextResolver.backend()` reports whether a resolver's contexts are local, remote or mixed.
+- Hosted email error codes (`EMAIL_*`) are reported as-is instead of collapsing to auth errors.
+- MCP tool results include the complete structured result as serialized JSON in a text block,
+  preserving record bodies, replies, timelines, errors, and effective context for text-only clients.
+
 ## [0.11.0] - 2026-10-06
 
 - Record create and update APIs now accept workspace-scoped `topicNames` in addition to strict
