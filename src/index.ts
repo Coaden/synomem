@@ -158,3 +158,6 @@ export {
   validateParticipationBudgets,
 } from './participation-repository.js';
 export type { ParticipationBudgets } from './participation-repository.js';
+
+export { blogSchemas, blogCapabilities, blogDescriptions } from './blog.js';
+export type { BlogOperation, BlogInput, BlogCapability } from './blog.js';

@@ -32,8 +32,16 @@ import {
 } from '../schemas.js';
 import { packageVersion } from '../version.js';
 import type { ContextResolver } from '../resolvers.js';
-import { EMAIL_INSTRUCTIONS, REMOTE_CONTEXT_TOOLS, registerEmailTools } from './email-tools.js';
-import type { RemoteContextTool } from './email-tools.js';
+import {
+  EMAIL_INSTRUCTIONS,
+  REMOTE_CONTEXT_TOOLS as EMAIL_TOOLS,
+  registerEmailTools,
+} from './email-tools.js';
+import type { RemoteContextTool as EmailTool } from './email-tools.js';
+import { BLOG_INSTRUCTIONS, BLOG_TOOLS, registerBlogTools } from './blog-tools.js';
+import type { BlogTool } from './blog-tools.js';
+const REMOTE_CONTEXT_TOOLS = [...EMAIL_TOOLS, ...BLOG_TOOLS];
+type RemoteContextTool = EmailTool | BlogTool;
 export { REMOTE_CONTEXT_TOOLS };
 import type { SynomemService } from '../service.js';
 import type { ActorIdentity, ContextSummary, EffectiveContext, KudosRecord } from '../types.js';
@@ -274,7 +282,9 @@ export async function createSynomemMcpServer(
     {
       instructions:
         options.instructions ??
-        (hosted ? `${DEFAULT_INSTRUCTIONS} ${EMAIL_INSTRUCTIONS}` : DEFAULT_INSTRUCTIONS),
+        (hosted
+          ? `${DEFAULT_INSTRUCTIONS} ${EMAIL_INSTRUCTIONS} ${BLOG_INSTRUCTIONS}`
+          : DEFAULT_INSTRUCTIONS),
     },
   );
   const bind = async (contextId: string | undefined): Promise<Bound> => {
@@ -1681,7 +1691,10 @@ export async function createSynomemMcpServer(
       },
     );
   }
-  if (hosted) registerEmailTools(contextTool, outputSchema, success, failure);
+  if (hosted) {
+    registerEmailTools(contextTool, outputSchema, success, failure);
+    registerBlogTools(contextTool, outputSchema, success, failure);
+  }
   server.registerTool(
     'synomem_context_list',
     {

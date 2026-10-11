@@ -85,6 +85,7 @@ describe('hosted email MCP tools', () => {
     const { client, close } = await connect(createLocalResolver({ home, actor }));
     const names = (await client.listTools()).tools.map((tool) => tool.name);
     expect(names.some((name) => name.startsWith('synomem_email_'))).toBe(false);
+    expect(names.some((name) => name.startsWith('synomem_blog_'))).toBe(false);
     await close();
   });
 
@@ -94,7 +95,8 @@ describe('hosted email MCP tools', () => {
     expect(tools.map((tool) => tool.name).sort()).toEqual(
       [...CONTEXT_TOOLS, ...DISCOVERY_TOOLS, ...REMOTE_CONTEXT_TOOLS].sort(),
     );
-    for (const tool of tools.filter((entry) => entry.name.startsWith('synomem_email_')))
+    expect(tools.map((tool) => tool.name)).toContain('synomem_blog_post_publish');
+    for (const tool of tools.filter((entry) => /^synomem_(email|blog)_/.test(entry.name)))
       expect((tool.inputSchema as { properties?: object }).properties, tool.name).toHaveProperty(
         'contextId',
       );
@@ -219,6 +221,66 @@ describe('hosted email MCP tools', () => {
     const message = (result.structuredContent as { message: string }).message;
     expect(message).toContain('Delivery problems in the last 7 days');
     expect(message).toContain('“A cheer” (ID msg_1, bounced): contact@deepmind.com bounced 5.1.3');
+    await close();
+  });
+
+  it('drafts blog articles through one audited call route, with the retry key as a header', async () => {
+    const requests: { url: string; init?: RequestInit }[] = [];
+    let refuse = false;
+    const { client, close } = await connect(
+      remoteResolver((url, init) => {
+        requests.push({ url, ...(init ? { init } : {}) });
+        if (refuse)
+          return json(
+            {
+              ok: false,
+              error: { code: 'POLICY_FORBIDDEN', message: 'publish permission is required.' },
+            },
+            403,
+          );
+        return json({ ok: true, data: { id: '12', title: 'Field notes', _status: 'draft' } });
+      }),
+    );
+    const drafted = await client.callTool({
+      name: 'synomem_blog_post_create',
+      arguments: {
+        publicationId: '2',
+        title: 'Field notes',
+        slug: 'field-notes',
+        markdown: '# Hello',
+        idempotencyKey: 'draft-field-notes-1',
+      },
+    });
+    expect(drafted.isError).toBeFalsy();
+    expect(requests[0]!.url).toBe('https://api.example.test/v1/workspaces/workspace/blog/call');
+    expect((requests[0]!.init?.headers as Record<string, string>)['idempotency-key']).toBe(
+      'draft-field-notes-1',
+    );
+    expect(JSON.parse(requests[0]!.init?.body as string)).toEqual({
+      operation: 'post_create',
+      input: { publicationId: '2', title: 'Field notes', slug: 'field-notes', markdown: '# Hello' },
+    });
+    expect((drafted.structuredContent as { message: string }).message).toBe(
+      'Saved draft “Field notes” (ID 12). It is not public until published.',
+    );
+    // Writes without a retry key are refused before anything is sent.
+    const keyless = await client.callTool({
+      name: 'synomem_blog_post_publish',
+      arguments: { publicationId: '2', postId: '12', expectedUpdatedAt: '2026-10-11T10:00:00Z' },
+    });
+    expect(keyless.isError).toBe(true);
+    expect(requests).toHaveLength(1);
+    refuse = true;
+    const refused = await client.callTool({
+      name: 'synomem_blog_post_publish',
+      arguments: {
+        publicationId: '2',
+        postId: '12',
+        expectedUpdatedAt: '2026-10-11T10:00:00Z',
+        idempotencyKey: 'publish-field-notes-1',
+      },
+    });
+    expect(refused.structuredContent).toMatchObject({ ok: false, errorCode: 'POLICY_FORBIDDEN' });
     await close();
   });
 

@@ -1,3 +1,4 @@
+import type { BlogOperation } from './blog.js';
 import type {
   EmailAttachmentContent,
   EmailComposeInput,
@@ -547,6 +548,18 @@ export class RemoteSynomemService implements SynomemService {
    * Hosted email for the bound agent's own mailbox. There is no local equivalent: a mailbox
    * needs the hosted mail edge, so this exists only on the remote service.
    */
+  readonly blog = {
+    call: (operation: BlogOperation, input: Record<string, unknown> = {}) => {
+      const { idempotencyKey, ...data } = input;
+      return this.request<Record<string, unknown>>(
+        'POST',
+        'blog/call',
+        { operation, input: data },
+        typeof idempotencyKey === 'string' ? idempotencyKey : undefined,
+      );
+    },
+  };
+
   readonly email = {
     mailbox: () => this.request<EmailMailbox>('GET', 'email/mailbox'),
     list: (input: EmailListInput = {}) =>
@@ -1056,9 +1069,12 @@ export class RemoteSynomemService implements SynomemService {
         throw new SynomemError('REMOTE_PROTOCOL', 'Remote Synomem returned an invalid error.');
       }
       const reported = knownErrorCode(envelope.error.code);
-      // Hosted email reports its own refusals (policy, limits, missing mailbox) precisely.
+      // Hosted email and publishing report their own refusals (an operator's grant, limits, a
+      // missing mailbox) precisely: "ask your operator" is not "your credential is bad".
       const code =
-        contextCodes.has(reported) || reported.startsWith('EMAIL_')
+        contextCodes.has(reported) ||
+        reported.startsWith('EMAIL_') ||
+        reported === 'POLICY_FORBIDDEN'
           ? reported
           : response.status === 401
             ? 'AUTH_REQUIRED'

@@ -5,8 +5,15 @@ All notable changes will be documented here. The format follows
 
 ## Unreleased
 
-## [0.12.2] - 2026-10-11
+## [0.13.0] - 2026-10-11
 
+- Hosted connections gain public blogging on blog.synomem.ai: `synomem_blog_status`,
+  publications, articles (drafted from Markdown), publishing and unpublishing, versions and
+  restore, images, and the caller's own activity. Like email, the tools are registered only for
+  remote contexts. Access is an operator grant per agent and publication; changes require an
+  idempotency key and the revision timestamp last read.
+- `POLICY_FORBIDDEN` from a hosted server is reported as-is instead of collapsing into
+  `AUTH_FORBIDDEN`, so an agent can tell a missing grant from a bad credential.
 - `synomem_email_mailbox` leads with mail from the last 7 days that bounced or is still being
   retried (`recentDeliveryFailures`), so a delivery failure is not mistaken for success.
 
