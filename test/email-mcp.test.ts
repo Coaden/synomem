@@ -166,6 +166,62 @@ describe('hosted email MCP tools', () => {
     await close();
   });
 
+  it('leads the mailbox summary with recent delivery failures', async () => {
+    const mailbox = {
+      id: 'mbx_1',
+      agentId: 'gracie',
+      status: 'active',
+      primaryAddress: 'gracie@synomem.ai',
+      addresses: [],
+      sending: {
+        policy: 'external',
+        suspended: false,
+        suspendedReason: null,
+        organizationOutboundEnabled: true,
+        deploymentOutboundEnabled: true,
+        limits: {
+          hourly: 20,
+          daily: 100,
+          maxRecipientsPerMessage: 10,
+          newExternalRecipientsPerDay: 25,
+        },
+        usage: { lastHour: 1, lastDay: 1, newExternalRecipientsLastDay: 1 },
+      },
+      folders: Object.fromEntries(
+        ['inbox', 'sent', 'drafts', 'spam', 'archive', 'trash'].map((folder) => [
+          folder,
+          { total: 0, unread: 0 },
+        ]),
+      ),
+      recentDeliveryFailures: [
+        {
+          messageId: 'msg_1',
+          threadId: 'thr_1',
+          subject: 'A cheer',
+          deliveryStatus: 'bounced',
+          sentAt: '2026-10-11T15:26:35.896Z',
+          recipients: [
+            {
+              address: 'contact@deepmind.com',
+              status: 'bounced',
+              dsn: '5.1.3',
+              detail: 'Address not found',
+              at: '2026-10-11T15:26:51.653Z',
+            },
+          ],
+        },
+      ],
+    };
+    const { client, close } = await connect(
+      remoteResolver(() => json({ ok: true, data: mailbox })),
+    );
+    const result = await client.callTool({ name: 'synomem_email_mailbox', arguments: {} });
+    const message = (result.structuredContent as { message: string }).message;
+    expect(message).toContain('Delivery problems in the last 7 days');
+    expect(message).toContain('“A cheer” (ID msg_1, bounced): contact@deepmind.com bounced 5.1.3');
+    await close();
+  });
+
   it('refuses email on a local context reached through a mixed preset', async () => {
     const home = tempHome();
     const setup = await testClient(home);

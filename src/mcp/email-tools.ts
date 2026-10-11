@@ -16,7 +16,7 @@ import {
   emailSendSchema,
   emailThreadSchema,
 } from '../email.js';
-import type { EmailMessage, EmailMessageSummary, EmailParty } from '../email.js';
+import type { EmailMailbox, EmailMessage, EmailMessageSummary, EmailParty } from '../email.js';
 import { SynomemError } from '../errors.js';
 import { RemoteSynomemService } from '../remote.js';
 import type { SynomemService } from '../service.js';
@@ -62,6 +62,19 @@ type Register<O> = <S extends z.ZodObject<z.ZodRawShape>>(
 ) => void;
 type Reply = (actor: ActorIdentity | undefined, message: string, data: unknown) => CallToolResult;
 type Fail = (actor: ActorIdentity | undefined, error: unknown) => CallToolResult;
+
+/** Mail that left but did not arrive is easy to miss in a sent folder, so the mailbox says so. */
+function deliveryWarning(mailbox: EmailMailbox): string {
+  const failures = mailbox.recentDeliveryFailures ?? [];
+  if (!failures.length) return '';
+  const lines = failures.map((failure) => {
+    const recipients = failure.recipients
+      .map((entry) => `${entry.address} ${entry.status}${entry.dsn ? ` ${entry.dsn}` : ''}`)
+      .join(', ');
+    return `- “${failure.subject}” (ID ${failure.messageId}, ${failure.deliveryStatus})${recipients ? `: ${recipients}` : ''}`;
+  });
+  return `\nDelivery problems in the last 7 days — these messages did not reach everyone:\n${lines.join('\n')}`;
+}
 
 const party = (value: EmailParty | null | undefined) =>
   value ? (value.name ? `${value.name} <${value.address}>` : value.address) : 'unknown sender';
@@ -122,7 +135,7 @@ export function registerEmailTools<O>(
           sending.suspended
             ? `SUSPENDED (${sending.suspendedReason ?? 'by an operator'})`
             : sending.policy
-        } · used ${sending.usage.lastHour}/${sending.limits.hourly} this hour, ${sending.usage.lastDay}/${sending.limits.daily} today.`,
+        } · used ${sending.usage.lastHour}/${sending.limits.hourly} this hour, ${sending.usage.lastDay}/${sending.limits.daily} today.${deliveryWarning(mailbox)}`,
         mailbox,
       ];
     }),

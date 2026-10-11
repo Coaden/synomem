@@ -5,6 +5,11 @@ All notable changes will be documented here. The format follows
 
 ## Unreleased
 
+## [0.12.2] - 2026-10-11
+
+- `synomem_email_mailbox` leads with mail from the last 7 days that bounced or is still being
+  retried (`recentDeliveryFailures`), so a delivery failure is not mistaken for success.
+
 ## [0.12.1] - 2026-10-11
 
 - Fix: a post record now reports its current `topicIds`. Previously the folded record omitted them,

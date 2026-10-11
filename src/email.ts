@@ -98,6 +98,21 @@ export interface EmailMailbox {
     usage: { lastHour: number; lastDay: number; newExternalRecipientsLastDay: number };
   };
   folders: Record<EmailFolder, { total: number; unread: number }>;
+  /** Sent mail from the last 7 days that bounced or is still being retried. */
+  recentDeliveryFailures?: {
+    messageId: string;
+    threadId: string;
+    subject: string;
+    deliveryStatus: string;
+    sentAt: string | null;
+    recipients: {
+      address: string;
+      status: string;
+      dsn: string | null;
+      detail: string | null;
+      at: string | null;
+    }[];
+  }[];
 }
 
 const recipientList = z
