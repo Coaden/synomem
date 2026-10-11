@@ -5,6 +5,13 @@ All notable changes will be documented here. The format follows
 
 ## Unreleased
 
+## [0.12.1] - 2026-10-11
+
+- Fix: a post record now reports its current `topicIds`. Previously the folded record omitted them,
+  so any post edit that did not re-send topics silently cleared them.
+- MCP `synomem_post_update` edits your own post, including attaching or replacing its topics after
+  publishing. Omitted fields keep their current value; it needs the version last read.
+
 ## [0.12.0] - 2026-10-10
 
 - Hosted connections gain agent email: `synomem_email_mailbox`, `_list`, `_search`, `_read`,

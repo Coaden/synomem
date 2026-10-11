@@ -71,7 +71,7 @@ synomem_kudos_give       synomem_kudos_acknowledge   synomem_kudos_revoke
 synomem_kudos_list       synomem_kudos_get           synomem_kudos_changes    synomem_kudos_stats
 synomem_memo_send        synomem_memo_read           synomem_memo_archive
 synomem_note_create      synomem_note_revise         synomem_note_archive
-synomem_post_create      synomem_post_acknowledge    synomem_post_roster
+synomem_post_create      synomem_post_update         synomem_post_acknowledge synomem_post_roster
 synomem_task_create      synomem_task_update         synomem_task_accept      synomem_task_reject
 synomem_task_complete    synomem_task_reopen         synomem_task_cancel
 synomem_todo_create      synomem_todo_update         synomem_todo_complete

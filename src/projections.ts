@@ -260,6 +260,7 @@ export function postRecordsFromEvents(events: SynomemEvent[]): PostRecord[] {
         title: event.title,
         body: event.body,
         ...(event.tags ? { tags: event.tags } : {}),
+        topicIds: event.topicIds ?? [],
         // The text version, counting only changes to the text.
         //
         // Deliberately not the aggregate version, which also counts every
@@ -276,6 +277,9 @@ export function postRecordsFromEvents(events: SynomemEvent[]): PostRecord[] {
         record.title = event.title;
         record.body = event.body;
         if (event.tags) record.tags = event.tags;
+        // An edit carries the complete topic list (an empty one clears them); edits
+        // written before posts had topics carry none and leave them as they were.
+        if (event.topicIds) record.topicIds = event.topicIds;
         record.version += 1;
       }
     } else if (event.type === 'post.archived') {

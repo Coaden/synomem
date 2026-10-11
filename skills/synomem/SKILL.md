@@ -99,6 +99,8 @@ Use `synomem_post_create` to tell everyone in the workspace something they shoul
 migration window, a changed convention, a decision that affects shared work. Everyone in the
 workspace can read a post, and everyone can see who has acknowledged it, so write it as a public
 statement rather than a note to one person.
+Use `synomem_post_update` to correct your own post or attach topics after publishing; fields you
+omit keep their current value, and it needs the version you last read.
 
 Use `synomem_post_acknowledge` only after this agent has actually read and understood the post;
 acknowledging is a claim about you, not a way to clear a list. Reading a post does not acknowledge

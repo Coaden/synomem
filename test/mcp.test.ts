@@ -208,6 +208,7 @@ describe('MCP protocol integration', () => {
       'synomem_note_create',
       'synomem_note_revise',
       'synomem_post_create',
+      'synomem_post_update',
       'synomem_task_create',
       'synomem_task_update',
       'synomem_todo_create',
@@ -596,6 +597,62 @@ describe('MCP protocol integration', () => {
       (postsUnderTopic.structuredContent as { data: { items: Array<{ title: string }> } }).data
         .items,
     ).toMatchObject([{ title: 'Topic post' }]);
+    // A post published without topics can have them attached afterwards, and removed again.
+    const untagged = await protocolClient.callTool({
+      name: 'synomem_post_create',
+      arguments: { title: 'Late topic post', body: 'Topic added later.' },
+    });
+    const untaggedId = (untagged.structuredContent as { data: { post: { event: { id: string } } } })
+      .data.post.event.id;
+    const attached = await protocolClient.callTool({
+      name: 'synomem_post_update',
+      arguments: { postId: untaggedId, expectedVersion: 1, topicIds: [topicId] },
+    });
+    expect(attached.isError).not.toBe(true);
+    expect(attached.structuredContent).toMatchObject({
+      data: {
+        post: {
+          version: 2,
+          title: 'Late topic post',
+          body: 'Topic added later.',
+          topicIds: [topicId],
+        },
+      },
+    });
+    // An edit that does not mention topics keeps them.
+    const retitled = await protocolClient.callTool({
+      name: 'synomem_post_update',
+      arguments: { postId: untaggedId, expectedVersion: 2, title: 'Late topic post (edited)' },
+    });
+    expect(retitled.structuredContent).toMatchObject({
+      data: { post: { version: 3, topicIds: [topicId] } },
+    });
+    const listedAfterEdit = await protocolClient.callTool({
+      name: 'synomem_list',
+      arguments: { kinds: ['post'], topicId },
+    });
+    expect(
+      (
+        listedAfterEdit.structuredContent as { data: { items: Array<{ title: string }> } }
+      ).data.items
+        .map((item) => item.title)
+        .sort(),
+    ).toEqual(['Late topic post (edited)', 'Topic post']);
+    const stale = await protocolClient.callTool({
+      name: 'synomem_post_update',
+      arguments: { postId: untaggedId, expectedVersion: 2, topicIds: [] },
+    });
+    expect(stale.structuredContent).toMatchObject({ errorCode: 'REVISION_CONFLICT' });
+    const detached = await protocolClient.callTool({
+      name: 'synomem_post_update',
+      arguments: { postId: untaggedId, expectedVersion: 3, topicIds: [] },
+    });
+    expect(detached.structuredContent).toMatchObject({ data: { post: { topicIds: [] } } });
+    const misspelled = await protocolClient.callTool({
+      name: 'synomem_post_create',
+      arguments: { title: 'Typo', body: 'Unknown fields are refused.', topicIDs: [topicId] },
+    });
+    expect(misspelled.isError).toBe(true);
     const unknownTopic = await protocolClient.callTool({
       name: 'synomem_post_create',
       arguments: {

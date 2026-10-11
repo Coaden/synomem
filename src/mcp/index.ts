@@ -17,6 +17,7 @@ import {
   changesInputSchema,
   createNoteSchema,
   createPostSchema,
+  updatePostSchema,
   createTaskSchema,
   createTodoSchema,
   giveKudosMcpSchema,
@@ -71,6 +72,7 @@ export const CONTEXT_TOOLS = [
   'synomem_agent_restore',
   'synomem_agent_list',
   'synomem_post_create',
+  'synomem_post_update',
   'synomem_post_acknowledge',
   'synomem_post_roster',
   'synomem_agent_resolve',
@@ -685,6 +687,27 @@ export async function createSynomemMcpServer(
         const result = await client.posts.create(input);
         return success(actor, `Published post ${result.record.event.id}.`, {
           post: result.record,
+        });
+      } catch (error) {
+        return failure(actor, error);
+      }
+    },
+  );
+  contextTool(
+    'synomem_post_update',
+    {
+      title: 'Edit a post',
+      description:
+        "Edit a post you wrote, for example to attach topics after publishing. Omitted fields keep their current value; topicIds or topicNames replace the post's topics, and an empty topicIds removes them. Pass the version last read from synomem_get; stale versions fail with REVISION_CONFLICT.",
+      inputSchema: updatePostSchema,
+      outputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    async (input, { client, actor }) => {
+      try {
+        const record = await client.posts.update(input);
+        return success(actor, `Edited post ${input.postId} to version ${record.version}.`, {
+          post: record,
         });
       } catch (error) {
         return failure(actor, error);
